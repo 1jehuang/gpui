@@ -1219,14 +1219,15 @@ pub struct Window {
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) global_ids: crate::element::GlobalIdCache,
-    /// The memos whose subtree is being built or painted, innermost last. An
-    /// interaction inside one — a hover, a scroll — marks all of them to be
-    /// built again. See [`crate::memo`].
+    /// The reusable subtrees — memos and cached views — being built or
+    /// painted, innermost last. An interaction inside one, a hover or a
+    /// scroll, marks all of them to be built again. See [`crate::memo`].
     pub(crate) memo_stack: Vec<GlobalElementId>,
-    /// Memos that an interaction inside them changed since they were drawn.
+    /// Reusable subtrees that an interaction inside them changed since they
+    /// were drawn.
     pub(crate) dirty_memos: FxHashSet<GlobalElementId>,
-    /// Memos found out of date too late in a frame to build them again, which
-    /// become [`Window::dirty_memos`] for the next one.
+    /// Reusable subtrees found out of date too late in a frame to build them
+    /// again, which become [`Window::dirty_memos`] for the next one.
     pub(crate) memos_dirty_next_frame: FxHashSet<GlobalElementId>,
     /// Whether each hitbox whose hover a memo's subtree was painted by was
     /// hovered then, in painting order. A memo keeps the stretch its subtree
@@ -7195,6 +7196,15 @@ impl Window {
     /// See [`TaffyLayoutEngine::keep_retained`].
     pub(crate) fn keep_retained_layout(&mut self, keys: &[u64]) {
         self.layout_engine.as_mut().unwrap().keep_retained(keys);
+    }
+
+    /// Whether every hover in `dependencies`, recorded while a reusable
+    /// subtree — a memo or a cached view — was painted, is still as it was.
+    pub(crate) fn hovers_unchanged(&self, dependencies: &[(HitboxId, bool)]) -> bool {
+        let touch = self.last_input_was_touch();
+        dependencies
+            .iter()
+            .all(|(hitbox, hovered)| (!touch && hitbox.is_hovered(self)) == *hovered)
     }
 
     /// Marks memos to be built again rather than reused on the next frame.

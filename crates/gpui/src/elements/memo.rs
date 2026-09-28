@@ -134,10 +134,7 @@ struct MemoState<K> {
 impl<K> MemoState<K> {
     /// Whether every hover the subtree was painted by is still as it was.
     fn hovers_unchanged(&self, window: &Window) -> bool {
-        let touch = window.last_input_was_touch();
-        self.hover_dependencies
-            .iter()
-            .all(|(hitbox, hovered)| (!touch && hitbox.is_hovered(window)) == *hovered)
+        window.hovers_unchanged(&self.hover_dependencies)
     }
 }
 

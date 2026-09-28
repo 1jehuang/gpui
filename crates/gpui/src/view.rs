@@ -1,7 +1,8 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle, WeakEntity,
+    Entity, EntityId, GlobalElementId, HitboxId, InspectorElementId, IntoElement, LayoutId,
+    PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle,
+    WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -287,6 +288,13 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// Whether each hitbox whose hover the view was painted by was hovered
+    /// then. The view is rendered again once any of them is hovered
+    /// differently, as a memo is; see [`crate::memo`].
+    hover_dependencies: Vec<(HitboxId, bool)>,
+    /// The keys of the layout nodes the view was laid out with, kept alive
+    /// while it is reused so that rendering it again reuses them.
+    layout_keys: Vec<u64>,
 }
 
 struct ViewElementCacheKey {
@@ -377,8 +385,9 @@ impl<V: View> Element for ViewElement<V> {
                     return Some(element);
                 }
 
+                let global_id = global_id.unwrap();
                 window.with_element_state::<ViewElementState, _>(
-                    global_id.unwrap(),
+                    global_id,
                     |element_state, window| {
                         let content_mask = window.content_mask();
                         let text_style = window.text_style();
@@ -389,7 +398,11 @@ impl<V: View> Element for ViewElement<V> {
                             && element_state.cache_key.text_style == text_style
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
+                            && !window.dirty_memos.contains(global_id)
+                            && !cx.has_active_drag()
+                            && window.hovers_unchanged(&element_state.hover_dependencies)
                         {
+                            window.keep_retained_layout(&element_state.layout_keys);
                             let prepaint_start = window.prepaint_index();
                             window.reuse_prepaint(element_state.prepaint_range.clone());
                             cx.entities
@@ -401,7 +414,9 @@ impl<V: View> Element for ViewElement<V> {
                         }
 
                         let refreshing = mem::replace(&mut window.refreshing, true);
+                        window.memo_stack.push(global_id.clone());
                         let prepaint_start = window.prepaint_index();
+                        let recording = window.record_claimed_layout_keys();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                             let mut element = self
                                 .view
@@ -414,13 +429,17 @@ impl<V: View> Element for ViewElement<V> {
                             element
                         });
 
+                        let layout_keys = window.finish_recording_claimed_layout_keys(recording);
                         let prepaint_end = window.prepaint_index();
+                        window.memo_stack.pop();
                         window.refreshing = refreshing;
 
                         (
                             Some(element),
                             ViewElementState {
                                 accessed_entities,
+                                hover_dependencies: Vec::new(),
+                                layout_keys,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
                                 cache_key: ViewElementCacheKey {
@@ -499,13 +518,34 @@ fn paint_view(
                     let mut element_state = element_state.unwrap();
 
                     let paint_start = window.paint_index();
+                    let global_id = global_id.unwrap();
 
                     if let Some(element) = element {
                         let refreshing = mem::replace(&mut window.refreshing, true);
+                        window.memo_stack.push(global_id.clone());
+                        let dependencies_start = window.memo_hover_dependencies.len();
                         element.paint(window, cx);
+                        element_state.hover_dependencies =
+                            window.memo_hover_dependencies[dependencies_start..].to_vec();
+                        window.memo_stack.pop();
                         window.refreshing = refreshing;
                     } else {
+                        // Checked against last frame's hitboxes before the view
+                        // was reused; something drawn over it this frame shows
+                        // only now, and the view is rendered on the next frame.
+                        if !window.hovers_unchanged(&element_state.hover_dependencies) {
+                            window
+                                .memos_dirty_next_frame
+                                .extend(window.memo_stack.iter().cloned());
+                            window.memos_dirty_next_frame.insert(global_id.clone());
+                            window.request_animation_frame();
+                        }
                         window.reuse_paint(element_state.paint_range.clone());
+                        if !window.memo_stack.is_empty() {
+                            window
+                                .memo_hover_dependencies
+                                .extend_from_slice(&element_state.hover_dependencies);
+                        }
                     }
 
                     let paint_end = window.paint_index();
@@ -530,4 +570,166 @@ fn paint_component(
     window.with_id(ElementId::Name(name.into()), |window| {
         element.as_mut().unwrap().paint(window, cx);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
+        Render, StyleRefinement, Styled as _, TestAppContext, Window, WindowHandle, div,
+        prelude::FluentBuilder as _, px,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct Row {
+        label: u32,
+        builds: Rc<Cell<usize>>,
+    }
+
+    impl Render for Row {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.builds.set(self.builds.get() + 1);
+            div()
+                .size_full()
+                .bg(crate::black())
+                .hover(|style| style.bg(crate::white()))
+                .child(format!("row {}", self.label))
+        }
+    }
+
+    struct Rows {
+        row: Entity<Row>,
+        covered: bool,
+    }
+
+    impl Render for Rows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size(px(300.))
+                .child(
+                    self.row
+                        .clone()
+                        .cached(StyleRefinement::default().w(px(100.)).h(px(20.))),
+                )
+                .when(self.covered, |this| {
+                    this.child(div().absolute().top_0().left_0().size(px(200.)).occlude())
+                })
+        }
+    }
+
+    fn window(cx: &mut TestAppContext) -> (WindowHandle<Rows>, Entity<Row>, Rc<Cell<usize>>) {
+        let builds = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let builds = builds.clone();
+            move |_, cx| Rows {
+                row: cx.new(|_| Row { label: 0, builds }),
+                covered: false,
+            }
+        });
+        let row = window.update(cx, |rows, _, _| rows.row.clone()).unwrap();
+        (window, row, builds)
+    }
+
+    fn draw(cx: &mut TestAppContext, window: WindowHandle<Rows>) -> Vec<String> {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.describe_rendered_frame()
+        })
+        .unwrap()
+    }
+
+    fn notify_parent(cx: &mut TestAppContext, window: WindowHandle<Rows>) {
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+    }
+
+    fn move_mouse(cx: &mut TestAppContext, window: WindowHandle<Rows>, x: f32, y: f32) {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_mouse_move(crate::point(px(x), px(y)), cx);
+        })
+        .unwrap();
+    }
+
+    /// A cached view painted while the pointer was over something in it that
+    /// has a hover style is rendered again once the pointer leaves, even
+    /// though the element never saw the pointer arrive.
+    #[test]
+    fn a_cached_view_is_rendered_again_when_a_hover_it_was_painted_by_changes() {
+        let mut cx = TestAppContext::single();
+        let (window, _, builds) = window(&mut cx);
+        move_mouse(&mut cx, window, 10., 10.);
+        let hovered = draw(&mut cx, window);
+        notify_parent(&mut cx, window);
+        draw(&mut cx, window);
+        let builds_before = builds.get();
+
+        move_mouse(&mut cx, window, 250., 250.);
+        let left = draw(&mut cx, window);
+        assert_eq!(builds.get(), builds_before + 1);
+        assert_ne!(hovered, left);
+    }
+
+    /// A cached view reused for a while keeps the layout nodes it was laid
+    /// out with, so rendering it again finds them all.
+    #[test]
+    fn a_reused_cached_view_keeps_its_layout_nodes() {
+        let mut cx = TestAppContext::single();
+        let (window, row, builds) = window(&mut cx);
+        draw(&mut cx, window);
+        for _ in 0..3 {
+            notify_parent(&mut cx, window);
+            draw(&mut cx, window);
+        }
+        assert_eq!(
+            builds.get(),
+            1,
+            "the view is reused while its parent renders"
+        );
+
+        cx.update_window(window.into(), |_, window, _| window.reset_layout_stats())
+            .unwrap();
+        row.update(&mut cx, |row, cx| {
+            row.label = 7;
+            cx.notify();
+        });
+        draw(&mut cx, window);
+        assert_eq!(builds.get(), 2);
+        let stats = cx
+            .update_window(window.into(), |_, window, _| window.layout_stats())
+            .unwrap();
+        assert_eq!(
+            stats.nodes_created, 0,
+            "the view's nodes should have been kept while it was reused"
+        );
+        assert!(stats.nodes_reused > 0);
+    }
+
+    /// Something drawn over a hovered cached view is found out only when the
+    /// view paints; it is rendered on the next frame, which is asked for.
+    #[test]
+    fn a_cached_view_covered_while_hovered_is_rendered_on_the_next_frame() {
+        let mut cx = TestAppContext::single();
+        let (window, _, builds) = window(&mut cx);
+        move_mouse(&mut cx, window, 10., 10.);
+        let hovered = draw(&mut cx, window);
+        notify_parent(&mut cx, window);
+        draw(&mut cx, window);
+        let builds_before = builds.get();
+
+        window
+            .update(&mut cx, |rows, _, cx| {
+                rows.covered = true;
+                cx.notify();
+            })
+            .unwrap();
+        let mut look = None;
+        for _ in 0..3 {
+            if builds.get() > builds_before {
+                break;
+            }
+            look = Some(draw(&mut cx, window));
+        }
+        assert_eq!(builds.get(), builds_before + 1);
+        assert_ne!(Some(hovered), look);
+    }
 }
