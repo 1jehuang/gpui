@@ -15,9 +15,6 @@
 //! root one by one, in `gpui.rs`.
 
 pub(crate) mod dependencies;
-pub(crate) mod global_id;
-pub(crate) mod interactivity;
-pub(crate) mod keyed;
 pub(crate) mod layout;
 pub(crate) mod layout_key;
 pub(crate) mod memo;

@@ -74,7 +74,9 @@ struct CellState {
 enum RowIdentity {
     Position,
     Id,
-    Key,
+    /// Wrapped in an element with the id, so switching to or from `Id`
+    /// hands a row's node to its wrapper or its first child.
+    Wrapped,
 }
 
 #[derive(Clone, Debug)]
@@ -197,7 +199,8 @@ impl Change {
                 by: rng.random_range(1..4),
             },
             72..75 => Change::RowIdentity(
-                [RowIdentity::Position, RowIdentity::Id, RowIdentity::Key][rng.random_range(0..3)],
+                [RowIdentity::Position, RowIdentity::Id, RowIdentity::Wrapped]
+                    [rng.random_range(0..3)],
             ),
             75..77 => Change::Direction,
             77..83 => Change::Badge,
@@ -431,7 +434,7 @@ fn render_row(row: u64, identity: RowIdentity) -> AnyElement {
     match identity {
         RowIdentity::Position => row_element.into_any_element(),
         RowIdentity::Id => row_element.id(("row", row)).into_any_element(),
-        RowIdentity::Key => row_element.key(("row", row)).into_any_element(),
+        RowIdentity::Wrapped => div().id(("row", row)).child(row_element).into_any_element(),
     }
 }
 
@@ -452,7 +455,10 @@ fn render_chip(chip: u64, identity: RowIdentity) -> AnyElement {
     match identity {
         RowIdentity::Position => chip_element.into_any_element(),
         RowIdentity::Id => chip_element.id(("chip", chip)).into_any_element(),
-        RowIdentity::Key => chip_element.key(("chip", chip)).into_any_element(),
+        RowIdentity::Wrapped => div()
+            .id(("chip", chip))
+            .child(chip_element)
+            .into_any_element(),
     }
 }
 

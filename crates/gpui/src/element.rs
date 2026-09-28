@@ -36,7 +36,7 @@ use crate::{
     FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
     util::FluentBuilder, window::with_element_arena,
 };
-use derive_more::Deref;
+use derive_more::{Deref, DerefMut};
 use std::{
     any::Any,
     fmt::{self, Debug, Display},
@@ -154,11 +154,6 @@ pub trait IntoElement: Sized {
     fn into_any_element(self) -> AnyElement {
         self.into_element().into_any()
     }
-
-    /// Gives this element a key among its siblings. See [`Keyed`](crate::Keyed).
-    fn key(self, key: impl Into<ElementId>) -> crate::fast::keyed::Keyed {
-        crate::fast::keyed::Keyed::new(key.into(), self.into_any_element())
-    }
 }
 
 impl<T: IntoElement> FluentBuilder for T {}
@@ -214,8 +209,8 @@ pub trait ParentElement {
 }
 
 /// A globally unique identifier for an element, used to track state across frames.
-#[derive(Deref, Clone, Debug)]
-pub struct GlobalElementId(#[deref] pub(crate) Arc<[ElementId]>, pub(crate) u64);
+#[derive(Deref, DerefMut, Clone, Default, Debug, Eq, PartialEq, Hash)]
+pub struct GlobalElementId(pub(crate) Arc<[ElementId]>);
 
 impl Display for GlobalElementId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -310,15 +305,15 @@ impl<E: Element> Drawable<E> {
                 let layout_key = window.push_layout_key(element_id.as_ref());
                 let global_id = element_id.map(|element_id| {
                     window.element_id_stack.push(element_id);
-                    window.global_ids.get(&window.element_id_stack)
+                    GlobalElementId(Arc::from(&*window.element_id_stack))
                 });
 
                 let inspector_id;
                 #[cfg(any(feature = "inspector", debug_assertions))]
                 {
-                    inspector_id = window.inspected(&self.element).map(|source| {
+                    inspector_id = self.element.source_location().map(|source| {
                         let path = crate::InspectorElementPath {
-                            global_id: GlobalElementId::new(Arc::from(&*window.element_id_stack)),
+                            global_id: GlobalElementId(Arc::from(&*window.element_id_stack)),
                             source_location: source,
                         };
                         window.build_inspector_element_id(path)

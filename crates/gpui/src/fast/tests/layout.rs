@@ -8,10 +8,10 @@ use std::{
 };
 
 use crate::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Context, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement, Pixels, Render, RenderOnce, SharedString, Styled, TestAppContext,
-    UniformListScrollHandle, Window, WindowHandle, canvas, div, fast::stats::LayoutStats, hsla,
-    point, px, size, uniform_list,
+    AnyWindowHandle, AppContext as _, Bounds, Context, Div, ElementId, Entity, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, SharedString, Styled,
+    TestAppContext, UniformListScrollHandle, Window, WindowHandle, canvas, div,
+    fast::stats::LayoutStats, hsla, point, px, size, uniform_list,
 };
 
 /// Drives the retained-layout tests.
@@ -306,136 +306,6 @@ fn rows_identified_by_an_element_id_keep_their_nodes_when_one_is_inserted_ahead(
     );
 }
 
-/// A row built as a component, which is what lists are mostly made of. It
-/// identifies the element it renders into, which is as far as a
-/// component's own id reaches: the component itself reports none.
-#[derive(IntoElement)]
-struct ComponentRow {
-    id: u64,
-    probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-}
-
-impl RenderOnce for ComponentRow {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        let probes = self.probes;
-        div()
-            .id(("row", self.id))
-            .flex()
-            .flex_row()
-            .w(px(200.) + px((self.id % 5) as f32 * 10.))
-            .h(px(20.))
-            .child("ab")
-            .child(
-                canvas(
-                    move |bounds, _, _| probes.borrow_mut().push(bounds),
-                    |_, _, _, _| {},
-                )
-                .flex_1()
-                .h_full(),
-            )
-    }
-}
-
-/// A list of [`ComponentRow`]s, each keyed by its id when `keyed` is set.
-struct ComponentRows {
-    row_ids: Vec<u64>,
-    keyed: bool,
-    probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-}
-
-impl Render for ComponentRows {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.probes.borrow_mut().clear();
-        let keyed = self.keyed;
-        let probes = self.probes.clone();
-        div()
-            .flex()
-            .flex_col()
-            .children(self.row_ids.iter().map(move |&id| {
-                let row = ComponentRow {
-                    id,
-                    probes: probes.clone(),
-                };
-                if keyed {
-                    row.key(("row", id)).into_any_element()
-                } else {
-                    row.into_any_element()
-                }
-            }))
-    }
-}
-
-fn component_rows_window(
-    cx: &mut TestAppContext,
-    keyed: bool,
-) -> (
-    WindowHandle<ComponentRows>,
-    Rc<RefCell<Vec<Bounds<Pixels>>>>,
-) {
-    let probes = Rc::new(RefCell::new(Vec::new()));
-    let window = cx.add_window({
-        let probes = probes.clone();
-        move |_, _| ComponentRows {
-            row_ids: (0..4).collect(),
-            keyed,
-            probes,
-        }
-    });
-    draw_frame(cx, window.into());
-    (window, probes)
-}
-
-/// A component's id stops at the element it renders into, so a list of
-/// components is matched by position however its rows are identified
-/// inside. A key is what reaches the list.
-#[test]
-fn components_given_a_key_keep_their_nodes_when_one_is_inserted_ahead() {
-    fn insert_at_head(cx: &mut TestAppContext, keyed: bool) -> LayoutStats {
-        let (window, probes) = component_rows_window(cx, keyed);
-        let stats = change_and_draw(cx, window, |view| view.row_ids.insert(0, 100));
-        assert_eq!(probes.borrow().len(), 5);
-        stats
-    }
-
-    let mut cx = TestAppContext::single();
-    let identified_inside = insert_at_head(&mut cx, false);
-    let keyed = insert_at_head(&mut cx, true);
-
-    // Identified only inside, a shifted row is not handed its
-    // neighbour's node, since the id inside is part of the path; it gets a
-    // new one, which is as much a rebuild. Keyed, only the new row does.
-    assert_eq!(
-        keyed.style_writes, 0,
-        "keyed components should keep the node they styled: {keyed:?}"
-    );
-    assert!(
-        keyed.nodes_created > 0,
-        "the inserted row needs nodes of its own: {keyed:?}"
-    );
-    assert_eq!(
-        identified_inside.nodes_created,
-        5 * keyed.nodes_created,
-        "every component identified only inside should be rebuilt once the rows shift, \
-         and only the inserted one when they are keyed: {identified_inside:?} against {keyed:?}"
-    );
-}
-
-/// A key is only a step in the path a node is found by. It must not add a
-/// node of its own or move anything.
-#[test]
-fn a_key_adds_no_layout_node_and_moves_nothing() {
-    let mut cx = TestAppContext::single();
-    let (plain, plain_probes) = component_rows_window(&mut cx, false);
-    let (keyed, keyed_probes) = component_rows_window(&mut cx, true);
-
-    let node_count = |cx: &mut TestAppContext, window: WindowHandle<ComponentRows>| {
-        cx.update_window(window.into(), |_, window, _| window.layout_node_count())
-            .unwrap()
-    };
-    assert_eq!(node_count(&mut cx, plain), node_count(&mut cx, keyed));
-    assert_eq!(*plain_probes.borrow(), *keyed_probes.borrow());
-}
-
 /// Timing a measurement or a shaped line reads the clock twice, which is
 /// not free on a frame full of text, so the times are kept only once the
 /// stats have been reset — which is how a benchmark asks for them. The
@@ -468,33 +338,52 @@ fn layout_times_are_kept_only_once_the_stats_are_reset() {
     assert!(timed.compute_layout_time > Duration::ZERO);
 }
 
-/// A chip whose identity is given by a key or by an id.
+/// A chip padded inside a row, its child a probe of where it lands.
+fn chip(probes: Rc<RefCell<Vec<Bounds<Pixels>>>>) -> Div {
+    div().pl(px(7.)).child(
+        canvas(
+            move |bounds, _, _| probes.borrow_mut().push(bounds),
+            |_, _, _, _| {},
+        )
+        .w(px(10.))
+        .h(px(10.)),
+    )
+}
+
+/// The chip drawn as a view of its own, which takes a step in the path
+/// its contents' nodes are found by without a node of its own.
+struct ChipView {
+    probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+}
+
+impl Render for ChipView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        chip(self.probes.clone())
+    }
+}
+
+/// A chip identified by the view it is drawn in, or by an id of the same
+/// value.
 struct ReparentedChip {
-    keyed: bool,
+    chip_view: Entity<ChipView>,
+    in_view: bool,
     probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
 }
 
 impl Render for ReparentedChip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let probes = self.probes.clone();
-        probes.borrow_mut().clear();
-        let chip = div().pl(px(7.)).child(
-            canvas(
-                move |bounds, _, _| probes.borrow_mut().push(bounds),
-                |_, _, _, _| {},
-            )
-            .w(px(10.))
-            .h(px(10.)),
-        );
-        div().flex().pl(px(50.)).child(if self.keyed {
-            chip.key("chip").into_any_element()
+        self.probes.borrow_mut().clear();
+        div().flex().pl(px(50.)).child(if self.in_view {
+            self.chip_view.clone().into_any_element()
         } else {
-            chip.id("chip").into_any_element()
+            chip(self.probes.clone())
+                .id(ElementId::View(self.chip_view.entity_id()))
+                .into_any_element()
         })
     }
 }
 
-/// A chip that trades its key for an id of the same value takes the key
+/// A chip that leaves its view for an id of the same value takes the key
 /// its child used to find its node by, so it gets a new node, and the
 /// child is handed the node the chip had. That node is still listed under
 /// the row when the chip's new node adopts it, and the row rewriting its
@@ -505,8 +394,11 @@ fn a_node_adopted_from_another_parent_keeps_its_position() {
     let probes = Rc::new(RefCell::new(Vec::new()));
     let window = cx.add_window({
         let probes = probes.clone();
-        move |_, _| ReparentedChip {
-            keyed: true,
+        move |_, cx| ReparentedChip {
+            chip_view: cx.new(|_| ChipView {
+                probes: probes.clone(),
+            }),
+            in_view: true,
             probes,
         }
     });
@@ -514,7 +406,7 @@ fn a_node_adopted_from_another_parent_keeps_its_position() {
     draw_frame(&mut cx, window.into());
     assert_eq!(probes.borrow()[0].origin.x, px(57.));
 
-    change_and_draw(&mut cx, window, |view| view.keyed = false);
+    change_and_draw(&mut cx, window, |view| view.in_view = false);
     assert_eq!(
         probes.borrow()[0].origin.x,
         px(57.),

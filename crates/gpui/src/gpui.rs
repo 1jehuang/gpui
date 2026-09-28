@@ -105,7 +105,6 @@ pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
-pub use fast::keyed::Keyed;
 pub use fast::memo::{AnyMemoKey, ContentHash, Memo, MemoPrepaint, Version, memo};
 pub use fast::retained::{ViewLayoutState, ViewPrepaintState};
 pub use fast::stats::LayoutStats;
