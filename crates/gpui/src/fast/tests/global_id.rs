@@ -5,8 +5,8 @@
 use crate::{
     AnyWindowHandle, AppContext as _, Context, DivInspectorState, Entity, InspectorElementId,
     InteractiveElement as _, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent,
-    ParentElement as _, Pixels, PlatformInput, Render, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, TestAppContext, Window, div, px,
+    ParentElement as _, Pixels, PlatformInput, Render, StyleRefinement, Styled as _,
+    TestAppContext, Window, div, px,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, rc::Rc};

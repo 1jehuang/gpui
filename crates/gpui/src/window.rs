@@ -1231,7 +1231,7 @@ pub struct Window {
     frame_phase_times: (Duration, Duration, Duration),
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
-    pub(crate) global_ids: crate::fast::GlobalIdCache,
+    pub(crate) global_ids: crate::fast::global_id::GlobalIdCache,
     /// The reusable subtrees — memos and cached views — being built or
     /// painted, innermost last. An interaction inside one, a hover or a
     /// scroll, marks all of them to be built again. See [`crate::memo`].
