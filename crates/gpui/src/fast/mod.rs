@@ -11,8 +11,6 @@
 //! Every submodule's items are re-exported here, and from here at the crate
 //! root, so that they keep the paths they would have had upstream.
 
-#![allow(unused_imports)]
-
 pub(crate) mod dependencies;
 pub(crate) mod global_id;
 pub(crate) mod interactivity;
@@ -27,15 +25,3 @@ pub(crate) mod text;
 
 #[cfg(test)]
 mod tests;
-
-pub use dependencies::*;
-pub use global_id::*;
-pub use interactivity::*;
-pub use keyed::*;
-pub use layout::*;
-pub use layout_key::*;
-pub use memo::*;
-pub use retained::*;
-pub use scene::*;
-pub use stats::*;
-pub use text::*;

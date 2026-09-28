@@ -30,7 +30,7 @@ pub(crate) struct NodeContext {
 }
 pub struct TaffyLayoutEngine {
     pub(crate) taffy: TaffyTree<NodeContext>,
-    pub(crate) retention: crate::fast::LayoutRetention,
+    pub(crate) retention: crate::fast::layout::LayoutRetention,
     pub(crate) absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     pub(crate) absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,

@@ -1,8 +1,9 @@
 //! Taffy layout nodes retained across frames, and the style fingerprint that decides whether a retained node can be left alone.
 
 use crate::{
-    AbsoluteLength, App, AvailableSpace, DefiniteLength, Edges, GridTemplate, LayoutId,
-    LayoutStats, Length, Pixels, Size, Style, TaffyLayoutEngine, Window,
+    AbsoluteLength, App, AvailableSpace, DefiniteLength, Edges, GridTemplate, LayoutId, Length,
+    Pixels, Size, Style, TaffyLayoutEngine, Window,
+    fast::stats::LayoutStats,
     taffy::{EXPECT_MESSAGE, MeasureFn, NodeContext, ToTaffy as _},
     util::round_to_device_pixel,
 };

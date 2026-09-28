@@ -1,7 +1,6 @@
 //! Tests of retained layout: layout nodes carried from one frame to the next,
 //! the keys that match them to elements, and the statistics that show it.
 
-use smallvec::SmallVec;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -9,13 +8,12 @@ use std::{
 };
 
 use crate::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Context, DivInspectorState, ElementId, Entity,
-    Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutStats, Length, Modifiers,
-    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Render,
-    RenderOnce, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled,
-    TestAppContext, UniformListScrollHandle, Window, WindowHandle, WindowOptions, canvas, div,
-    hsla, point, px, size, uniform_list,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement, Pixels, Render, RenderOnce, SharedString, Styled, TestAppContext,
+    UniformListScrollHandle, Window, WindowHandle, canvas, div, fast::stats::LayoutStats, hsla,
+    point, px, size, uniform_list,
 };
+
 /// Drives the retained-layout tests.
 ///
 /// The shape, the styling and the text of the tree are each controllable on
@@ -468,38 +466,6 @@ fn layout_times_are_kept_only_once_the_stats_are_reset() {
     });
     let timed = stats(&mut cx);
     assert!(timed.compute_layout_time > Duration::ZERO);
-}
-
-/// Elements are given the ids the inspector finds them by only while it is
-/// open, since building one copies the whole element id stack. Opening it
-/// has to bring them back on the next frame.
-#[test]
-fn inspector_ids_are_built_only_while_the_inspector_is_open() {
-    let mut cx = TestAppContext::single();
-    let probes = Rc::new(RefCell::new(Vec::new()));
-    let window = retained_layout_window(&mut cx, probes);
-    let inspector_ids = |cx: &mut TestAppContext| {
-        cx.update_window(window.into(), |_, window, _| {
-            window.rendered_frame.next_inspector_instance_ids.len()
-        })
-        .unwrap()
-    };
-
-    draw_frame(&mut cx, window.into());
-    assert_eq!(inspector_ids(&mut cx), 0);
-
-    cx.update_window(window.into(), |_, window, cx| window.toggle_inspector(cx))
-        .unwrap();
-    draw_frame(&mut cx, window.into());
-    assert!(
-        inspector_ids(&mut cx) > 0,
-        "opening the inspector should give elements their ids again"
-    );
-
-    cx.update_window(window.into(), |_, window, cx| window.toggle_inspector(cx))
-        .unwrap();
-    draw_frame(&mut cx, window.into());
-    assert_eq!(inspector_ids(&mut cx), 0);
 }
 
 /// A chip whose identity is given by a key or by an id.

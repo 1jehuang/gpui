@@ -1,8 +1,8 @@
 //! The path of keys from the root of the element tree that matches an element to the layout node it had last frame.
 
 use crate::{
-    AnyElement, App, AvailableSpace, ElementId, FramePhaseTimes, LayoutId, Pixels, SharedString,
-    Size, Style, TaffyLayoutEngine, Window,
+    AnyElement, App, AvailableSpace, ElementId, LayoutId, Pixels, SharedString, Size, Style,
+    TaffyLayoutEngine, Window, fast::stats::FramePhaseTimes,
 };
 use collections::FxHasher;
 use smallvec::SmallVec;

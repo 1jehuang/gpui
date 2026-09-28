@@ -163,11 +163,11 @@ pub trait IntoElement: Sized {
     /// index: a row that keeps its key keeps its layout when rows are
     /// inserted or removed ahead of it. Unlike [`.id()`], it works on anything,
     /// including components built with [`RenderOnce`], whose own id never
-    /// reaches their siblings. It adds no box to the layout. See [`Keyed`](crate::Keyed).
+    /// reaches their siblings. It adds no box to the layout. See [`Keyed`](crate::fast::keyed::Keyed).
     ///
     /// [`.id()`]: crate::InteractiveElement::id
-    fn key(self, key: impl Into<ElementId>) -> crate::Keyed {
-        crate::Keyed::new(key.into(), self.into_any_element())
+    fn key(self, key: impl Into<ElementId>) -> crate::fast::keyed::Keyed {
+        crate::fast::keyed::Keyed::new(key.into(), self.into_any_element())
     }
 }
 

@@ -22,6 +22,7 @@ mod element;
 mod elements;
 mod executor;
 mod fast;
+pub use fast::{keyed::Keyed, stats::LayoutStats};
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
@@ -107,8 +108,6 @@ pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
-#[allow(unused_imports)]
-pub use fast::*;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;

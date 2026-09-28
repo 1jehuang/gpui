@@ -1181,7 +1181,7 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     pub(crate) layout_engine: Option<TaffyLayoutEngine>,
-    pub(crate) fast_layout: crate::fast::WindowLayout,
+    pub(crate) fast_layout: crate::fast::layout_key::WindowLayout,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) global_ids: crate::element::GlobalIdCache,
