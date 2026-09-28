@@ -12,6 +12,8 @@ mod app;
 mod arena;
 mod asset_cache;
 mod assets;
+// gpui-fast replaces the bounds tree with one that replays last frame's orderings.
+#[path = "fast/bounds_tree.rs"]
 mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.
@@ -106,9 +108,9 @@ pub use ctor::ctor;
 pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
+pub use executor::*;
 #[allow(unused_imports)]
 pub use fast::*;
-pub use executor::*;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
