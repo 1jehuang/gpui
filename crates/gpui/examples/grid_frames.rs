@@ -16,8 +16,13 @@
 //! next, which is the axis worth sweeping: reuse can only save the work of
 //! whatever stood still.
 //!
+//! A fourth argument, `cjk`, gives every cell two Chinese characters of its
+//! own instead of a number, so the grid shows thousands of distinct glyphs:
+//! more than one atlas texture holds, which is what a CJK interface draws.
+//!
 //! ```text
 //! cargo run -p gpui --example grid_frames --release -- 50 50 25
+//! cargo run -p gpui --example grid_frames --release -- 50 50 0 cjk
 //! ```
 
 #[path = "example_support/fonts.rs"]
@@ -122,9 +127,9 @@ impl Render for Grid {
                         // live share of them differs from last frame too.
                         let cell = row * columns + column;
                         let index = if cell % 100 < changing_percent {
-                            (tick + cell) % LABELS
+                            (tick + cell) % labels.len()
                         } else {
-                            cell % LABELS
+                            cell % labels.len()
                         };
                         div().w(px(25.)).h(px(15.)).child(labels[index].clone())
                     }))
@@ -133,14 +138,30 @@ impl Render for Grid {
 }
 
 impl Grid {
-    fn new(rows: usize, columns: usize, changing_percent: usize) -> Self {
+    fn new(rows: usize, columns: usize, changing_percent: usize, cjk: bool) -> Self {
+        let labels = if cjk {
+            // Two characters per cell, none shared between cells, from the
+            // start of the CJK Unified Ideographs block.
+            (0..rows * columns)
+                .map(|cell| {
+                    let character = |n: usize| char::from_u32(0x4e00 + n as u32).unwrap();
+                    SharedString::from(format!(
+                        "{}{}",
+                        character(2 * cell),
+                        character(2 * cell + 1)
+                    ))
+                })
+                .collect()
+        } else {
+            (0..LABELS)
+                .map(|n| SharedString::from(format!("{n:02}")))
+                .collect()
+        };
         Grid {
             rows,
             columns,
             changing_percent,
-            labels: (0..LABELS)
-                .map(|n| SharedString::from(format!("{n:02}")))
-                .collect(),
+            labels,
             tick: 0,
             frames: 0,
             measuring_since: None,
@@ -176,11 +197,16 @@ impl Grid {
         };
         let (p50, p95) = (percentile(0.5), percentile(0.95));
         println!(
-            "\n  grid {}x{}, {}% of cells changing, over {} frames\n    \
+            "\n  grid {}x{}{}, {}% of cells changing, over {} frames\n    \
              main cpu          {main_cpu}  (per frame p50 {p50:.2}, p95 {p95:.2} ms)\n    \
              wall              {:>8.2} ms/frame  ({:.1} fps, slowest {:.2} ms)",
             self.rows,
             self.columns,
+            if self.labels.len() > LABELS {
+                " cjk"
+            } else {
+                ""
+            },
             self.changing_percent,
             MEASURED_FRAMES,
             wall.as_secs_f64() * 1e3 / frames,
@@ -244,6 +270,7 @@ fn run_example() {
     let rows: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(50);
     let columns: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(50);
     let changing_percent: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(100);
+    let cjk = args.next().is_some_and(|a| a == "cjk");
 
     application().run(move |cx| {
         if !example_support::load_fonts(cx) {
@@ -259,7 +286,7 @@ fn run_example() {
                 ))),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Grid::new(rows, columns, changing_percent)),
+            |_, cx| cx.new(|_| Grid::new(rows, columns, changing_percent, cjk)),
         )
         .unwrap();
         cx.activate(true);
