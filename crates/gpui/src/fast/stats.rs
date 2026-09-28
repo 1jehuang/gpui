@@ -38,11 +38,6 @@ pub struct LayoutStats {
     /// also counts. The difference between the two is Taffy's own solving.
     /// Kept only once the stats have been reset.
     pub measure_time: Duration,
-    /// Measurements that answered from a result the element had already
-    /// computed, rather than computing a new one. Taffy probes a node more than
-    /// once per layout, so the gap between this and `measure_calls` is what the
-    /// probing actually costs.
-    pub measure_reuses: u64,
     /// Calls to [`TaffyLayoutEngine::compute_layout`].
     pub compute_layout_calls: u64,
     /// Time spent building the element tree: rendering every view and
@@ -169,9 +164,8 @@ impl TaffyLayoutEngine {
         }
     }
 
-    /// Folds what a layout computation measured into [`Self::stats`], along
-    /// with the reuses the window recorded meanwhile.
-    pub(crate) fn finish_measure_tally(&mut self, tally: MeasureTally, window: &mut Window) {
+    /// Folds what a layout computation measured into [`Self::stats`].
+    pub(crate) fn finish_measure_tally(&mut self, tally: MeasureTally) {
         let stats = &mut self.retention.stats;
         stats.compute_layout_calls += 1;
         if let Some(started_at) = tally.compute_started_at {
@@ -179,7 +173,6 @@ impl TaffyLayoutEngine {
         }
         stats.measure_calls += tally.calls;
         stats.measure_time += tally.time;
-        stats.measure_reuses += std::mem::take(&mut window.fast_layout.pending_measure_reuses);
     }
 }
 
@@ -209,15 +202,6 @@ impl Window {
         self.fast_layout.phase_times.reset();
         self.layout_engine.as_mut().unwrap().reset_stats();
         self.text_system().reset_shaping_stats();
-    }
-
-    /// Records that a measurement answered from a result the element already
-    /// had, for [`Window::layout_stats`].
-    ///
-    /// Measurements run with the layout engine moved out of the window, so this
-    /// is tallied here and folded in once layout is done.
-    pub(crate) fn record_measure_reuse(&mut self) {
-        self.fast_layout.pending_measure_reuses += 1;
     }
 
     /// How many layout nodes this window is currently holding on to.

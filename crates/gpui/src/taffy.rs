@@ -87,7 +87,7 @@ impl TaffyLayoutEngine {
         ) -> Size<Pixels>
         + 'static,
     ) -> LayoutId {
-        self.request_uncached_measured_layout(key, style, rem_size, scale_factor, measure)
+        self.request_retained_measured_layout(key, style, rem_size, scale_factor, measure)
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -237,7 +237,7 @@ impl TaffyLayoutEngine {
                 },
             )
             .expect(EXPECT_MESSAGE);
-        self.finish_measure_tally(measures, window);
+        self.finish_measure_tally(measures);
     }
 
     // Pixel snapping

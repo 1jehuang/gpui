@@ -5,6 +5,4 @@ mod layout;
 mod oracle;
 mod retained;
 mod retained_bench;
-mod scene;
 mod support;
-mod text;

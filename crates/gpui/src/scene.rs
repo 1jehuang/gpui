@@ -40,9 +40,8 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
-    pub(crate) primitive_bounds: BoundsTree<ScaledPixels>,
+    primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
-    pub(crate) ordering: crate::fast::scene::SceneOrdering,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -67,7 +66,6 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
-        self.ordering.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -137,15 +135,13 @@ impl Scene {
             }
         }
         self.paint_operations
-            .push(self.primitive_operation(&primitive));
+            .push(PaintOperation::Primitive(primitive));
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(kind, at) => {
-                    self.replay_primitive(prev_scene, *kind, *at)
-                }
+                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -153,7 +149,17 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
-        self.sort_in_drawing_order();
+        self.shadows.sort_by_key(|shadow| shadow.order);
+        self.quads.sort_by_key(|quad| quad.order);
+        self.paths.sort_by_key(|path| path.order);
+        self.underlines.sort_by_key(|underline| underline.order);
+        self.monochrome_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.subpixel_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.polychrome_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.surfaces.sort_by_key(|surface| surface.order);
     }
 
     #[cfg_attr(
@@ -206,14 +212,7 @@ pub(crate) enum PrimitiveKind {
 }
 
 pub(crate) enum PaintOperation {
-    /// Which vector the primitive went into and where it was emitted, rather
-    /// than a second copy of the primitive itself.
-    ///
-    /// The copy this replaces was 168 bytes, which a frame wrote once and a
-    /// replay read back a frame later, by which time it had fallen out of every
-    /// cache. Writing it was free; reading it back was most of what a replay
-    /// cost.
-    Primitive(PrimitiveKind, u32),
+    Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
