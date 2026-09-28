@@ -15,7 +15,6 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
-use crate::StateVersion;
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
@@ -4353,7 +4352,7 @@ struct ScrollHandleState {
     active_item: Option<ScrollActiveItem>,
     /// Changes whenever the handle is scrolled from outside the element, so
     /// that a view drawn again from last frame is built again when it is.
-    version: StateVersion,
+    version: crate::StateVersion,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4534,11 +4533,8 @@ impl ScrollHandle {
     /// As you scroll further down the offset becomes more negative.
     pub fn set_offset(&self, mut position: Point<Pixels>) {
         let state = self.0.borrow();
-        let mut offset = state.offset.borrow_mut();
-        if *offset != position {
-            state.version.bump();
-            *offset = position;
-        }
+        state.version.bump_if(*state.offset.borrow() != position);
+        *state.offset.borrow_mut() = position;
     }
 
     /// Get the logical scroll top, based on a child index and a pixel offset.
