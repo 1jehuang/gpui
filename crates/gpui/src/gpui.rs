@@ -106,6 +106,7 @@ pub use element::*;
 pub use elements::*;
 pub use executor::*;
 pub use fast::memo::{AnyMemoKey, ContentHash, Memo, MemoPrepaint, Version, memo};
+pub use fast::retained::{ViewLayoutState, ViewPrepaintState};
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
