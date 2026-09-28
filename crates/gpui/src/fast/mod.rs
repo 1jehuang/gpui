@@ -8,8 +8,11 @@
 //! structures, algorithms, bookkeeping, tests — is written here, one file per
 //! topic. See `docs/upstream-sync.md` for the rules and how they are checked.
 //!
-//! Every submodule's items are re-exported here, and from here at the crate
-//! root, so that they keep the paths they would have had upstream.
+//! Nothing here is glob-imported or glob-re-exported. Code, upstream's or
+//! ours, names what it uses by its place in this module —
+//! `crate::fast::retained::RetainedSubtrees` — so it is always plain where it
+//! comes from. The few items that are public API are exported from the crate
+//! root one by one, in `gpui.rs`.
 
 pub(crate) mod dependencies;
 pub(crate) mod global_id;
