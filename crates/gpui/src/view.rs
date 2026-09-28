@@ -1,8 +1,9 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, Context, Element, ElementId, Entity,
     EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Render,
-    RenderDependencies, RenderOnce, RetainedLayout, Style, StyleRefinement, WeakEntity,
+    RenderOnce, RetainedLayout, Style, StyleRefinement, WeakEntity,
 };
+use crate::fast::dependencies::RenderDependencies;
 use crate::{Empty, Window};
 use anyhow::Result;
 use refineable::Refineable;

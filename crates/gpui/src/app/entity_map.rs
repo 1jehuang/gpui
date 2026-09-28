@@ -56,7 +56,7 @@ impl Display for EntityId {
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
     pub accessed_entities: RefCell<FxHashSet<EntityId>>,
-    pub(crate) access_log: crate::fast::EntityAccessLog,
+    pub(crate) access_log: crate::fast::dependencies::EntityAccessLog,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
