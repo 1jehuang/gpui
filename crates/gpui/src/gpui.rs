@@ -109,8 +109,6 @@ pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
-#[allow(unused_imports)]
-pub use fast::*;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
