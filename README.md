@@ -24,7 +24,7 @@ gpui-fast retains each level:
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Views**                           | nothing the view read while rendering changed — the entities it accessed, the globals it read, the list and scroll state it depends on — and it is drawn at the same place. It is then neither rendered, laid out, prepainted nor painted: its last frame's output is replayed.       |
 | **`memo(id, key, build)` subtrees** | the key is unchanged. Any `PartialEq` value that stands for what the subtree depends on will do; `Version`, `ContentHash` and `AnyMemoKey` are ready-made ones.                                                                                                                       |
-| **Layout nodes**                    | the element asks for the same style, children and measurement. Taffy's per-node cache survives, so unchanged parts of the tree are not laid out again. Elements keep their nodes by their path from the root, or by `.key(id)` / `ElementId` wherever they move among their siblings. |
+| **Layout nodes**                    | the element asks for the same style, children and measurement. Taffy's per-node cache survives, so unchanged parts of the tree are not laid out again. Elements keep their nodes by their path from the root, or by their `ElementId` wherever they move among their siblings.        |
 | **Shaped text**                     | its text, font and runs are unchanged. Recoloured text keeps its shaping; text already fitting the width it is offered is not shaped again.                                                                                                                                           |
 | **Primitive ordering**              | the bounds painted before it are unchanged; only what meets a changed bound is ordered afresh.                                                                                                                                                                                        |
 | **Element identity**                | the element's path is the one it had last frame.                                                                                                                                                                                                                                      |
@@ -47,59 +47,9 @@ The gain follows how little of the window changes. In gpui-kit's DataTable,
 a table taking new values 30 times a second, drawing costs 37% less than
 before, and 48% less once the table memoizes its rows.
 
-### Correct by construction, checked anyway
-
-A retained frame has to be the frame that drawing from scratch would have
-produced. An oracle test drives two windows through the same random history —
-one drawing incrementally, one from scratch — and requires every frame to
-match, and `gpui_perf --verify` does the same for whole simulated screens.
-
-### Getting more out of it
-
-Nothing has to change for the gains above. Three things take them further;
-[`docs/performance-guide.md`](docs/performance-guide.md) covers each:
-
-- **Key list items by their data**, so a row keeps its layout when something
-  is inserted ahead of it. `.key()` works on anything, components included,
-  and adds no box to the layout:
-
-  ```rust
-  .children(rows.iter().map(|row| render_row(row).key(row.id)))
-  ```
-
-  Inserting at the head of a 200-row list goes from 7.43 ms to 1.97 ms.
-
-- **`memo`** a subtree whose inputs you can name cheaply.
-- **Split large views** into smaller ones, so a change re-renders only the
-  view that read it.
-
-## Staying in step with upstream
-
-gpui-fast tracks Zed's `crates/gpui` and the Zed crates it depends on. The
-upstream commit it is based on is recorded in [`UPSTREAM`](UPSTREAM); the
-source layout and crate paths are upstream's, so any file compares path for
-path with a Zed checkout.
-
-To keep merging upstream cheap, gpui-fast's changes never spread through
-upstream's files:
-
-- **All of gpui-fast's logic lives in `crates/<crate>/src/fast/`**, one file per
-  topic — `fast/retained.rs`, `fast/layout.rs`, `fast/text.rs`, … — and is
-  always referred to by its path, `crate::fast::retained::…`, so it is obvious
-  where code comes from.
-- **Upstream files hold only hooks**: a field holding a `fast` struct, a
-  one-line call into `fast`, a visibility bump. No algorithms, no new types,
-  no tests, no reformatting.
-- **`script/check-upstream` enforces it**, comparing every upstream file with
-  upstream's own copy and failing on anything more than a hook:
-
-  ```sh
-  script/check-upstream                      # against upstream as imported
-  script/check-upstream --zed ~/github/zed   # against a Zed checkout
-  ```
-
-[`docs/upstream-sync.md`](docs/upstream-sync.md) has the rules in full and the
-procedure for taking a new upstream commit.
+A retained frame is checked against the frame drawing from scratch would
+have produced: a test drives two windows through the same random history, one
+drawing incrementally and one from scratch, and requires every frame to match.
 
 ## Using it
 
@@ -118,40 +68,13 @@ Point a project at it in place of upstream GPUI:
 gpui = { git = "https://github.com/longbridge/gpui-fast" }
 ```
 
-## Working on it
+## Following upstream
 
-```sh
-cargo run -p gpui --example hello_world
-cargo test -p gpui --features test-support
-script/check-upstream
-```
-
-Measuring:
-
-```sh
-# Simulated forms, lists, tables and settings screens, retained and not
-cargo run -p gpui_perf --release
-# 2500 labels in a real window, 25% of them changing every frame
-cargo run -p gpui_perf --example grid_frames --release -- 50 50 25
-# A list scrolled back and forth
-cargo run -p gpui_perf --example scroll_frames --release -- uniform oscillate 12 index
-```
-
-`Window::layout_stats()` reports where a frame's time went — build, prepaint,
-layout, paint, text shaping — and how many layout nodes were reused.
-[`docs/frame-budget.html`](docs/frame-budget.html) is the measurement behind
-every figure above, step by step.
-
-```
-crates/gpui                 the framework; gpui-fast's code is in src/fast/
-crates/gpui_platform        platform backend dispatch
-crates/gpui_{linux,macos,windows,web,apple,wgpu}
-                            per-platform backends and renderers
-crates/{collections,util,sum_tree,scheduler,refineable,...}
-                            supporting crates from Zed
-crates/gpui_perf            gpui-fast's benchmarks (not upstream)
-tooling/perf                test-perf harness from Zed
-```
+GPUI Fast is based on Zed at the commit recorded in [`UPSTREAM`](UPSTREAM) and
+takes upstream's changes as Zed makes them. Its own code is kept apart from
+upstream's, so a new upstream is a merge rather than a port. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for how that is kept true, and for building,
+testing and measuring.
 
 ## License
 
