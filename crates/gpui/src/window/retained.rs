@@ -413,22 +413,6 @@ impl Window {
         (Some(Rc::new(layout)), dependencies)
     }
 
-    /// Runs `f` as though the element being prepainted were requesting its
-    /// layout, so that what `f` lays out is keyed as that element's children
-    /// were, and finds the nodes they had.
-    pub(crate) fn with_layout_key_of_prepainting_element<R>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        self.layout_key_stack.push(LayoutKeyFrame {
-            key: self.layout_prepaint_scope,
-            next_unidentified_child: 0,
-        });
-        let result = f(self);
-        self.layout_key_stack.pop();
-        result
-    }
-
     /// How many writes that change a layout the engine has made. See
     /// [`TaffyLayoutEngine::layout_changes`].
     pub(crate) fn layout_changes(&self) -> u64 {

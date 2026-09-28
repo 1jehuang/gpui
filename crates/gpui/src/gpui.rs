@@ -106,9 +106,9 @@ pub use ctor::ctor;
 pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
+pub use executor::*;
 #[allow(unused_imports)]
 pub use fast::*;
-pub use executor::*;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
@@ -163,7 +163,7 @@ pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
 use taffy::TaffyLayoutEngine;
-pub use taffy::{AvailableSpace, LayoutId, LayoutStats};
+pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
