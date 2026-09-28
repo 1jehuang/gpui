@@ -32,7 +32,13 @@ only hold the hooks that call into it.
 3. **No new types, algorithms, bookkeeping or tests in upstream files.** No
    reformatting, reordering or renaming of upstream code either: code we don't
    need to change stays byte-for-byte upstream's.
-4. **New files only inside `fast/`, or in our own crates** such as
+4. **Name fast code by its full path.** No glob imports or re-exports of
+   `fast` (`pub use fast::*`, `use crate::fast::layout::*`): write
+   `crate::fast::<topic>::Name`, or `use crate::fast::<topic>::{..}` with the
+   names listed, so every use shows where the code lives. Public API that has
+   to stay at the crate root gets an explicit line in `gpui.rs`, such as
+   `pub use fast::memo::{Memo, memo};`.
+5. **New files only inside `fast/`, or in our own crates** such as
    `crates/gpui_perf` (benchmarks, examples and the frame-measuring app).
    Documentation goes in `docs/`.
 
@@ -60,8 +66,11 @@ working tree, so run it before committing. It fails when:
 - a changed upstream file adds and removes more than 60 lines in total
   (`--max-file`);
 - a binary file differs.
+- any file, `fast/` included, glob-imports from `fast` (`use ...fast::*`,
+  `use ...fast::<topic>::*`).
 
-Files under any `src/fast/` directory are never checked.
+Apart from the glob rule, files under any `src/fast/` directory are never
+checked.
 
 A justified exception, such as crate metadata in a `Cargo.toml`, goes in
 `script/upstream-allowlist`: one line per path or glob, optionally raising the
