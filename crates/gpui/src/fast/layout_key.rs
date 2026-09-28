@@ -1,16 +1,14 @@
 //! The path of keys from the root of the element tree that matches an element to the layout node it had last frame.
 
 use crate::{
-    AnyElement, App, AvailableSpace, ElementId, LayoutId, Pixels, SharedString, Size, Style,
-    TaffyLayoutEngine, Window, fast::stats::FramePhaseTimes,
+    AnyElement, App, AvailableSpace, ElementId, Pixels, SharedString, Size, Window,
+    fast::stats::FramePhaseTimes,
 };
 use collections::FxHasher;
 use smallvec::SmallVec;
 use std::{
-    any::Any,
     hash::{Hash, Hasher},
     mem,
-    rc::Rc,
 };
 
 /// What a window keeps to match elements to the layout nodes they had last
@@ -26,9 +24,6 @@ pub(crate) struct WindowLayout {
     /// The layout key of the element currently being prepainted, which anything
     /// it lays out from there hangs off. See [`Window::push_layout_key`].
     prepaint_scope: u64,
-    /// Measurement reuses recorded while the layout engine was moved out of the
-    /// window, waiting to be folded into its statistics.
-    pub(crate) pending_measure_reuses: u64,
     /// How long each phase of the frame took. See [`FramePhaseTimes`].
     pub(crate) phase_times: FramePhaseTimes,
 }
@@ -39,7 +34,6 @@ impl Default for WindowLayout {
             key_stack: SmallVec::new(),
             root_index: 0,
             prepaint_scope: LAYOUT_ROOT_SEED,
-            pending_measure_reuses: 0,
             phase_times: FramePhaseTimes::default(),
         }
     }
@@ -85,102 +79,7 @@ fn mix(state: u64, value: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-impl TaffyLayoutEngine {
-    /// [`Self::request_retained_measured_layout`] for a measurement nothing is
-    /// known about: what it depends on is not described, so it is re-run every
-    /// frame.
-    pub(crate) fn request_uncached_measured_layout(
-        &mut self,
-        key: Option<u64>,
-        style: Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-        measure: impl FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
-        ) -> Size<Pixels>
-        + 'static,
-    ) -> LayoutId {
-        let (layout_id, _) = self.request_retained_measured_layout(
-            key,
-            style,
-            rem_size,
-            scale_factor,
-            None,
-            None,
-            Rc::new(()) as Rc<dyn Any>,
-            |_| Box::new(measure),
-        );
-        layout_id
-    }
-}
-
 impl Window {
-    /// Like [`Window::request_measured_layout`], but tells the layout engine
-    /// what the measurement depends on so it can be skipped when nothing has.
-    ///
-    /// `measure_key` must cover every input that can change the measured size —
-    /// and *only* those inputs, since anything else folded into it costs a
-    /// needless relayout. While the key is unchanged, the node is left clean and
-    /// Taffy may answer its size from cache without calling the measurement.
-    ///
-    /// Measurements in GPUI generally do double duty, producing artifacts the
-    /// element later paints from. Those live in `state`: when a skipped
-    /// measurement means nothing was produced this frame, the state that went
-    /// with the previous one is returned instead, and the caller should adopt it.
-    ///
-    /// `closure_key` must cover everything the closure `build_measure` returns
-    /// depends on, including what it captures and `build_measure` itself does.
-    /// While both keys are unchanged the node keeps the closure it already
-    /// has, built around the same state, and `build_measure` is not called.
-    /// A closure that captures anything `measure_key` leaves out, colours for
-    /// example, would otherwise be rebuilt every frame just in case.
-    pub fn request_measured_layout_cached<S, F>(
-        &mut self,
-        style: Style,
-        measure_key: u64,
-        closure_key: u64,
-        state: Rc<S>,
-        build_measure: impl FnOnce(&Rc<S>) -> F,
-    ) -> (LayoutId, Rc<S>)
-    where
-        S: 'static,
-        F: FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
-            + 'static,
-    {
-        self.invalidator.debug_assert_prepaint();
-
-        let rem_size = self.rem_size();
-        let scale_factor = self.scale_factor();
-        let key = self.layout_key();
-        let (layout_id, state) = self
-            .layout_engine
-            .as_mut()
-            .unwrap()
-            .request_retained_measured_layout(
-                key,
-                style,
-                rem_size,
-                scale_factor,
-                Some(measure_key),
-                Some(closure_key),
-                state as Rc<dyn Any>,
-                |state| {
-                    let state = state
-                        .clone()
-                        .downcast::<S>()
-                        .expect("layout state type is checked before it is handed back");
-                    Box::new(build_measure(&state))
-                },
-            );
-        let state = state
-            .downcast::<S>()
-            .expect("layout state type is checked before it is handed back");
-        (layout_id, state)
-    }
-
     /// The key identifying the element currently requesting layout, used to
     /// match it up with the Taffy node it had on the previous frame.
     ///
@@ -305,16 +204,12 @@ impl Window {
     }
 
     /// Drops everything this window keeps from one frame to the next to save
-    /// work — retained layout nodes and the measurements they hold, shaped
-    /// lines, recorded orderings — and asks for a full refresh, so the next
+    /// work — retained layout nodes — and asks for a full refresh, so the next
     /// frame is drawn the way a window drawing its first frame would draw it.
     /// State the application can observe, such as element state, is kept.
     #[cfg(test)]
     pub(crate) fn forget_retained_state(&mut self) {
-        self.layout_engine = Some(TaffyLayoutEngine::new());
-        self.text_system().forget_line_layouts();
-        self.rendered_frame.scene.forget_orderings();
-        self.next_frame.scene.forget_orderings();
+        self.layout_engine = Some(crate::TaffyLayoutEngine::new());
         self.refresh();
     }
 

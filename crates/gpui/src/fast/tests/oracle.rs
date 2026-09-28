@@ -3,8 +3,7 @@
 //!
 //! Each run drives two windows holding the same view through the same random
 //! history of changes. One draws every frame as an application would, reusing
-//! retained layout nodes, shaped lines and last frame's orderings. The other
-//! forgets all of that before every frame, so it draws each one as though it
+//! retained layout nodes. The other forgets them before every frame, so it draws each one as though it
 //! were its first. Every frame, the two must paint the same primitives in the
 //! same places and leave the same hitboxes; any difference is something a
 //! retained shortcut got wrong.

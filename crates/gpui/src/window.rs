@@ -1156,7 +1156,7 @@ pub struct Window {
     display_id: Option<DisplayId>,
     is_resizable: bool,
     is_minimizable: bool,
-    pub(crate) sprite_atlas: Arc<dyn PlatformAtlas>,
+    sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -3055,7 +3055,7 @@ impl Window {
     }
 
     #[inline]
-    pub(crate) fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+    fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.cover_bounds(self.content_mask().bounds),
         }
@@ -4646,7 +4646,7 @@ impl Window {
         Ok(())
     }
 
-    pub(crate) fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }

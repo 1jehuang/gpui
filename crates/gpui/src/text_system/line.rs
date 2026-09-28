@@ -20,7 +20,7 @@ pub struct GlyphRasterData {
 }
 
 /// Set the text decoration for a run of text.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DecorationRun {
     /// The length of the run in utf-8 bytes.
     pub len: u32,
@@ -369,10 +369,6 @@ fn paint_line(
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
         let text_system = cx.text_system().clone();
-        // Nothing painted below changes the content mask, and a run's glyphs
-        // share their rendering, so neither is worked out again per glyph.
-        let content_mask = window.content_mask();
-        let mut glyph_painter = crate::fast::text::LineGlyphPainter::new(window);
         let mut glyph_origin = point(
             aligned_origin_x(
                 origin,
@@ -535,6 +531,7 @@ fn paint_line(
                     size: max_glyph_size,
                 };
 
+                let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
@@ -545,8 +542,7 @@ fn paint_line(
                             layout.font_size,
                         )?;
                     } else {
-                        glyph_painter.paint_glyph(
-                            window,
+                        window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,

@@ -10,11 +10,9 @@ use crate::{
 use collections::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::{
-    any::Any,
     fmt::Debug,
     hash::{Hash as _, Hasher as _},
     mem,
-    rc::Rc,
 };
 use taffy::TaffyTree;
 
@@ -93,8 +91,8 @@ struct RetainedNode {
     /// The children the node was last given, kept here because reading them
     /// back out of Taffy allocates.
     children: SmallVec<[LayoutId; 8]>,
-    /// Present while the node measures its own size.
-    measure: Option<RetainedMeasure>,
+    /// Whether the node measures its own size.
+    measured: bool,
     /// [`layout_fingerprint`] of the style the node was last asked for. While
     /// the request is the same, converting it to a Taffy style and comparing
     /// that against the node's is work with only one possible outcome.
@@ -110,24 +108,6 @@ enum Claim {
     /// No node may be retained for this element: either it has no key, or
     /// another element already claimed the one it has.
     Unkeyed,
-}
-
-/// The retained half of a measured leaf.
-struct RetainedMeasure {
-    /// What the last measurement depended on, as described by the caller.
-    /// `None` means the caller could not describe its inputs, so the
-    /// measurement is treated as stale every frame.
-    key: Option<u64>,
-    /// What the measurement closure the node holds was built from, as
-    /// described by the caller. While it matches, the closure is kept rather
-    /// than built again; `None` means it is built again every frame.
-    closure_key: Option<u64>,
-    /// Where the caller left the result of that measurement.
-    ///
-    /// Handed back when the key still matches, because Taffy may then answer
-    /// the node's size from cache without calling the measurement at all, and
-    /// callers such as text layout keep the artifacts they paint from in here.
-    state: Rc<dyn Any>,
 }
 
 impl TaffyLayoutEngine {
@@ -294,7 +274,7 @@ impl TaffyLayoutEngine {
         key: Option<u64>,
         id: LayoutId,
         children: &[LayoutId],
-        measure: Option<RetainedMeasure>,
+        measured: bool,
         style_fingerprint: u64,
     ) {
         let retention = &mut self.retention;
@@ -308,7 +288,7 @@ impl TaffyLayoutEngine {
                 id,
                 claimed_in_frame: retention.frame,
                 children: SmallVec::from_slice(children),
-                measure,
+                measured,
                 style_fingerprint,
             },
         );
@@ -419,13 +399,13 @@ impl TaffyLayoutEngine {
                     .retention
                     .retained
                     .get(&key)
-                    .is_some_and(|node| node.measure.is_some())
+                    .is_some_and(|node| node.measured)
                 {
                     self.retention
                         .retained
                         .get_mut(&key)
                         .expect("a claimed key is always present")
-                        .measure = None;
+                        .measured = false;
                     self.taffy
                         .set_node_context(id.into(), None)
                         .expect(EXPECT_MESSAGE);
@@ -457,7 +437,7 @@ impl TaffyLayoutEngine {
                 .set_children(id.into(), LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE);
         }
-        self.retain(key, id, children, None, style_fingerprint);
+        self.retain(key, id, children, false, style_fingerprint);
         id
     }
 
@@ -465,27 +445,27 @@ impl TaffyLayoutEngine {
     /// under `key` when there is one. See
     /// [`TaffyLayoutEngine::request_measured_layout`].
     ///
-    /// `measure_key` describes what the measurement depends on. When a retained
-    /// node is found whose `measure_key` is unchanged, the node is left clean,
-    /// so Taffy may answer its size from cache and never call `measure` at all.
-    /// Because callers stash paintable results inside the measurement (text
-    /// layout does), the state that went with the previous measurement is
-    /// handed to `build_measure` and returned, so the caller can adopt it
-    /// instead of starting from an empty one.
-    ///
-    /// Passing `measure_key: None` keeps the old behaviour: the node is dirtied
-    /// every frame and `measure` is guaranteed to run.
+    /// Nothing says what the measurement depends on, so a reused node is given
+    /// the new closure and dirtied, and `measure` is guaranteed to run.
     pub(crate) fn request_retained_measured_layout(
         &mut self,
         key: Option<u64>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
-        measure_key: Option<u64>,
-        closure_key: Option<u64>,
-        fresh_state: Rc<dyn Any>,
-        build_measure: impl FnOnce(&Rc<dyn Any>) -> Box<MeasureFn>,
-    ) -> (LayoutId, Rc<dyn Any>) {
+        measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut Window,
+            &mut App,
+        ) -> Size<Pixels>
+        + 'static,
+    ) -> LayoutId {
+        let measure = Box::new(measure) as Box<MeasureFn>;
+        #[cfg(feature = "stacker")]
+        let measure = crate::taffy::StackSafe::new(measure);
+        self.retention.stats.measure_rebinds += 1;
+
         let (key, id) = match self.claim(key) {
             Claim::Reused(key, id) => (key, id),
             claim => {
@@ -493,106 +473,42 @@ impl TaffyLayoutEngine {
                     Claim::Vacant(key) => Some(key),
                     _ => None,
                 };
-                let measure = build_measure(&fresh_state);
-                #[cfg(feature = "stacker")]
-                let measure = crate::taffy::StackSafe::new(measure);
                 let style_fingerprint = layout_fingerprint(&style, rem_size, scale_factor);
                 let taffy_style = style.to_taffy(rem_size, scale_factor);
                 self.retention.stats.nodes_created += 1;
-                self.retention.stats.measure_rebinds += 1;
                 self.retention.layout_changes += 1;
                 let id: LayoutId = self
                     .taffy
                     .new_leaf_with_context(taffy_style, NodeContext { measure })
                     .expect(EXPECT_MESSAGE)
                     .into();
-                self.retain(
-                    key,
-                    id,
-                    &[],
-                    Some(RetainedMeasure {
-                        key: measure_key,
-                        closure_key,
-                        state: fresh_state.clone(),
-                    }),
-                    style_fingerprint,
-                );
-                return (id, fresh_state);
+                self.retain(key, id, &[], true, style_fingerprint);
+                return id;
             }
         };
 
         self.apply_requested_style(key, id, &style, rem_size, scale_factor);
         self.apply_children(key, id, &[]);
 
-        // The previous measurement still stands only if the caller described
-        // its inputs and they have not changed. The type check guards against a
-        // key collision handing back state of an unrelated kind.
-        let node = self
-            .retention
-            .retained
-            .get_mut(&key)
-            .expect("a claimed key is always present");
-        let previous = node.measure.take();
-        let reusable = match &previous {
-            Some(previous) => {
-                measure_key.is_some()
-                    && previous.key == measure_key
-                    && (*previous.state).type_id() == (*fresh_state).type_id()
-            }
-            None => false,
-        };
-        // The closure the node holds was built around the state being handed
-        // back, from inputs the caller says are unchanged, so it is the closure
-        // that would be built now.
-        let keeps_closure = reusable
-            && closure_key.is_some()
-            && previous
-                .as_ref()
-                .is_some_and(|previous| previous.closure_key == closure_key);
-        let state = match (reusable, previous) {
-            (true, Some(previous)) => previous.state,
-            _ => fresh_state,
-        };
-
-        if !keeps_closure {
-            let measure = build_measure(&state);
-            #[cfg(feature = "stacker")]
-            let measure = crate::taffy::StackSafe::new(measure);
-
-            // Swapping the closure in place leaves the node clean. Going
-            // through `set_node_context` would dirty it, which is exactly what
-            // a reusable measurement must avoid.
-            if let Some(context) = self.taffy.get_node_context_mut(id.into()) {
-                context.measure = measure;
-            } else {
-                self.taffy
-                    .set_node_context(id.into(), Some(NodeContext { measure }))
-                    .expect(EXPECT_MESSAGE);
-            }
+        // Nothing says whether the measurement still stands, and what it
+        // produces lives in state the element made afresh this frame, so it
+        // has to be taken again: the layout counts as changed.
+        self.retention.layout_changes += 1;
+        if let Some(context) = self.taffy.get_node_context_mut(id.into()) {
+            context.measure = measure;
+        } else {
+            self.taffy
+                .set_node_context(id.into(), Some(NodeContext { measure }))
+                .expect(EXPECT_MESSAGE);
         }
-
-        if !reusable {
-            self.retention.stats.measure_rebinds += 1;
-            // A measurement that says nothing of its inputs is taken again
-            // every frame whether or not they changed, so it is no sign that
-            // the layout did.
-            if measure_key.is_some() {
-                self.retention.layout_changes += 1;
-            }
-            self.taffy.mark_dirty(id.into()).expect(EXPECT_MESSAGE);
-        }
-
+        self.taffy.mark_dirty(id.into()).expect(EXPECT_MESSAGE);
         self.retention
             .retained
             .get_mut(&key)
             .expect("a claimed key is always present")
-            .measure = Some(RetainedMeasure {
-            key: measure_key,
-            closure_key,
-            state: state.clone(),
-        });
+            .measured = true;
 
-        (id, state)
+        id
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
