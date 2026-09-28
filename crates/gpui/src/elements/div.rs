@@ -2486,28 +2486,26 @@ impl Interactivity {
                     }
                 }
 
-                // Opacity only affects what is painted, but a retained subtree
-                // inside is drawn again from what it painted only if it would
-                // be painted at the opacity it was, which prepaint decides.
-                window.with_element_opacity(style.opacity, |window| {
-                    window.with_text_style(style.text_style().cloned(), |window| {
-                        window.with_content_mask(
-                            style.overflow_mask(bounds, window.rem_size()),
-                            |window| {
-                                let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                    Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-                                } else {
-                                    None
-                                };
+                let opacity = window.push_element_opacity(style.opacity);
+                let result = window.with_text_style(style.text_style().cloned(), |window| {
+                    window.with_content_mask(
+                        style.overflow_mask(bounds, window.rem_size()),
+                        |window| {
+                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                            } else {
+                                None
+                            };
 
-                                let scroll_offset =
-                                    self.clamp_scroll_position(bounds, &style, window, cx);
-                                let result = f(&style, scroll_offset, hitbox, window, cx);
-                                (result, element_state)
-                            },
-                        )
-                    })
-                })
+                            let scroll_offset =
+                                self.clamp_scroll_position(bounds, &style, window, cx);
+                            let result = f(&style, scroll_offset, hitbox, window, cx);
+                            (result, element_state)
+                        },
+                    )
+                });
+                window.pop_element_opacity(opacity);
+                result
             },
         )
     }

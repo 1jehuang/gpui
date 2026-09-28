@@ -64,9 +64,8 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod prompts;
-mod retained;
 
-pub(crate) use retained::{RetainedLayout, RetainedSubtrees};
+use crate::fast::retained::{EnclosingRetained, RetainedState, RetainedSubtrees};
 
 pub use a11y::A11ySubtreeBuilder;
 
@@ -976,17 +975,14 @@ pub(crate) struct DeferredDraw {
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
-    /// The retained subtrees, as indices into this frame's records, that were
-    /// being drawn when this was deferred. What drawing it reads and the
-    /// hovers it is painted by are theirs too, though it is drawn after them.
-    enclosing_retained: SmallVec<[usize; 4]>,
+    pub(crate) enclosing_retained: EnclosingRetained,
 }
 
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
-    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    pub(crate) accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -1009,12 +1005,12 @@ pub(crate) struct Frame {
 }
 
 /// One level of [`Window::push_layout_key`]'s path stack.
-struct LayoutKeyFrame {
+pub(crate) struct LayoutKeyFrame {
     /// Hash of the path from the root of the element tree to this element.
-    key: u64,
+    pub(crate) key: u64,
     /// How many children without an [`ElementId`] have been entered so far,
     /// which is what identifies the next one.
-    next_unidentified_child: u32,
+    pub(crate) next_unidentified_child: u32,
 }
 
 /// Where layout key paths start.
@@ -1039,26 +1035,26 @@ fn mix(state: u64, value: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-#[derive(Clone, Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct PrepaintStateIndex {
-    hitboxes_index: usize,
-    tooltips_index: usize,
-    deferred_draws_index: usize,
-    dispatch_tree_index: usize,
-    accessed_element_states_index: usize,
-    line_layout_index: LineLayoutIndex,
+    pub(crate) hitboxes_index: usize,
+    pub(crate) tooltips_index: usize,
+    pub(crate) deferred_draws_index: usize,
+    pub(crate) dispatch_tree_index: usize,
+    pub(crate) accessed_element_states_index: usize,
+    pub(crate) line_layout_index: LineLayoutIndex,
 }
 
-#[derive(Clone, Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct PaintIndex {
-    scene_index: usize,
-    window_control_hitboxes_index: usize,
-    mouse_listeners_index: usize,
-    input_handlers_index: usize,
-    cursor_styles_index: usize,
-    accessed_element_states_index: usize,
-    tab_handle_index: usize,
-    line_layout_index: LineLayoutIndex,
+    pub(crate) scene_index: usize,
+    pub(crate) window_control_hitboxes_index: usize,
+    pub(crate) mouse_listeners_index: usize,
+    pub(crate) input_handlers_index: usize,
+    pub(crate) cursor_styles_index: usize,
+    pub(crate) accessed_element_states_index: usize,
+    pub(crate) tab_handle_index: usize,
+    pub(crate) line_layout_index: LineLayoutIndex,
 }
 
 impl Frame {
@@ -1211,17 +1207,17 @@ pub struct Window {
     /// a given rem size.
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
-    layout_engine: Option<TaffyLayoutEngine>,
+    pub(crate) layout_engine: Option<TaffyLayoutEngine>,
     /// Running hashes of the path from the root of the element tree down to the
     /// element currently requesting layout. See [`Window::push_layout_key`].
-    layout_key_stack: SmallVec<[LayoutKeyFrame; 32]>,
+    pub(crate) layout_key_stack: SmallVec<[LayoutKeyFrame; 32]>,
     /// How many unidentified element trees have been laid out under the
     /// current scope. Window roots, prompts, drags and tooltips each start a
     /// tree of their own and need keys that do not collide with each other.
     layout_root_index: u32,
     /// The layout key of the element currently being prepainted, which anything
     /// it lays out from there hangs off. See [`Window::push_layout_key`].
-    layout_prepaint_scope: u64,
+    pub(crate) layout_prepaint_scope: u64,
     /// Measurement reuses recorded while the layout engine was moved out of the
     /// window, waiting to be folded into its statistics.
     pub(crate) pending_measure_reuses: u64,
@@ -1232,20 +1228,7 @@ pub struct Window {
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) global_ids: crate::element::GlobalIdCache,
-    /// The reusable subtrees — memos and cached views — being built or
-    /// painted, innermost last. An interaction inside one, a hover or a
-    /// scroll, marks all of them to be built again. See [`crate::memo`].
-    pub(crate) memo_stack: Vec<GlobalElementId>,
-    /// Reusable subtrees that an interaction inside them changed since they
-    /// were drawn.
-    pub(crate) dirty_memos: FxHashSet<GlobalElementId>,
-    /// Reusable subtrees found out of date too late in a frame to build them
-    /// again, which become [`Window::dirty_memos`] for the next one.
-    pub(crate) memos_dirty_next_frame: FxHashSet<GlobalElementId>,
-    /// Whether each hitbox whose hover a memo's subtree was painted by was
-    /// hovered then, in painting order. A memo keeps the stretch its subtree
-    /// added and is built again once any of them is hovered differently.
-    pub(crate) memo_hover_dependencies: Vec<(HitboxId, bool)>,
+    pub(crate) retained_state: RetainedState,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
@@ -1265,13 +1248,6 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
-    /// Every entity notified since the last frame was drawn, views or not. A
-    /// retained subtree that read any of them is built again.
-    pub(crate) notified_entities: FxHashSet<EntityId>,
-    /// Whether a view that was not notified since the last frame, and read
-    /// nothing that was, is drawn again from what it drew then. See
-    /// [`Window::set_view_retention`].
-    view_retention: bool,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
@@ -2124,10 +2100,7 @@ impl Window {
             root: None,
             element_id_stack: SmallVec::default(),
             global_ids: Default::default(),
-            memo_stack: Vec::new(),
-            dirty_memos: FxHashSet::default(),
-            memos_dirty_next_frame: FxHashSet::default(),
-            memo_hover_dependencies: Vec::new(),
+            retained_state: RetainedState::new(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
@@ -2143,8 +2116,6 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
-            notified_entities: FxHashSet::default(),
-            view_retention: std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
@@ -3332,20 +3303,7 @@ impl Window {
         self.layout_prepaint_scope = LAYOUT_ROOT_SEED;
         self.text_system().finish_frame();
         self.global_ids.finish_frame();
-        self.dirty_memos = mem::take(&mut self.memos_dirty_next_frame);
-        self.memo_hover_dependencies.clear();
-        self.next_frame.retained.finish_frame();
-        #[cfg(any(test, feature = "test-support"))]
-        if self.next_frame.retained.reused_any() {
-            // Reused subtrees do not paint, and the bounds they would have
-            // recorded for tests to find them by are last frame's.
-            for (selector, bounds) in &self.rendered_frame.debug_bounds {
-                self.next_frame
-                    .debug_bounds
-                    .entry(selector.clone())
-                    .or_insert(*bounds);
-            }
-        }
+        self.finish_retained_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -3433,9 +3391,8 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
-        self.notified_entities.clear();
+        self.retained_state.note_notified(&views);
         for entity in views.drain() {
-            self.notified_entities.insert(entity);
             self.mark_view_dirty(entity);
         }
         self.invalidator.replace_views(views);
@@ -3728,15 +3685,7 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (
-                    element,
-                    parent_node,
-                    current_view,
-                    rem_size,
-                    absolute_offset,
-                    prepaint_range,
-                    enclosing_retained,
-                ) = {
+                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3749,22 +3698,13 @@ impl Window {
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
                         deferred_draw.prepaint_range.clone(),
-                        deferred_draw.enclosing_retained.clone(),
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
-                    let recording =
-                        (!enclosing_retained.is_empty()).then(|| cx.begin_recording_dependencies());
-                    // Drawn after the subtrees it was deferred from, but as a
-                    // part of them: what it listens for marks them.
-                    self.memo_stack.extend(
-                        enclosing_retained
-                            .iter()
-                            .map(|&index| self.next_frame.retained.id(index).clone()),
-                    );
+                    let recording = self.begin_deferred_retained_prepaint(deferred_draw_ix, cx);
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
@@ -3772,13 +3712,7 @@ impl Window {
                             });
                         });
                     });
-                    self.memo_stack.clear();
-                    if let Some(recording) = recording {
-                        let dependencies = cx.finish_recording_dependencies(recording);
-                        self.next_frame
-                            .retained
-                            .add_dependencies(&enclosing_retained, &dependencies);
-                    }
+                    self.finish_deferred_retained(recording, cx);
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
@@ -3816,23 +3750,8 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
-                let enclosing_retained = &deferred_draw.enclosing_retained;
-                // Painted after the subtrees it was deferred from, but as a
-                // part of them: an interaction in it marks them, and what it
-                // reads and is hovered by is theirs.
-                let recording = if enclosing_retained.is_empty() {
-                    None
-                } else {
-                    self.memo_stack.extend(
-                        enclosing_retained
-                            .iter()
-                            .map(|&index| self.next_frame.retained.id(index).clone()),
-                    );
-                    Some((
-                        cx.begin_recording_dependencies(),
-                        self.memo_hover_dependencies.len(),
-                    ))
-                };
+                let recording =
+                    self.begin_deferred_retained_paint(&deferred_draw.enclosing_retained, cx);
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     window.with_content_mask(content_mask, |window| {
                         window.with_rem_size(Some(deferred_draw.rem_size), |window| {
@@ -3840,17 +3759,7 @@ impl Window {
                         });
                     })
                 });
-                if let Some((recording, hovers_start)) = recording {
-                    let dependencies = cx.finish_recording_dependencies(recording);
-                    let hovers = self.memo_hover_dependencies.split_off(hovers_start);
-                    self.memo_stack.clear();
-                    self.next_frame
-                        .retained
-                        .add_dependencies(enclosing_retained, &dependencies);
-                    self.next_frame
-                        .retained
-                        .add_hover_dependencies(enclosing_retained, &hovers);
-                }
+                self.finish_deferred_retained(recording, cx);
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
@@ -3928,7 +3837,7 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                     // Drawn from last frame, so it neither reads nor hovers
                     // anything new.
-                    enclosing_retained: SmallVec::new(),
+                    enclosing_retained: EnclosingRetained::default(),
                 }),
         );
     }
@@ -7264,52 +7173,6 @@ impl Window {
             }
         };
         self.refresh();
-    }
-
-    /// The memos around the element being painted, for a listener to mark if
-    /// what it listens for changes the element's look. See [`crate::memo`].
-    pub(crate) fn enclosing_memos(&self) -> SmallVec<[GlobalElementId; 2]> {
-        self.memo_stack.iter().cloned().collect()
-    }
-
-    /// Notes that what is being painted inside a memo looks the way it does
-    /// because `hitbox` is, or is not, hovered. See [`crate::memo`].
-    pub(crate) fn note_memo_hover_dependency(&mut self, hitbox: HitboxId, hovered: bool) {
-        if !self.memo_stack.is_empty() {
-            self.memo_hover_dependencies.push((hitbox, hovered));
-        }
-    }
-
-    /// See [`TaffyLayoutEngine::record_claimed_keys`].
-    pub(crate) fn record_claimed_layout_keys(&mut self) -> usize {
-        self.layout_engine.as_mut().unwrap().record_claimed_keys()
-    }
-
-    /// See [`TaffyLayoutEngine::finish_recording_claimed_keys`].
-    pub(crate) fn finish_recording_claimed_layout_keys(&mut self, start: usize) -> Vec<u64> {
-        self.layout_engine
-            .as_mut()
-            .unwrap()
-            .finish_recording_claimed_keys(start)
-    }
-
-    /// See [`TaffyLayoutEngine::keep_retained`].
-    pub(crate) fn keep_retained_layout(&mut self, keys: &[u64]) {
-        self.layout_engine.as_mut().unwrap().keep_retained(keys);
-    }
-
-    /// Whether every hover in `dependencies`, recorded while a reusable
-    /// subtree — a memo or a cached view — was painted, is still as it was.
-    pub(crate) fn hovers_unchanged(&self, dependencies: &[(HitboxId, bool)]) -> bool {
-        let touch = self.last_input_was_touch();
-        dependencies
-            .iter()
-            .all(|(hitbox, hovered)| (!touch && hitbox.is_hovered(self)) == *hovered)
-    }
-
-    /// Marks memos to be built again rather than reused on the next frame.
-    pub(crate) fn invalidate_memos(&mut self, memos: &[GlobalElementId]) {
-        self.dirty_memos.extend(memos.iter().cloned());
     }
 
     /// Whether the inspector is open, so elements need the ids it finds them by.
