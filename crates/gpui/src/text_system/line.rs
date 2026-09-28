@@ -372,7 +372,7 @@ fn paint_line(
         // Nothing painted below changes the content mask, and a run's glyphs
         // share their rendering, so neither is worked out again per glyph.
         let content_mask = window.content_mask();
-        let mut glyph_painter = crate::LineGlyphPainter::new(window);
+        let mut glyph_painter = crate::fast::text::LineGlyphPainter::new(window);
         let mut glyph_origin = point(
             aligned_origin_x(
                 origin,

@@ -44,7 +44,7 @@ fn replacing_decorations_in_place_lands_where_reshaping_would() {
         let reshaped = system
             .shape_text(text, font_size, &after, None, None)
             .unwrap();
-        crate::update_decoration_runs(&mut recolored, &after);
+        crate::fast::text::update_decoration_runs(&mut recolored, &after);
 
         assert_eq!(recolored.len(), reshaped.len());
         for (recolored, reshaped) in recolored.iter().zip(reshaped.iter()) {

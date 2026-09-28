@@ -71,7 +71,7 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    sized_fonts: crate::fast::SizedFonts,
+    sized_fonts: crate::fast::text_system::SizedFonts,
 }
 
 impl MacTextSystem {

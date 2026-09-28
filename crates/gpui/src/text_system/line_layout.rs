@@ -455,7 +455,7 @@ pub(crate) struct LineLayoutCache {
     pub(crate) previous_frame: Mutex<FrameCache>,
     pub(crate) current_frame: RwLock<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
-    pub(crate) shaping: crate::LineShaping,
+    pub(crate) shaping: crate::fast::text::LineShaping,
 }
 
 #[derive(Default)]
@@ -561,7 +561,7 @@ impl LineLayoutCache {
     pub fn finish_frame(&self) {
         let mut prev_frame = self.previous_frame.lock();
         let mut curr_frame = self.current_frame.write();
-        crate::carry_over_line_layouts(&mut prev_frame, &mut curr_frame);
+        crate::fast::text::carry_over_line_layouts(&mut prev_frame, &mut curr_frame);
     }
 
     pub fn layout_wrapped_line<Text>(

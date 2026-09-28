@@ -7,10 +7,5 @@
 //! call to it. The logic itself — data structures, algorithms, bookkeeping,
 //! tests — is written here, one file per topic.
 
-#![allow(unused_imports)]
-
 #[cfg(feature = "font-kit")]
 pub(crate) mod text_system;
-
-#[cfg(feature = "font-kit")]
-pub(crate) use text_system::*;
