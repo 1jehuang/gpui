@@ -616,8 +616,6 @@ pub struct TextLayout(pub(crate) Rc<RefCell<Option<TextLayoutInner>>>);
 pub(crate) struct TextLayoutInner {
     pub(crate) len: usize,
     pub(crate) lines: SmallVec<[WrappedLine; 1]>,
-    /// What the decorations currently painted onto `lines` were built from, so
-    /// a recolor can be recognised and applied without reshaping.
     pub(crate) decoration_key: u64,
     pub(crate) line_height: Pixels,
     pub(crate) wrap_width: Option<Pixels>,

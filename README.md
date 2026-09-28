@@ -1,4 +1,4 @@
-# gpui-fast
+# GPUI Fast
 
 **GPUI with a retained-mode frame, kept in step with upstream.**
 
@@ -20,14 +20,14 @@ for layout, **prepaint** computes layout and places elements, **paint** turns
 them into the scene handed to the GPU. Upstream does all three from scratch.
 gpui-fast retains each level:
 
-| What is retained | Drawn again from the last frame while |
-|---|---|
-| **Views** | nothing the view read while rendering changed — the entities it accessed, the globals it read, the list and scroll state it depends on — and it is drawn at the same place. It is then neither rendered, laid out, prepainted nor painted: its last frame's output is replayed. |
-| **`memo(id, key, build)` subtrees** | the key is unchanged. Any `PartialEq` value that stands for what the subtree depends on will do; `Version`, `ContentHash` and `AnyMemoKey` are ready-made ones. |
-| **Layout nodes** | the element asks for the same style, children and measurement. Taffy's per-node cache survives, so unchanged parts of the tree are not laid out again. Elements keep their nodes by their path from the root, or by `.key(id)` / `ElementId` wherever they move among their siblings. |
-| **Shaped text** | its text, font and runs are unchanged. Recoloured text keeps its shaping; text already fitting the width it is offered is not shaped again. |
-| **Primitive ordering** | the bounds painted before it are unchanged; only what meets a changed bound is ordered afresh. |
-| **Element identity** | the element's path is the one it had last frame. |
+| What is retained                    | Drawn again from the last frame while                                                                                                                                                                                                                                                 |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Views**                           | nothing the view read while rendering changed — the entities it accessed, the globals it read, the list and scroll state it depends on — and it is drawn at the same place. It is then neither rendered, laid out, prepainted nor painted: its last frame's output is replayed.       |
+| **`memo(id, key, build)` subtrees** | the key is unchanged. Any `PartialEq` value that stands for what the subtree depends on will do; `Version`, `ContentHash` and `AnyMemoKey` are ready-made ones.                                                                                                                       |
+| **Layout nodes**                    | the element asks for the same style, children and measurement. Taffy's per-node cache survives, so unchanged parts of the tree are not laid out again. Elements keep their nodes by their path from the root, or by `.key(id)` / `ElementId` wherever they move among their siblings. |
+| **Shaped text**                     | its text, font and runs are unchanged. Recoloured text keeps its shaping; text already fitting the width it is offered is not shaped again.                                                                                                                                           |
+| **Primitive ordering**              | the bounds painted before it are unchanged; only what meets a changed bound is ordered afresh.                                                                                                                                                                                        |
+| **Element identity**                | the element's path is the one it had last frame.                                                                                                                                                                                                                                      |
 
 Hover, scrolling, bounds, content masks and window refreshes invalidate
 exactly what they affect, without the application doing anything. Retention
@@ -37,11 +37,11 @@ can be turned off, for comparison or debugging, with
 What it is worth, in main-thread CPU per frame on an Apple M4, median of five
 runs, against GPUI as extracted:
 
-| Workload | Upstream | gpui-fast |
-|---|---|---|
-| 2500 live labels in a real window, still | 8.20 ms | 3.64 ms (−56%) |
-| 2500 live labels, every cell changing | 8.25 ms | 5.18 ms (−37%) |
-| A wide table scrolled back and forth | 7.89 ms | 4.07 ms (−48%) |
+| Workload                                 | Upstream | gpui-fast      |
+| ---------------------------------------- | -------- | -------------- |
+| 2500 live labels in a real window, still | 8.20 ms  | 3.64 ms (−56%) |
+| 2500 live labels, every cell changing    | 8.25 ms  | 5.18 ms (−37%) |
+| A wide table scrolled back and forth     | 7.89 ms  | 4.07 ms (−48%) |
 
 The gain follows how little of the window changes. In gpui-kit's DataTable,
 a table taking new values 30 times a second, drawing costs 37% less than

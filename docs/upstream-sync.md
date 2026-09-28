@@ -63,22 +63,29 @@ working tree, so run it before committing. It fails when:
 - a file outside `src/fast/` is added to, or removed from, an upstream
   directory (`LICENSE*` files excepted);
 - a hunk of a changed upstream file adds more than 8 lines (`--max-hunk`);
-- a changed upstream file adds and removes more than 60 lines in total
-  (`--max-file`);
-- a binary file differs.
+- a changed upstream file adds more than 40 lines (`--max-added`) or removes
+  more than 20 (`--max-removed`);
+- a binary file differs;
 - any file, `fast/` included, glob-imports from `fast` (`use ...fast::*`,
   `use ...fast::<topic>::*`).
 
 Apart from the glob rule, files under any `src/fast/` directory are never
-checked.
+checked. A line that differs from upstream's only by a visibility bump
+(`pub(crate)`, `pub(super)`) is a hook by definition: it is counted in the
+table's `pub(crate)` column and not against any budget.
 
-A justified exception, such as crate metadata in a `Cargo.toml`, goes in
-`script/upstream-allowlist`: one line per path or glob, optionally raising the
-budgets or allowing any change, always with a reason:
+A justified exception goes in `script/upstream-allowlist`: one line per path or
+glob, optionally raising the budgets (`hunk=N`, `added=N`, `removed=N`) or
+allowing any change (`any`), always with a reason. The usual reasons are a hub
+file with many one-line hooks, and an upstream body replaced by a `fast/`
+implementation it now forwards to:
 
 ```text
-crates/gpui/Cargo.toml file=80 # dependencies of fast/ modules
+crates/gpui/src/view.rs removed=210 # ViewElement's cache-by-bounds is replaced by fast::retained's retained views
 ```
+
+Removed lines deserve the most care: upstream's changes to code we deleted
+conflict on every sync, and have to be ported into `fast/` by hand.
 
 When the check fails, move the change into a `fast/` module and leave a hook
 behind; use `git diff <import_commit> -- <file>` to see what differs.

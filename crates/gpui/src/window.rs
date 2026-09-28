@@ -999,8 +999,6 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
-    /// The subtrees drawn this frame that a later one can draw again from
-    /// what they drew here. See [`RetainedSubtrees`].
     pub(crate) retained: RetainedSubtrees,
 }
 
@@ -3772,8 +3770,6 @@ impl Window {
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
-                    // Drawn from last frame, so it neither reads nor hovers
-                    // anything new.
                     enclosing_retained: EnclosingRetained::default(),
                 }),
         );
@@ -3793,12 +3789,7 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
-        self.next_frame.window_control_hitboxes.extend(
-            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
-                ..range.end.window_control_hitboxes_index]
-                .iter()
-                .cloned(),
-        );
+        self.reuse_window_control_hitboxes(&range);
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]

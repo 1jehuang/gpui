@@ -73,8 +73,6 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
-    /// Changes whenever the state is changed from outside the list, so that a
-    /// view drawn again from last frame is built again when its list changed.
     version: crate::fast::dependencies::StateVersion,
 }
 

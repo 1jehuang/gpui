@@ -155,16 +155,7 @@ pub trait IntoElement: Sized {
         self.into_element().into_any()
     }
 
-    /// Give this element a key that identifies it among its siblings, so the
-    /// layout it had last frame is found again wherever it is drawn this one.
-    ///
-    /// Put it on each item of a list, keyed by the item rather than by its
-    /// index: a row that keeps its key keeps its layout when rows are
-    /// inserted or removed ahead of it. Unlike [`.id()`], it works on anything,
-    /// including components built with [`RenderOnce`], whose own id never
-    /// reaches their siblings. It adds no box to the layout. See [`Keyed`](crate::fast::keyed::Keyed).
-    ///
-    /// [`.id()`]: crate::InteractiveElement::id
+    /// Gives this element a key among its siblings. See [`Keyed`](crate::Keyed).
     fn key(self, key: impl Into<ElementId>) -> crate::fast::keyed::Keyed {
         crate::fast::keyed::Keyed::new(key.into(), self.into_any_element())
     }
@@ -279,8 +270,6 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
     Start,
     RequestLayout {
         layout_id: LayoutId,
-        /// The key this element's layout node was matched by, kept so that
-        /// anything laid out during its prepaint can be keyed underneath it.
         layout_key: u64,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
@@ -318,9 +307,6 @@ impl<E: Element> Drawable<E> {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
                 let element_id = self.element.id();
-                // Opens this element's level of the layout key path, which is
-                // how its Taffy node is matched up with the one it had on the
-                // previous frame.
                 let layout_key = window.push_layout_key(element_id.as_ref());
                 let global_id = element_id.map(|element_id| {
                     window.element_id_stack.push(element_id);
@@ -430,9 +416,6 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
-                // Elements this one lays out from here — list items, most of
-                // all — get keyed under it rather than under whatever happens
-                // to be laid out around them.
                 let enclosing_scope = window.enter_prepaint_layout_scope(layout_key);
                 let mut prepaint = self.element.prepaint(
                     global_id.as_ref(),

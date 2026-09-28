@@ -8,6 +8,12 @@ use crate::{
 /// Gives an element a key among its siblings, without a box of its own. Made
 /// with [`IntoElement::key`].
 ///
+/// Put it on each item of a list, keyed by the item rather than by its index:
+/// a row that keeps its key keeps its layout when rows are inserted or removed
+/// ahead of it. Unlike [`.id()`](crate::InteractiveElement::id), it works on
+/// anything, including components built with [`RenderOnce`](crate::RenderOnce),
+/// whose own id never reaches their siblings.
+///
 /// Layout nodes are carried from one frame to the next by an element's path
 /// from the root, and each step of that path is either the element's
 /// [`ElementId`] or, when it has none, its position among the siblings that

@@ -555,6 +555,19 @@ impl Window {
         anchor
     }
 
+    /// Copies the window control hitboxes last frame's paint of `range`
+    /// inserted, which upstream's [`Window::reuse_paint`] leaves out: a subtree
+    /// drawn again from last frame would otherwise lose the window controls it
+    /// painted.
+    pub(crate) fn reuse_window_control_hitboxes(&mut self, range: &Range<PaintIndex>) {
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
+                .iter()
+                .cloned(),
+        );
+    }
+
     /// Draws the subtree whose prepaint [`Window::reuse_retained_prepaint`]
     /// drew again as far as its paint goes.
     pub(crate) fn reuse_retained_paint(&mut self, index: usize) {
