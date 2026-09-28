@@ -1,15 +1,14 @@
 use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, HitboxId, InspectorElementId, IntoElement, LayoutId,
-    PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle,
-    WeakEntity,
+    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, Context, Element, ElementId, Entity,
+    EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Render,
+    RenderDependencies, RenderOnce, RetainedLayout, Style, StyleRefinement, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
-use collections::FxHashSet;
 use refineable::Refineable;
 use std::mem;
-use std::{any::TypeId, fmt, ops::Range};
+use std::rc::Rc;
+use std::{any::TypeId, fmt};
 
 /// A dynamically-typed view handle that can be downcast to a specific `Entity<V>`.
 ///
@@ -283,29 +282,44 @@ impl<V: View> IntoElement for ViewElement<V> {
     }
 }
 
-struct ViewElementState {
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
-    cache_key: ViewElementCacheKey,
-    accessed_entities: FxHashSet<EntityId>,
-    /// Whether each hitbox whose hover the view was painted by was hovered
-    /// then. The view is rendered again once any of them is hovered
-    /// differently, as a memo is; see [`crate::memo`].
-    hover_dependencies: Vec<(HitboxId, bool)>,
-    /// The keys of the layout nodes the view was laid out with, kept alive
-    /// while it is reused so that rendering it again reuses them.
-    layout_keys: Vec<u64>,
+/// How a view was laid out, for its prepaint to follow up on.
+#[doc(hidden)]
+pub struct ViewLayoutState(ViewLayout);
+
+/// What a view's prepaint left for its paint.
+#[doc(hidden)]
+pub struct ViewPrepaintState(ViewPrepaint);
+
+enum ViewLayout {
+    /// Laid out by the style it is cached with; built at prepaint if at all.
+    Cached,
+    /// Built, and laid out by its content.
+    Built {
+        element: AnyElement,
+        /// How to lay it out again without building it, and what it read
+        /// while it was built and laid out, when it is retained.
+        retained: Option<(Option<Rc<RetainedLayout>>, RenderDependencies)>,
+    },
+    /// Laid out as it was last frame without being built, from the record
+    /// it left then, which it is drawn again from if nothing moved it.
+    Retained { previous: usize },
+    /// Moved on to prepaint.
+    Taken,
 }
 
-struct ViewElementCacheKey {
-    bounds: Bounds<Pixels>,
-    content_mask: ContentMask<Pixels>,
-    text_style: TextStyle,
+enum ViewPrepaint {
+    /// Built this frame, into its record in this frame if it has one.
+    Built {
+        element: AnyElement,
+        record: Option<usize>,
+    },
+    /// Drawn from last frame, as the record at this index in this frame.
+    Reused(usize),
 }
 
 impl<V: View> Element for ViewElement<V> {
-    type RequestLayoutState = Option<AnyElement>;
-    type PrepaintState = Option<AnyElement>;
+    type RequestLayoutState = ViewLayoutState;
+    type PrepaintState = ViewPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         self.entity_id.map(ElementId::View)
@@ -321,11 +335,55 @@ impl<V: View> Element for ViewElement<V> {
 
     fn request_layout(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let (layout_id, layout) = self.request_view_layout(global_id, window, cx);
+        (layout_id, ViewLayoutState(layout))
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> ViewPrepaintState {
+        let layout = mem::replace(&mut layout.0, ViewLayout::Taken);
+        ViewPrepaintState(self.prepaint_view(global_id, bounds, layout, window, cx))
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(entity_id) = self.entity_id {
+            // Stateful path.
+            paint_view(entity_id, global_id, &mut prepaint.0, window, cx);
+        } else {
+            // Stateless path: just paint the element.
+            paint_component(std::any::type_name::<V>(), &mut prepaint.0, window, cx);
+        }
+    }
+}
+
+impl<V: View> ViewElement<V> {
+    fn request_view_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ViewLayout) {
         if let Some(entity_id) = self.entity_id {
             // Stateful path: create a reactive boundary.
             window.with_rendered_view(entity_id, |window| {
@@ -335,7 +393,32 @@ impl<V: View> Element for ViewElement<V> {
                         let mut root_style = Style::default();
                         root_style.refine(style);
                         let layout_id = window.request_layout(root_style, None, cx);
-                        (layout_id, None)
+                        (layout_id, ViewLayout::Cached)
+                    }
+                    _ if window.view_retention() => {
+                        let global_id = global_id.expect("a view always has an id");
+                        if !window.dirty_views.contains(&entity_id)
+                            && let Some(previous) = window.reusable_retained(global_id, cx)
+                            && let Some(layout_id) = window.reuse_retained_layout(previous, cx)
+                        {
+                            return (layout_id, ViewLayout::Retained { previous });
+                        }
+                        let recording = window.begin_retained_layout(cx);
+                        let mut element = self
+                            .view
+                            .take()
+                            .unwrap()
+                            .render(window, cx)
+                            .into_any_element();
+                        let layout_id = element.request_layout(window, cx);
+                        let retained = window.finish_retained_layout(recording, layout_id, cx);
+                        (
+                            layout_id,
+                            ViewLayout::Built {
+                                element,
+                                retained: Some(retained),
+                            },
+                        )
                     }
                     _ => {
                         let mut element = self
@@ -345,7 +428,13 @@ impl<V: View> Element for ViewElement<V> {
                             .render(window, cx)
                             .into_any_element();
                         let layout_id = element.request_layout(window, cx);
-                        (layout_id, Some(element))
+                        (
+                            layout_id,
+                            ViewLayout::Built {
+                                element,
+                                retained: None,
+                            },
+                        )
                     }
                 }
             })
@@ -361,134 +450,149 @@ impl<V: View> Element for ViewElement<V> {
                         .render(window, cx)
                         .into_any_element();
                     let layout_id = element.request_layout(window, cx);
-                    (layout_id, Some(element))
+                    (
+                        layout_id,
+                        ViewLayout::Built {
+                            element,
+                            retained: None,
+                        },
+                    )
                 },
             )
         }
     }
 
-    fn prepaint(
+    fn prepaint_view(
         &mut self,
         global_id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        element: &mut Self::RequestLayoutState,
+        layout: ViewLayout,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<AnyElement> {
-        if let Some(entity_id) = self.entity_id {
-            // Stateful path.
-            window.set_view_id(entity_id);
-            window.with_rendered_view(entity_id, |window| {
-                if let Some(mut element) = element.take() {
-                    element.prepaint(window, cx);
-                    return Some(element);
-                }
-
-                let global_id = global_id.unwrap();
-                window.with_element_state::<ViewElementState, _>(
-                    global_id,
-                    |element_state, window| {
-                        let content_mask = window.content_mask();
-                        let text_style = window.text_style();
-
-                        if let Some(mut element_state) = element_state
-                            && element_state.cache_key.bounds == bounds
-                            && element_state.cache_key.content_mask == content_mask
-                            && element_state.cache_key.text_style == text_style
-                            && !window.dirty_views.contains(&entity_id)
-                            && !window.refreshing
-                            && !window.dirty_memos.contains(global_id)
-                            && !cx.has_active_drag()
-                            && window.hovers_unchanged(&element_state.hover_dependencies)
-                            && window.deferred_hovers_unchanged(global_id)
-                        {
-                            window.keep_retained_layout(&element_state.layout_keys);
-                            let prepaint_start = window.prepaint_index();
-                            window.reuse_prepaint(element_state.prepaint_range.clone());
-                            cx.entities
-                                .extend_accessed(&element_state.accessed_entities);
-                            let prepaint_end = window.prepaint_index();
-                            element_state.prepaint_range = prepaint_start..prepaint_end;
-
-                            return (None, element_state);
-                        }
-
-                        let refreshing = mem::replace(&mut window.refreshing, true);
-                        window.memo_stack.push(global_id.clone());
-                        let prepaint_start = window.prepaint_index();
-                        let recording = window.record_claimed_layout_keys();
-                        let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                            let mut element = self
-                                .view
-                                .take()
-                                .unwrap()
-                                .render(window, cx)
-                                .into_any_element();
-                            element.layout_as_root(bounds.size.into(), window, cx);
-                            element.prepaint_at(bounds.origin, window, cx);
-                            element
-                        });
-
-                        let layout_keys = window.finish_recording_claimed_layout_keys(recording);
-                        let prepaint_end = window.prepaint_index();
-                        window.memo_stack.pop();
-                        window.refreshing = refreshing;
-
-                        (
-                            Some(element),
-                            ViewElementState {
-                                accessed_entities,
-                                hover_dependencies: Vec::new(),
-                                layout_keys,
-                                prepaint_range: prepaint_start..prepaint_end,
-                                paint_range: PaintIndex::default()..PaintIndex::default(),
-                                cache_key: ViewElementCacheKey {
-                                    bounds,
-                                    content_mask,
-                                    text_style,
-                                },
-                            },
-                        )
-                    },
-                )
-            })
-        } else {
+    ) -> ViewPrepaint {
+        let Some(entity_id) = self.entity_id else {
             // Stateless path: just prepaint the element.
+            let ViewLayout::Built { mut element, .. } = layout else {
+                unreachable!("a stateless view is always built");
+            };
             window.with_id(
                 ElementId::Name(std::any::type_name::<V>().into()),
                 |window| {
-                    element.as_mut().unwrap().prepaint(window, cx);
+                    element.prepaint(window, cx);
                 },
             );
-            Some(element.take().unwrap())
-        }
+            return ViewPrepaint::Built {
+                element,
+                record: None,
+            };
+        };
+
+        window.set_view_id(entity_id);
+        window.with_rendered_view(entity_id, |window| {
+            let global_id = global_id.expect("a view always has an id");
+            match layout {
+                ViewLayout::Built {
+                    mut element,
+                    retained: None,
+                } => {
+                    element.prepaint(window, cx);
+                    ViewPrepaint::Built {
+                        element,
+                        record: None,
+                    }
+                }
+                ViewLayout::Built {
+                    mut element,
+                    retained: Some((layout, dependencies)),
+                } => {
+                    let recording = window.begin_retained(global_id, cx);
+                    element.prepaint(window, cx);
+                    let record = window.finish_retained_prepaint(
+                        recording,
+                        bounds,
+                        layout,
+                        Some(dependencies),
+                        cx,
+                    );
+                    ViewPrepaint::Built { element, record }
+                }
+                ViewLayout::Retained { previous } => {
+                    if window.retained_context_matches(previous, bounds) {
+                        return ViewPrepaint::Reused(
+                            window.reuse_retained_prepaint(previous, true, cx),
+                        );
+                    }
+                    self.build_at_retained_layout(previous, global_id, bounds, window, cx)
+                }
+                ViewLayout::Cached => {
+                    if !window.dirty_views.contains(&entity_id)
+                        && let Some(previous) = window.reusable_retained(global_id, cx)
+                        && window.retained_context_matches(previous, bounds)
+                    {
+                        return ViewPrepaint::Reused(
+                            window.reuse_retained_prepaint(previous, false, cx),
+                        );
+                    }
+                    let recording = window.begin_retained(global_id, cx);
+                    let mut element = self
+                        .view
+                        .take()
+                        .unwrap()
+                        .render(window, cx)
+                        .into_any_element();
+                    element.layout_as_root(bounds.size.into(), window, cx);
+                    element.prepaint_at(bounds.origin, window, cx);
+                    let record = window.finish_retained_prepaint(recording, bounds, None, None, cx);
+                    ViewPrepaint::Built { element, record }
+                }
+                ViewLayout::Taken => unreachable!("a view is prepainted once"),
+            }
+        })
     }
 
-    fn paint(
+    /// Builds a view whose layout was reused, but which cannot be drawn again
+    /// from last frame because it is drawn somewhere else: it moved, or what it
+    /// inherits changed. It is laid out at the nodes it kept, which it finds
+    /// again as it requests them. Nothing it depends on changed, so it asks
+    /// for the layout it had; if it asks for another after all, it is laid out
+    /// within the bounds it was given, and on the next frame from scratch.
+    #[inline(never)]
+    fn build_at_retained_layout(
         &mut self,
-        global_id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        element: &mut Self::PrepaintState,
+        previous: usize,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
-    ) {
-        if let Some(entity_id) = self.entity_id {
-            // Stateful path.
-            paint_view(
-                entity_id,
-                self.cached_style.is_some(),
-                global_id,
-                element,
-                window,
-                cx,
-            );
+    ) -> ViewPrepaint {
+        let root = window.retained_layout_root(previous);
+        window.release_retained_layout(previous);
+        let layout_recording = window.begin_retained_layout(cx);
+        let changes_before = window.layout_changes();
+        let view = self.view.take().unwrap();
+        let (mut element, layout_id) = window.with_layout_key_of_prepainting_element(|window| {
+            let mut element = view.render(window, cx).into_any_element();
+            let layout_id = element.request_layout(window, cx);
+            (element, layout_id)
+        });
+        let unchanged = window.layout_changes() == changes_before;
+        let (layout, dependencies) = window.finish_retained_layout(layout_recording, layout_id, cx);
+
+        let recording = window.begin_retained(global_id, cx);
+        if Some(layout_id) == root {
+            if !unchanged {
+                window.relayout_in_place(layout_id, bounds.size.into(), cx);
+                window.request_animation_frame();
+            }
+            element.prepaint(window, cx);
         } else {
-            // Stateless path: just paint the element.
-            paint_component(std::any::type_name::<V>(), element, window, cx);
+            element.layout_as_root(bounds.size.into(), window, cx);
+            element.prepaint_at(bounds.origin, window, cx);
+            window.request_animation_frame();
         }
+        let record =
+            window.finish_retained_prepaint(recording, bounds, layout, Some(dependencies), cx);
+        ViewPrepaint::Built { element, record }
     }
 }
 
@@ -504,59 +608,25 @@ impl Render for EmptyView {
 #[inline(never)]
 fn paint_view(
     entity_id: EntityId,
-    cached: bool,
     global_id: Option<&GlobalElementId>,
-    element: &mut Option<AnyElement>,
+    prepaint: &mut ViewPrepaint,
     window: &mut Window,
     cx: &mut App,
 ) {
-    window.with_rendered_view(entity_id, |window| {
-        let caching_disabled = window.is_inspector_picking(cx);
-        if cached && !caching_disabled {
-            window.with_element_state::<ViewElementState, _>(
-                global_id.unwrap(),
-                |element_state, window| {
-                    let mut element_state = element_state.unwrap();
-
-                    let paint_start = window.paint_index();
-                    let global_id = global_id.unwrap();
-
-                    if let Some(element) = element {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
-                        window.memo_stack.push(global_id.clone());
-                        let dependencies_start = window.memo_hover_dependencies.len();
-                        element.paint(window, cx);
-                        element_state.hover_dependencies =
-                            window.memo_hover_dependencies[dependencies_start..].to_vec();
-                        window.memo_stack.pop();
-                        window.refreshing = refreshing;
-                    } else {
-                        // Checked against last frame's hitboxes before the view
-                        // was reused; something drawn over it this frame shows
-                        // only now, and the view is rendered on the next frame.
-                        if !window.hovers_unchanged(&element_state.hover_dependencies) {
-                            window
-                                .memos_dirty_next_frame
-                                .extend(window.memo_stack.iter().cloned());
-                            window.memos_dirty_next_frame.insert(global_id.clone());
-                            window.request_animation_frame();
-                        }
-                        window.reuse_paint(element_state.paint_range.clone());
-                        if !window.memo_stack.is_empty() {
-                            window
-                                .memo_hover_dependencies
-                                .extend_from_slice(&element_state.hover_dependencies);
-                        }
-                    }
-
-                    let paint_end = window.paint_index();
-                    element_state.paint_range = paint_start..paint_end;
-
-                    ((), element_state)
-                },
-            )
-        } else {
-            element.as_mut().unwrap().paint(window, cx);
+    window.with_rendered_view(entity_id, |window| match prepaint {
+        ViewPrepaint::Reused(index) => window.reuse_retained_paint(*index),
+        ViewPrepaint::Built {
+            element,
+            record: None,
+        } => element.paint(window, cx),
+        ViewPrepaint::Built {
+            element,
+            record: Some(record),
+        } => {
+            let global_id = global_id.expect("a view always has an id");
+            let recording = window.begin_retained_paint(Some(*record), global_id, cx);
+            element.paint(window, cx);
+            window.finish_retained_paint(recording, cx);
         }
     });
 }
@@ -564,12 +634,15 @@ fn paint_view(
 #[inline(never)]
 fn paint_component(
     name: &'static str,
-    element: &mut Option<AnyElement>,
+    prepaint: &mut ViewPrepaint,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let ViewPrepaint::Built { element, .. } = prepaint else {
+        unreachable!("a stateless view is always built");
+    };
     window.with_id(ElementId::Name(name.into()), |window| {
-        element.as_mut().unwrap().paint(window, cx);
+        element.paint(window, cx);
     });
 }
 
@@ -732,5 +805,175 @@ mod tests {
         }
         assert_eq!(builds.get(), builds_before + 1);
         assert_ne!(Some(hovered), look);
+    }
+
+    struct Counted {
+        label: usize,
+        model: Option<Entity<Model>>,
+        builds: Rc<Cell<usize>>,
+    }
+
+    struct Model(usize);
+
+    impl Render for Counted {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.builds.set(self.builds.get() + 1);
+            let model = self.model.as_ref().map_or(0, |model| model.read(cx).0);
+            div()
+                .flex()
+                .flex_row()
+                .child(format!("{} {}", self.label, model))
+        }
+    }
+
+    struct Siblings {
+        first: Entity<Counted>,
+        second: Entity<Counted>,
+        spacer: f32,
+    }
+
+    impl Render for Siblings {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .child(div().h(px(self.spacer)))
+                .child(self.first.clone())
+                .child(self.second.clone())
+        }
+    }
+
+    struct SiblingsWindow {
+        window: WindowHandle<Siblings>,
+        first: Entity<Counted>,
+        model: Entity<Model>,
+        first_builds: Rc<Cell<usize>>,
+        second_builds: Rc<Cell<usize>>,
+    }
+
+    fn siblings(cx: &mut TestAppContext) -> SiblingsWindow {
+        let first_builds = Rc::new(Cell::new(0));
+        let second_builds = Rc::new(Cell::new(0));
+        let model = cx.new(|_| Model(0));
+        let window = cx.add_window({
+            let (first_builds, second_builds, model) =
+                (first_builds.clone(), second_builds.clone(), model.clone());
+            move |_, cx| Siblings {
+                first: cx.new(|_| Counted {
+                    label: 1,
+                    model: None,
+                    builds: first_builds,
+                }),
+                second: cx.new(|_| Counted {
+                    label: 2,
+                    model: Some(model),
+                    builds: second_builds,
+                }),
+                spacer: 10.,
+            }
+        });
+        let first = window.update(cx, |view, _, _| view.first.clone()).unwrap();
+        SiblingsWindow {
+            window,
+            first,
+            model,
+            first_builds,
+            second_builds,
+        }
+    }
+
+    fn draw_siblings(cx: &mut TestAppContext, window: WindowHandle<Siblings>) -> Vec<String> {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.describe_rendered_frame()
+        })
+        .unwrap()
+    }
+
+    /// A view that is neither cached nor memoized is drawn again from the
+    /// last frame while nothing it read changed, even when the view around it
+    /// is rendered again, and rendered again once something it read did.
+    #[test]
+    fn a_view_is_rendered_again_only_when_something_it_read_changed() {
+        let mut cx = TestAppContext::single();
+        let s = siblings(&mut cx);
+        draw_siblings(&mut cx, s.window);
+        assert_eq!((s.first_builds.get(), s.second_builds.get()), (1, 1));
+
+        s.window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        draw_siblings(&mut cx, s.window);
+        assert_eq!(
+            (s.first_builds.get(), s.second_builds.get()),
+            (1, 1),
+            "notifying the parent leaves its children alone"
+        );
+
+        s.first.update(&mut cx, |first, cx| {
+            first.label = 3;
+            cx.notify();
+        });
+        draw_siblings(&mut cx, s.window);
+        assert_eq!((s.first_builds.get(), s.second_builds.get()), (2, 1));
+
+        s.model.update(&mut cx, |model, cx| {
+            model.0 = 5;
+            cx.notify();
+        });
+        draw_siblings(&mut cx, s.window);
+        assert_eq!(
+            (s.first_builds.get(), s.second_builds.get()),
+            (2, 2),
+            "a model the view read changing renders it again, unobserved"
+        );
+
+        cx.update_window(s.window.into(), |_, window, _| window.refresh())
+            .unwrap();
+        draw_siblings(&mut cx, s.window);
+        assert_eq!((s.first_builds.get(), s.second_builds.get()), (3, 3));
+    }
+
+    /// A view that moved is built again where it went, at the layout nodes it
+    /// kept, and draws what a window drawing from scratch draws.
+    #[test]
+    fn a_moved_view_is_built_again_at_its_layout() {
+        let mut cx = TestAppContext::single();
+        let s = siblings(&mut cx);
+        draw_siblings(&mut cx, s.window);
+        s.window
+            .update(&mut cx, |view, _, cx| {
+                view.spacer = 30.;
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(s.window.into(), |_, window, _| window.reset_layout_stats())
+            .unwrap();
+        let moved = draw_siblings(&mut cx, s.window);
+        assert_eq!((s.first_builds.get(), s.second_builds.get()), (2, 2));
+        let stats = cx
+            .update_window(s.window.into(), |_, window, _| window.layout_stats())
+            .unwrap();
+        assert_eq!(stats.nodes_created, 0, "the moved views keep their nodes");
+
+        cx.update_window(s.window.into(), |_, window, _| {
+            window.forget_retained_state()
+        })
+        .unwrap();
+        assert_eq!(moved, draw_siblings(&mut cx, s.window));
+    }
+
+    /// With retention turned off, every view is rendered every frame.
+    #[test]
+    fn views_are_rendered_every_frame_without_retention() {
+        let mut cx = TestAppContext::single();
+        let s = siblings(&mut cx);
+        cx.update_window(s.window.into(), |_, window, _| {
+            window.set_view_retention(false)
+        })
+        .unwrap();
+        draw_siblings(&mut cx, s.window);
+        let before = (s.first_builds.get(), s.second_builds.get());
+        s.window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        draw_siblings(&mut cx, s.window);
+        assert!(s.first_builds.get() > before.0 && s.second_builds.get() > before.1);
     }
 }

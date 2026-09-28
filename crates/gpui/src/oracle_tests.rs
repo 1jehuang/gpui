@@ -17,12 +17,12 @@ use std::{borrow::Cow, sync::Arc};
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
 
 use crate::{
-    AnyElement, Bounds, Context, DevicePixels, Entity, Font, FontId, FontMetrics, FontRun, GlyphId,
-    Hsla, InputEvent as _, IntoElement, LineLayout, ListAlignment, ListOffset, ListState,
+    AnyElement, Bounds, Context, DevicePixels, Entity, Font, FontId, FontMetrics, FontRun, Global,
+    GlyphId, Hsla, InputEvent as _, IntoElement, LineLayout, ListAlignment, ListOffset, ListState,
     MouseMoveEvent, NoopTextSystem, Pixels, PlatformTextSystem, Render, RenderGlyphParams, Result,
     SharedString, Size, StyleRefinement, TestAppContext, TextRenderingMode,
-    UniformListScrollHandle, Window, WindowHandle, div, hsla, list, memo, point, prelude::*, px,
-    size, uniform_list,
+    UniformListScrollHandle, Window, WindowHandle, anchored, deferred, div, hsla, list, memo,
+    point, prelude::*, px, size, uniform_list,
 };
 
 const WORDS: [&str; 10] = [
@@ -79,29 +79,80 @@ enum RowIdentity {
 
 #[derive(Clone, Debug)]
 enum Change {
-    Word { cell: usize, word: usize },
-    Color { cell: usize, color: usize },
-    Width { cell: usize, width: f32 },
-    Toggle { cell: usize, flag: CellFlag },
-    Paragraph { words: usize, width: f32 },
-    InsertRow { at: usize },
-    RemoveRow { at: usize },
-    Scroll { top: f32 },
-    InsertChip { at: usize },
-    RemoveChip { at: usize },
-    RotateChips { by: usize },
+    Word {
+        cell: usize,
+        word: usize,
+    },
+    Color {
+        cell: usize,
+        color: usize,
+    },
+    Width {
+        cell: usize,
+        width: f32,
+    },
+    Toggle {
+        cell: usize,
+        flag: CellFlag,
+    },
+    Paragraph {
+        words: usize,
+        width: f32,
+    },
+    InsertRow {
+        at: usize,
+    },
+    RemoveRow {
+        at: usize,
+    },
+    Scroll {
+        top: f32,
+    },
+    InsertChip {
+        at: usize,
+    },
+    RemoveChip {
+        at: usize,
+    },
+    RotateChips {
+        by: usize,
+    },
     RowIdentity(RowIdentity),
     Direction,
     Badge,
-    MoveMouse { x: f32, y: f32 },
-    Resize { width: f32, height: f32 },
+    /// Changes one panel, notifying only it.
+    Panel {
+        panel: usize,
+        value: usize,
+    },
+    /// Changes the leaf view nested in a panel, notifying only it.
+    Leaf {
+        panel: usize,
+    },
+    /// Changes the model some panels read without observing it, notifying
+    /// only the model.
+    Shared {
+        value: usize,
+    },
+    /// Changes a global some panels read.
+    Global {
+        value: usize,
+    },
+    MoveMouse {
+        x: f32,
+        y: f32,
+    },
+    Resize {
+        width: f32,
+        height: f32,
+    },
     Redraw,
 }
 
 impl Change {
     fn random(rng: &mut StdRng) -> Self {
         let cell = rng.random_range(0..GRID_CELLS);
-        match rng.random_range(0..100) {
+        match rng.random_range(0..116) {
             0..20 => Change::Word {
                 cell,
                 word: rng.random_range(0..WORDS.len()),
@@ -154,6 +205,19 @@ impl Change {
                 x: rng.random_range(0.0..900.0),
                 y: rng.random_range(0.0..700.0),
             },
+            100..105 => Change::Panel {
+                panel: rng.random_range(0..PANELS),
+                value: rng.random_range(0..WORDS.len()),
+            },
+            105..109 => Change::Leaf {
+                panel: rng.random_range(0..PANELS),
+            },
+            109..113 => Change::Shared {
+                value: rng.random_range(0..WORDS.len()),
+            },
+            113..116 => Change::Global {
+                value: rng.random_range(0..PALETTE.len()),
+            },
             92..95 => Change::Resize {
                 width: rng.random_range(300.0..1000.0),
                 height: rng.random_range(240.0..800.0),
@@ -163,8 +227,11 @@ impl Change {
     }
 }
 
+const PANELS: usize = 6;
+
 /// A small application: a grid of cells, wrapping paragraphs, a row of chips,
-/// a cached child view and the same rows in a uniform list and a list.
+/// a cached child view, child views that are neither cached nor memoized, one
+/// of them deferred, and the same rows in a uniform list and a list.
 struct OracleView {
     cells: Vec<CellState>,
     paragraph_words: usize,
@@ -179,10 +246,13 @@ struct OracleView {
     uniform_scroll: UniformListScrollHandle,
     list_state: ListState,
     badge: Entity<Badge>,
+    panels: Vec<Entity<Panel>>,
+    shared: Entity<Shared>,
 }
 
 impl OracleView {
     fn new(cx: &mut Context<Self>) -> Self {
+        let shared = cx.new(|_| Shared { value: 0 });
         Self {
             cells: (0..GRID_CELLS)
                 .map(|ix| CellState {
@@ -205,6 +275,20 @@ impl OracleView {
             uniform_scroll: UniformListScrollHandle::new(),
             list_state: ListState::new(INITIAL_ROWS as usize, ListAlignment::Top, px(40.)),
             badge: cx.new(|_| Badge { count: 0 }),
+            panels: {
+                (0..PANELS)
+                    .map(|ix| {
+                        let shared = shared.clone();
+                        cx.new(|cx| Panel {
+                            ix,
+                            value: ix,
+                            shared,
+                            leaf: cx.new(|_| Leaf { count: ix }),
+                        })
+                    })
+                    .collect()
+            },
+            shared,
         }
     }
 
@@ -270,7 +354,32 @@ impl OracleView {
                 });
                 return;
             }
-            Change::MoveMouse { .. } | Change::Resize { .. } | Change::Redraw => return,
+            Change::Panel { panel, value } => {
+                self.panels[panel].update(cx, |panel, cx| {
+                    panel.value = value;
+                    cx.notify();
+                });
+                return;
+            }
+            Change::Leaf { panel } => {
+                let leaf = self.panels[panel].read(cx).leaf.clone();
+                leaf.update(cx, |leaf, cx| {
+                    leaf.count += 1;
+                    cx.notify();
+                });
+                return;
+            }
+            Change::Shared { value } => {
+                self.shared.update(cx, |shared, cx| {
+                    shared.value = value;
+                    cx.notify();
+                });
+                return;
+            }
+            Change::Global { .. }
+            | Change::MoveMouse { .. }
+            | Change::Resize { .. }
+            | Change::Redraw => return,
         }
         cx.notify();
     }
@@ -433,8 +542,85 @@ impl Render for OracleView {
                     .gap_1()
                     .children(self.chips.iter().map(|&chip| render_chip(chip, identity))),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(self.panels[..PANELS - 1].iter().cloned()),
+            )
+            .child(
+                div()
+                    .size(px(10.))
+                    .child(deferred(anchored().child(self.panels[PANELS - 1].clone()))),
+            )
             .child(uniform_rows)
             .child(list_rows)
+    }
+}
+
+/// A model panels read without observing it.
+struct Shared {
+    value: usize,
+}
+
+/// A global panels read.
+struct Accent(usize);
+
+impl Global for Accent {}
+
+/// A child view drawn neither cached nor memoized, so the window keeps it
+/// from one frame to the next by itself. Some panels read the shared model
+/// and the global.
+struct Panel {
+    ix: usize,
+    value: usize,
+    shared: Entity<Shared>,
+    leaf: Entity<Leaf>,
+}
+
+impl Render for Panel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let shared = if self.ix.is_multiple_of(2) {
+            self.shared.read(cx).value
+        } else {
+            0
+        };
+        let accent = if self.ix.is_multiple_of(3) {
+            cx.try_global::<Accent>().map_or(0, |accent| accent.0)
+        } else {
+            0
+        };
+        div()
+            .flex()
+            .flex_col()
+            .p_1()
+            .bg(PALETTE[(self.value + accent) % PALETTE.len()])
+            .when(self.ix == 1, |this| {
+                this.hover(|style| style.bg(PALETTE[4]))
+            })
+            .child(WORDS[(self.value + shared) % WORDS.len()])
+            .child(self.leaf.clone())
+    }
+}
+
+/// A view nested in a panel, notified on its own.
+struct Leaf {
+    count: usize,
+}
+
+impl Render for Leaf {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .children((0..self.count % 3 + 1).map(|ix| {
+                div()
+                    .w(px(4. + ix as f32 * 5.))
+                    .h(px(6.))
+                    .bg(PALETTE[(self.count + ix) % PALETTE.len()])
+            }))
     }
 }
 
@@ -537,6 +723,7 @@ fn apply(cx: &mut TestAppContext, window: WindowHandle<OracleView>, change: &Cha
         Change::Resize { width, height } => {
             cx.simulate_window_resize(window.into(), size(px(width), px(height)));
         }
+        Change::Global { value } => cx.update(|cx| cx.set_global(Accent(value))),
         _ => window
             .update(cx, |view, _, cx| view.apply(change, cx))
             .unwrap(),
@@ -549,7 +736,7 @@ fn draw(
     cx: &mut TestAppContext,
     window: WindowHandle<OracleView>,
     from_scratch: bool,
-) -> (Vec<String>, u64) {
+) -> (Vec<String>, u64, bool) {
     cx.update_window(window.into(), |_, window, cx| {
         if from_scratch {
             window.forget_retained_state();
@@ -559,6 +746,7 @@ fn draw(
         (
             window.describe_rendered_frame(),
             window.layout_stats().nodes_reused,
+            window.rendered_frame.retained.reused_any(),
         )
     })
     .unwrap()
@@ -566,13 +754,14 @@ fn draw(
 
 /// Drives both windows through one random history and returns how many
 /// layout nodes the incremental window reused along the way.
-fn run(seed: u64, steps: usize) -> u64 {
+fn run(seed: u64, steps: usize) -> (u64, usize) {
     let mut cx = TestAppContext::with_text_system(Arc::new(GlyphBoxTextSystem(NoopTextSystem)));
     let incremental = cx.add_window(|_, cx| OracleView::new(cx));
     let from_scratch = cx.add_window(|_, cx| OracleView::new(cx));
     let mut rng = StdRng::seed_from_u64(seed);
     let mut history: Vec<Vec<Change>> = Vec::new();
     let mut reused = 0;
+    let mut frames_reusing_subtrees = 0;
 
     for step in 0..steps {
         let changes: Vec<Change> = if step == 0 {
@@ -588,13 +777,19 @@ fn run(seed: u64, steps: usize) -> u64 {
         }
         history.push(changes);
 
-        let (expected, reused_from_scratch) = draw(&mut cx, from_scratch, true);
-        let (actual, reused_incrementally) = draw(&mut cx, incremental, false);
+        let (expected, reused_from_scratch, subtrees_from_scratch) =
+            draw(&mut cx, from_scratch, true);
+        let (actual, reused_incrementally, reused_subtrees) = draw(&mut cx, incremental, false);
         assert_eq!(
             reused_from_scratch, 0,
             "a window that forgot its layout nodes cannot have reused any"
         );
+        assert!(
+            !subtrees_from_scratch,
+            "a refreshed window cannot draw anything from its last frame"
+        );
         reused += reused_incrementally;
+        frames_reusing_subtrees += reused_subtrees as usize;
 
         if actual != expected {
             let first = actual
@@ -629,14 +824,20 @@ fn run(seed: u64, steps: usize) -> u64 {
             );
         }
     }
-    reused
+    (reused, frames_reusing_subtrees)
 }
 
 #[test]
 fn incremental_frames_match_frames_drawn_from_scratch() {
-    let reused: u64 = (0..24).map(|seed| run(seed, 60)).sum();
+    let (reused, frames_reusing_subtrees) = (0..24)
+        .map(|seed| run(seed, 60))
+        .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
     assert!(
         reused > 0,
         "the incremental window never reused a layout node, so nothing was compared"
+    );
+    assert!(
+        frames_reusing_subtrees > 0,
+        "the incremental window never drew a view again from its last frame"
     );
 }

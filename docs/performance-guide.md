@@ -13,6 +13,7 @@ commit after it. The measurements behind every figure are in
   2. [`memo`: skipping a subtree whose key is unchanged](#2-memo-skipping-a-subtree-whose-key-is-unchanged)
   3. [Cached views](#3-cached-views)
   4. [What the retained frame rewards](#4-what-the-retained-frame-rewards)
+- [Retained views](#retained-views)
 - [Measuring](#measuring)
 
 ## Changes that need nothing from the application
@@ -37,6 +38,7 @@ only what changed.
 | Element identity | Copies and hashes the whole element id stack several times per element | Hashes a path once, and gives an element the global id it had last frame |
 | Element size | A `div` is 1360 bytes, copied through every builder call | Listener lists and accessibility stay out of line until used: 752 bytes |
 | Inspector | Builds inspector ids and state for every element in debug builds or with the `inspector` feature | Only while the inspector is open |
+| Views | Renders, lays out, prepaints and paints every view every frame | Draws a view again from the last frame while nothing it read changed, see [Retained views](#retained-views) |
 
 Main-thread CPU per frame on an Apple M4, median of five runs:
 
@@ -66,6 +68,7 @@ Additions:
 | `memo(id, key, build) -> Memo<K>` | A subtree drawn again from last frame while its key is equal |
 | `Version`, `ContentHash`, `AnyMemoKey` | Ready-made memo keys |
 | `Window::layout_stats()`, `Window::reset_layout_stats()`, `LayoutStats` | Counters and timings for a frame's layout, shaping and phases |
+| `Window::set_view_retention(bool)`, `Window::view_retention()` | Turns retained views off, and back on; `GPUI_VIEW_RETENTION=0` turns them off everywhere |
 
 Changed behaviour with an unchanged signature: `Entity::cached` and
 `AnyView::cached` keep their layout nodes while reused and follow hover, see
@@ -160,6 +163,9 @@ it what `memo` has:
   neither is something drawn over it in the same frame. Both are caught now.
 - It is rendered again while something is being dragged, and when a hover,
   scroll or press inside it marks it dirty.
+- It is rendered again when an entity or global it read changed, notified or
+  not, as every retained view is, and a cached view or memo built again reuses
+  the retained subtrees nested in it instead of building them all.
 
 Choosing between the two:
 
@@ -191,6 +197,47 @@ an application keeps unchanged is what it saves:
 - **Notifying over refreshing.** `window.refresh()` rebuilds every cached view
   and memo; notifying the view that changed keeps the rest.
 
+## Retained views
+
+Every view — any `Entity<V: Render>` or `AnyView` placed in the element tree —
+is a retained subtree, cached or not, with no change to how it is written.
+While nothing it depends on changed since the last frame, it is not rendered:
+its layout is taken from the nodes it left, and its hitboxes, listeners,
+dispatch nodes and primitives are copied from the last frame. A view depends
+on:
+
+- **What it read.** Every entity accessed and every global read while it was
+  rendered, laid out, prepainted and painted — its own entity, models it reads
+  without observing them, the views nested in it — and the list states and
+  scroll handles its lists and scrollable elements track. Changing any of them,
+  notified or not for a global or a handle, draws it again.
+- **Where it is drawn.** Its bounds, content mask, text style and opacity. A
+  view that moved is rendered again at the layout nodes it kept.
+- **The hovers it was painted by**, and interactions inside it, as for a memo.
+
+A notified view is rendered again together with the views around it, which
+have to be walked to reach it; the views beside it and inside it that did not
+change are drawn from the last frame. So the more of a window is split into
+views, the less a change costs:
+
+| | Draws from the last frame |
+|---|---|
+| Nothing changed | Everything |
+| One view notified | Everything but that view and the views around it |
+| `window.refresh()`, focus change, resize, drag, inspector picking, accessibility active | Nothing |
+
+What a view's render reads that is none of the above — an `Rc<RefCell<..>>`
+shared outside entities, the time, `window.modifiers()` — it has to be notified
+of, as a cached view has to. `window.set_view_retention(false)` draws every view
+every frame, as upstream GPUI does, to rule retention in or out when something
+looks stale.
+
+Nested subtrees stay reusable while the one around them is drawn again from
+the last frame: each frame keeps a record per retained subtree, and drawing
+one again copies the records nested in it, shifted to where the copy landed.
+A cached view or memo that is built again therefore no longer builds
+everything nested in it.
+
 ## Measuring
 
 `Window::layout_stats()` reports counters accumulated since
@@ -220,6 +267,14 @@ println!(
 The counters cost a few integer increments per node and are always on. The
 times take a clock read per measurement, so they are kept only once
 `reset_layout_stats()` has been called.
+
+`crates/gpui_perf` drives simulated application screens — forms, lists, a data
+table, a settings page — headlessly with real text shaping, with retained views
+on and off, and compares what each frame cost:
+
+```sh
+cargo run -p gpui_perf --release
+```
 
 Two benchmarks draw through a real window:
 

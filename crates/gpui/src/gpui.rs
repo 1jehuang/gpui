@@ -48,6 +48,8 @@ pub mod profiler;
 ))]
 #[expect(missing_docs)]
 pub mod queue;
+#[cfg(test)]
+mod retained_bench;
 mod scene;
 mod shared_uri;
 mod spring;

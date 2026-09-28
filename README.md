@@ -128,6 +128,13 @@ Each of these is one commit, with its own measurements in the commit message.
   `PartialEq` value that stands for everything the subtree depends on;
   `Version`, `ContentHash` and `AnyMemoKey` are ready-made ones. Hover, scrolls,
   bounds and refreshes are taken care of by the framework.
+- **Views are retained.** Every view, cached or not, is drawn again from the
+  last frame while nothing it read — entities, globals, list and scroll
+  state — changed and it is drawn where it was, without being rendered, laid
+  out, prepainted or painted. Nested subtrees are relocated along with the one
+  around them, so a cached view or memo built again no longer builds
+  everything inside it. Nothing about how views are written changes;
+  `Window::set_view_retention(false)` or `GPUI_VIEW_RETENTION=0` turns it off.
 - **Anything can carry a key.** `.key(id)` gives any element, components
   included, an identity among its siblings without adding a layout box. A
   component's own id never reached that far.

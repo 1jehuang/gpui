@@ -1,17 +1,13 @@
 //! An element that reuses what it drew last frame while its key is unchanged.
 
 use crate::{
-    AnyElement, App, Bounds, ContentMask, Element, ElementId, EntityId, GlobalElementId, HitboxId,
-    InspectorElementId, IntoElement, LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Style,
-    StyleRefinement, Styled, TextStyle, Window,
+    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, Pixels, Style, StyleRefinement, Styled, Window,
 };
-use collections::FxHashSet;
 use refineable::Refineable;
 use std::{
     any::Any,
     hash::{Hash, Hasher},
-    mem,
-    ops::Range,
 };
 
 /// A subtree that is built only when `key` differs from the one it was drawn
@@ -113,29 +109,22 @@ impl<K: PartialEq + 'static> DynMemoKey for K {
     }
 }
 
-/// What a memo remembers from the frame it was last drawn in.
+/// What a memo remembers of the key it was last built with. Where its last
+/// frame's drawing is, and what it depended on besides the key, is in the
+/// frame's retained records, see [`Window::reusable_retained`].
 struct MemoState<K> {
     key: K,
-    bounds: Bounds<Pixels>,
-    content_mask: ContentMask<Pixels>,
-    text_style: TextStyle,
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
-    accessed_entities: FxHashSet<EntityId>,
-    /// Whether each hitbox whose hover the subtree was painted by was hovered
-    /// then. The subtree looks different once any of them is hovered
-    /// differently, so it is built again.
-    hover_dependencies: Vec<(HitboxId, bool)>,
-    /// The keys of the layout nodes the subtree was laid out with, kept alive
-    /// while it is reused so that building it again reuses them.
-    layout_keys: Vec<u64>,
 }
 
-impl<K> MemoState<K> {
-    /// Whether every hover the subtree was painted by is still as it was.
-    fn hovers_unchanged(&self, window: &Window) -> bool {
-        window.hovers_unchanged(&self.hover_dependencies)
-    }
+/// What a memo's prepaint left for its paint.
+#[doc(hidden)]
+pub struct MemoPrepaint(MemoDrawn);
+
+enum MemoDrawn {
+    /// Built this frame, into its record in this frame if it has one.
+    Built(AnyElement, Option<usize>),
+    /// Drawn from last frame, as the record at this index in this frame.
+    Reused(usize),
 }
 
 impl<K: PartialEq + 'static> Styled for Memo<K> {
@@ -154,8 +143,7 @@ impl<K: PartialEq + 'static> IntoElement for Memo<K> {
 
 impl<K: PartialEq + 'static> Element for Memo<K> {
     type RequestLayoutState = ();
-    /// The subtree, when it was built this frame rather than reused.
-    type PrepaintState = Option<AnyElement>;
+    type PrepaintState = MemoPrepaint;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -189,60 +177,23 @@ impl<K: PartialEq + 'static> Element for Memo<K> {
         let global_id = global_id.expect("a memo always has an id");
         let key = self.key.take().expect("a memo is prepainted once");
         window.with_element_state::<MemoState<K>, _>(global_id, |state, window| {
-            let content_mask = window.content_mask();
-            let text_style = window.text_style();
-
-            if let Some(mut state) = state
-                && state.key == key
-                && state.bounds == bounds
-                && state.content_mask == content_mask
-                && state.text_style == text_style
-                && !window.refreshing
-                && !window.dirty_memos.contains(global_id)
-                && !window.is_inspector_picking(cx)
-                && !cx.has_active_drag()
-                && state.hovers_unchanged(window)
-                && window.deferred_hovers_unchanged(global_id)
+            if state.is_some_and(|state| state.key == key)
+                && let Some(previous) = window.reusable_retained(global_id, cx)
+                && window.retained_context_matches(previous, bounds)
             {
-                window.keep_retained_layout(&state.layout_keys);
-                let prepaint_start = window.prepaint_index();
-                window.reuse_prepaint(state.prepaint_range.clone());
-                cx.entities.extend_accessed(&state.accessed_entities);
-                state.prepaint_range = prepaint_start..window.prepaint_index();
-                return (None, state);
+                let index = window.reuse_retained_prepaint(previous, false, cx);
+                return (MemoPrepaint(MemoDrawn::Reused(index)), MemoState { key });
             }
 
-            // Whatever is nested inside was drawn as part of this subtree, so
-            // none of it can be reused once this subtree is built again.
-            let refreshing = mem::replace(&mut window.refreshing, true);
-            window.memo_stack.push(global_id.clone());
-            let prepaint_start = window.prepaint_index();
-            let recording = window.record_claimed_layout_keys();
+            let recording = window.begin_retained(global_id, cx);
             let build = self.build.take().expect("a memo is built once");
-            let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                let mut element = build(window, cx);
-                element.layout_as_root(bounds.size.into(), window, cx);
-                element.prepaint_at(bounds.origin, window, cx);
-                element
-            });
-            let layout_keys = window.finish_recording_claimed_layout_keys(recording);
-            let prepaint_end = window.prepaint_index();
-            window.memo_stack.pop();
-            window.refreshing = refreshing;
-
+            let mut element = build(window, cx);
+            element.layout_as_root(bounds.size.into(), window, cx);
+            element.prepaint_at(bounds.origin, window, cx);
+            let record = window.finish_retained_prepaint(recording, bounds, None, None, cx);
             (
-                Some(element),
-                MemoState {
-                    key,
-                    bounds,
-                    content_mask,
-                    text_style,
-                    prepaint_range: prepaint_start..prepaint_end,
-                    paint_range: PaintIndex::default()..PaintIndex::default(),
-                    accessed_entities,
-                    hover_dependencies: Vec::new(),
-                    layout_keys,
-                },
+                MemoPrepaint(MemoDrawn::Built(element, record)),
+                MemoState { key },
             )
         })
     }
@@ -253,49 +204,19 @@ impl<K: PartialEq + 'static> Element for Memo<K> {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        element: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         let global_id = global_id.expect("a memo always has an id");
-        window.with_element_state::<MemoState<K>, _>(global_id, |state, window| {
-            let mut state = state.expect("a memo is prepainted before it is painted");
-            let paint_start = window.paint_index();
-            match element {
-                Some(element) => {
-                    let refreshing = mem::replace(&mut window.refreshing, true);
-                    window.memo_stack.push(global_id.clone());
-                    let dependencies_start = window.memo_hover_dependencies.len();
-                    element.paint(window, cx);
-                    state.hover_dependencies =
-                        window.memo_hover_dependencies[dependencies_start..].to_vec();
-                    window.memo_stack.pop();
-                    window.refreshing = refreshing;
-                }
-                None => {
-                    // The hovers were checked against last frame's hitboxes;
-                    // this frame's could put something over the subtree. That
-                    // is found out only now, too late to build it again, so it
-                    // is built on the next frame, which is asked for.
-                    if !state.hovers_unchanged(window) {
-                        window
-                            .memos_dirty_next_frame
-                            .extend(window.memo_stack.iter().cloned());
-                        window.memos_dirty_next_frame.insert(global_id.clone());
-                        window.request_animation_frame();
-                    }
-                    window.reuse_paint(state.paint_range.clone());
-                    // Memos around this one depend on these hovers too.
-                    if !window.memo_stack.is_empty() {
-                        window
-                            .memo_hover_dependencies
-                            .extend_from_slice(&state.hover_dependencies);
-                    }
-                }
+        match &mut prepaint.0 {
+            MemoDrawn::Reused(index) => window.reuse_retained_paint(*index),
+            MemoDrawn::Built(element, record) => {
+                let recording = window.begin_retained_paint(*record, global_id, cx);
+                element.paint(window, cx);
+                window.finish_retained_paint(recording, cx);
             }
-            state.paint_range = paint_start..window.paint_index();
-            ((), state)
-        })
+        }
     }
 }
 

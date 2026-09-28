@@ -979,6 +979,10 @@ impl VisualTestContext {
         self.update(|window, cx| {
             let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
+            // Drawn outside of the window's frames, which is what tells
+            // retained subtrees what changed since they were drawn, so
+            // nothing is drawn again from an earlier frame.
+            window.refreshing = true;
             window.invalidator.set_phase(DrawPhase::Prepaint);
             let mut element = Drawable::new(f(window, cx));
             element.layout_as_root(space.into(), window, cx);

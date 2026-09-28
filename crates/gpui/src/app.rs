@@ -742,6 +742,17 @@ pub struct App {
     // below is plain data, the drop order is insignificant here
     pub(crate) pending_notifications: FxHashSet<EntityId>,
     pub(crate) pending_global_notifications: TypeIdHashSet,
+    /// Counts the changes to globals, each of which is stamped into
+    /// [`App::global_changed_at`], so a retained subtree can tell whether a
+    /// global it read has changed since it was built.
+    global_generation: u64,
+    global_changed_at: TypeIdHashMap<u64>,
+    /// Every global read while a recording is open. See
+    /// [`App::begin_recording_dependencies`].
+    global_read_log: RefCell<Vec<TypeId>>,
+    /// Every [`StateVersion`] read while a recording is open, with the
+    /// version it was at.
+    state_read_log: RefCell<Vec<(StateVersion, u64)>>,
     pub(crate) restart_path: Option<PathBuf>,
     pub(crate) restart_arguments: Vec<OsString>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
@@ -838,6 +849,10 @@ impl App {
                 pending_effects: VecDeque::new(),
                 pending_notifications: FxHashSet::default(),
                 pending_global_notifications: Default::default(),
+                global_generation: 0,
+                global_changed_at: Default::default(),
+                global_read_log: RefCell::new(Vec::new()),
+                state_read_log: RefCell::new(Vec::new()),
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
                 window_invalidators_by_entity: FxHashMap::default(),
@@ -1127,20 +1142,97 @@ impl App {
         })
     }
 
-    pub(crate) fn detect_accessed_entities<R>(
+    /// Starts recording what is read from here on — the entities accessed and
+    /// the globals read — for a subtree that is drawn again from what it drew
+    /// while none of it changes. Recordings nest; each sees everything read
+    /// while it is open, including what nested ones saw.
+    pub(crate) fn begin_recording_dependencies(&mut self) -> DependencyRecording {
+        DependencyRecording {
+            entities: self.entities.begin_recording(),
+            globals: self.global_read_log.get_mut().len(),
+            states: self.state_read_log.get_mut().len(),
+            generation: self.global_generation,
+        }
+    }
+
+    /// Ends `recording`, returning what was read while it was open.
+    pub(crate) fn finish_recording_dependencies(
         &mut self,
-        callback: impl FnOnce(&mut App) -> R,
-    ) -> (R, FxHashSet<EntityId>) {
-        let accessed_entities_start = self.entities.accessed_entities.get_mut().clone();
-        let result = callback(self);
-        let entities_accessed_in_callback = self
-            .entities
-            .accessed_entities
-            .get_mut()
-            .difference(&accessed_entities_start)
-            .copied()
-            .collect::<FxHashSet<EntityId>>();
-        (result, entities_accessed_in_callback)
+        recording: DependencyRecording,
+    ) -> RenderDependencies {
+        let mut globals = self.global_read_log.get_mut()[recording.globals..].to_vec();
+        let states = dedup_states(&self.state_read_log.get_mut()[recording.states..]);
+        let entities = self.entities.finish_recording(recording.entities);
+        if !self.entities.is_recording() {
+            self.global_read_log.get_mut().clear();
+            self.state_read_log.get_mut().clear();
+        }
+        globals.sort_unstable();
+        globals.dedup();
+        RenderDependencies {
+            entities: entities.into(),
+            globals: globals.into(),
+            states,
+            // As of when the recording began, so that a global written while
+            // it was open, after being read, counts as changed.
+            generation: recording.generation,
+        }
+    }
+
+    /// Tells the window, and any recording that is open, that `dependencies`
+    /// were read again, as they are when a subtree built from them is reused.
+    pub(crate) fn replay_dependencies(&mut self, dependencies: &RenderDependencies) {
+        self.entities.extend_accessed(dependencies.entities.iter());
+        if self.entities.is_recording() {
+            self.global_read_log
+                .get_mut()
+                .extend(dependencies.globals.iter().copied());
+            self.state_read_log
+                .get_mut()
+                .extend(dependencies.states.iter().cloned());
+        }
+    }
+
+    /// Records, for any recording that is open, that the state `version`
+    /// belongs to was read as it is now.
+    #[inline]
+    pub(crate) fn note_state_read(&self, version: &StateVersion) {
+        if self.entities.is_recording() {
+            self.state_read_log
+                .borrow_mut()
+                .push((version.clone(), version.get()));
+        }
+    }
+
+    /// Whether anything in `dependencies` may have changed since they were
+    /// recorded: one of the entities is among `notified`, or one of the
+    /// globals has been written.
+    pub(crate) fn dependencies_changed(
+        &self,
+        dependencies: &RenderDependencies,
+        notified: &FxHashSet<EntityId>,
+    ) -> bool {
+        (!notified.is_empty()
+            && dependencies
+                .entities
+                .iter()
+                .any(|entity| notified.contains(entity)))
+            || dependencies.globals.iter().any(|global| {
+                self.global_changed_at
+                    .get(global)
+                    .is_some_and(|changed_at| *changed_at > dependencies.generation)
+            })
+            || dependencies
+                .states
+                .iter()
+                .any(|(version, read_at)| version.get() != *read_at)
+    }
+
+    #[inline]
+    fn note_global_read(&self, global: TypeId) {
+        if self.entities.is_recording() {
+            self.global_read_log.borrow_mut().push(global);
+        }
     }
 
     pub(crate) fn record_entities_accessed(
@@ -1701,6 +1793,12 @@ impl App {
                 }
             }
             Effect::NotifyGlobalObservers { global_type } => {
+                // Stamped on every change, not only the first one an effect
+                // is queued for: a subtree built in between has seen only the
+                // first.
+                self.global_generation += 1;
+                self.global_changed_at
+                    .insert(*global_type, self.global_generation);
                 if !self.pending_global_notifications.insert(*global_type) {
                     return;
                 }
@@ -2059,12 +2157,14 @@ impl App {
 
     /// Check whether a global of the given type has been assigned.
     pub fn has_global<G: Global>(&self) -> bool {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type.contains_key(&TypeId::of::<G>())
     }
 
     /// Access the global of the given type. Panics if a global for that type has not been assigned.
     #[track_caller]
     pub fn global<G: Global>(&self) -> &G {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2073,6 +2173,7 @@ impl App {
 
     /// Access the global of the given type if a value has been assigned.
     pub fn try_global<G: Global>(&self) -> Option<&G> {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2935,6 +3036,89 @@ impl AppContext for App {
     {
         let mut g = self.global::<G>();
         callback(g, self)
+    }
+}
+
+/// Where a recording started by [`App::begin_recording_dependencies`] begins.
+#[derive(Clone, Copy)]
+pub(crate) struct DependencyRecording {
+    entities: usize,
+    globals: usize,
+    states: usize,
+    generation: u64,
+}
+
+/// What a retained subtree read while it was built: the entities it accessed
+/// and the globals it read, as of a global generation. While none of them has
+/// changed, building the subtree again would build the same thing.
+#[derive(Clone, Default)]
+pub(crate) struct RenderDependencies {
+    pub(crate) entities: Rc<[EntityId]>,
+    pub(crate) globals: Rc<[TypeId]>,
+    /// Element state kept outside of entities — scroll handles, list states
+    /// — with the version each was read at.
+    pub(crate) states: Rc<[(StateVersion, u64)]>,
+    pub(crate) generation: u64,
+}
+
+/// A counter that state shared outside of entities — a scroll handle, a list
+/// state — increments whenever it changes, so that a retained subtree that
+/// read it is built again, as it would be for an entity that was notified.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct StateVersion(Rc<Cell<u64>>);
+
+impl StateVersion {
+    pub(crate) fn get(&self) -> u64 {
+        self.0.get()
+    }
+
+    /// Marks the state as changed.
+    pub(crate) fn bump(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+
+    fn ptr(&self) -> *const Cell<u64> {
+        Rc::as_ptr(&self.0)
+    }
+}
+
+/// `states` once each, at the earliest version read, so that a change in
+/// between still counts.
+fn dedup_states(states: &[(StateVersion, u64)]) -> Rc<[(StateVersion, u64)]> {
+    if states.is_empty() {
+        return Rc::new([]);
+    }
+    let mut seen = FxHashSet::default();
+    states
+        .iter()
+        .filter(|(version, _)| seen.insert(version.ptr()))
+        .cloned()
+        .collect()
+}
+
+impl RenderDependencies {
+    /// Both sets of dependencies at once, as of the earlier generation, so
+    /// that a change either would have seen is still seen.
+    pub(crate) fn union(&self, other: &Self) -> Self {
+        if other.entities.is_empty() && other.globals.is_empty() && other.states.is_empty() {
+            return self.clone();
+        }
+        let mut entities = self.entities.to_vec();
+        entities.extend_from_slice(&other.entities);
+        entities.sort_unstable();
+        entities.dedup();
+        let mut globals = self.globals.to_vec();
+        globals.extend_from_slice(&other.globals);
+        globals.sort_unstable();
+        globals.dedup();
+        let mut states = self.states.to_vec();
+        states.extend_from_slice(&other.states);
+        Self {
+            entities: entities.into(),
+            globals: globals.into(),
+            states: dedup_states(&states),
+            generation: self.generation.min(other.generation),
+        }
     }
 }
 

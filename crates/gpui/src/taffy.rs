@@ -209,6 +209,11 @@ pub struct TaffyLayoutEngine {
     stats: LayoutStats,
     /// Whether to time layout and measurements. See [`LayoutStats`].
     timed: bool,
+    /// Counts every write that changes what a layout computes: a node created,
+    /// a style or a child list rewritten, a measurement that no longer
+    /// stands. A subtree laid out again without any of these has the layout
+    /// it had. See [`TaffyLayoutEngine::layout_changes`].
+    layout_changes: u64,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -232,6 +237,7 @@ impl TaffyLayoutEngine {
             layout_bounds_scratch_space: Vec::new(),
             stats: LayoutStats::default(),
             timed: false,
+            layout_changes: 0,
         }
     }
 
@@ -354,6 +360,52 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// Keeps the nodes retained under `keys` for another frame, as
+    /// [`Self::keep_retained`] does, but only if every one of them is still
+    /// retained and unclaimed this frame; otherwise keeps none of them and
+    /// returns false. A subtree whose layout is reused without being requested
+    /// again needs all of its nodes, just as they were.
+    pub(crate) fn try_keep_retained(&mut self, keys: &[u64]) -> bool {
+        let frame = self.frame;
+        let all_there = keys.iter().all(|key| {
+            self.retained
+                .get(key)
+                .is_some_and(|node| node.claimed_in_frame != frame)
+        });
+        if all_there {
+            self.keep_retained(keys);
+            self.stats.nodes_reused += keys.len() as u64;
+        }
+        all_there
+    }
+
+    /// Undoes [`Self::try_keep_retained`] for `keys`, so that the subtree can
+    /// be laid out again after all this frame and claim its nodes itself.
+    pub(crate) fn release_kept(&mut self, keys: &[u64]) {
+        let frame = self.frame;
+        for key in keys {
+            if let Some(node) = self.retained.get_mut(key)
+                && node.claimed_in_frame == frame
+            {
+                node.claimed_in_frame = frame.wrapping_sub(1);
+                self.claimed_this_frame -= 1;
+                self.stats.nodes_reused = self.stats.nodes_reused.saturating_sub(1);
+            }
+        }
+    }
+
+    /// How many nodes allocated this frame are not retained. A subtree that
+    /// allocated any cannot have its layout reused, since they go at the end
+    /// of the frame.
+    pub(crate) fn transient_count(&self) -> usize {
+        self.transient.len()
+    }
+
+    /// See [`TaffyLayoutEngine::layout_changes`] on the field.
+    pub(crate) fn layout_changes(&self) -> u64 {
+        self.layout_changes
+    }
+
     /// Records a freshly allocated node under `key`, or as transient when there
     /// is no key to record it under.
     fn retain(
@@ -433,6 +485,7 @@ impl TaffyLayoutEngine {
         // bookkeeping no longer applies.
         self.unstretched_styles.remove(&id);
         self.stats.style_writes += 1;
+        self.layout_changes += 1;
         self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
     }
 
@@ -448,6 +501,7 @@ impl TaffyLayoutEngine {
         node.children.clear();
         node.children.extend_from_slice(children);
         self.stats.children_writes += 1;
+        self.layout_changes += 1;
         self.taffy
             // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
             .set_children(id.0, LayoutId::to_taffy_slice(children))
@@ -493,6 +547,7 @@ impl TaffyLayoutEngine {
         };
 
         self.stats.nodes_created += 1;
+        self.layout_changes += 1;
         let style_fingerprint = layout_fingerprint(&style, rem_size, scale_factor);
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         let id: LayoutId = self
@@ -554,6 +609,7 @@ impl TaffyLayoutEngine {
                 let taffy_style = style.to_taffy(rem_size, scale_factor);
                 self.stats.nodes_created += 1;
                 self.stats.measure_rebinds += 1;
+                self.layout_changes += 1;
                 let id: LayoutId = self
                     .taffy
                     .new_leaf_with_context(taffy_style, NodeContext { measure })
@@ -625,6 +681,12 @@ impl TaffyLayoutEngine {
 
         if !reusable {
             self.stats.measure_rebinds += 1;
+            // A measurement that says nothing of its inputs is taken again
+            // every frame whether or not they changed, so it is no sign that
+            // the layout did.
+            if measure_key.is_some() {
+                self.layout_changes += 1;
+            }
             self.taffy.mark_dirty(id.0).expect(EXPECT_MESSAGE);
         }
 
@@ -832,6 +894,45 @@ impl TaffyLayoutEngine {
         self.stats.measure_calls += measure_calls;
         self.stats.measure_time += measure_time;
         self.stats.measure_reuses += std::mem::take(&mut window.pending_measure_reuses);
+    }
+
+    /// Lays out again the subtree under `id`, a node already placed by its
+    /// parent this frame, within `available_space`, leaving it where its
+    /// parent put it.
+    ///
+    /// Computing a layout from a node treats it as a root and moves it to the
+    /// origin; its absolute position, worked out before, is put back so that
+    /// the bounds of everything under it are found relative to it as before.
+    pub fn relayout_in_place(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let scale_factor = window.scale_factor();
+        let bounds = self.layout_bounds(id, scale_factor);
+        let origin = self
+            .absolute_outer_origins
+            .get(&id)
+            .copied()
+            .expect("layout_bounds caches the absolute origin");
+        self.compute_layout(id, available_space, window, cx);
+        let stack = &mut self.layout_bounds_scratch_space;
+        stack.push(id);
+        while let Some(id) = stack.pop() {
+            self.absolute_layout_bounds.remove(&id);
+            self.absolute_outer_origins.remove(&id);
+            stack.extend(
+                self.taffy
+                    .children(id.into())
+                    .expect(EXPECT_MESSAGE)
+                    .into_iter()
+                    .map(LayoutId::from),
+            );
+        }
+        self.absolute_outer_origins.insert(id, origin);
+        self.absolute_layout_bounds.insert(id, bounds);
     }
 
     // Pixel snapping

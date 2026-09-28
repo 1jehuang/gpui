@@ -6,7 +6,7 @@ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use slotmap::{KeyData, SecondaryMap, SlotMap};
 use std::{
     any::{Any, TypeId, type_name},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::{self, Display},
     hash::{Hash, Hasher},
@@ -56,6 +56,12 @@ impl Display for EntityId {
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
     pub accessed_entities: RefCell<FxHashSet<EntityId>>,
+    /// Every entity accessed while a recording is open, in order and with
+    /// repeats, for a retained subtree to learn what it was built from. See
+    /// [`App::begin_recording_dependencies`].
+    access_log: RefCell<Vec<EntityId>>,
+    /// How many recordings are open.
+    recordings: Cell<usize>,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
@@ -72,6 +78,8 @@ impl EntityMap {
         Self {
             entities: SecondaryMap::new(),
             accessed_entities: RefCell::new(FxHashSet::default()),
+            access_log: RefCell::new(Vec::new()),
+            recordings: Cell::new(0),
             ref_counts: Arc::new(RwLock::new(EntityRefCounts {
                 counts: SlotMap::with_key(),
                 dropped_entity_ids: Vec::new(),
@@ -121,8 +129,7 @@ impl EntityMap {
     where
         T: 'static,
     {
-        let mut accessed_entities = self.accessed_entities.get_mut();
-        accessed_entities.insert(slot.entity_id);
+        self.note_access(slot.entity_id);
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
@@ -133,8 +140,7 @@ impl EntityMap {
     #[track_caller]
     pub fn lease<T>(&mut self, pointer: &Entity<T>) -> Lease<T> {
         self.assert_valid_context(pointer);
-        let mut accessed_entities = self.accessed_entities.get_mut();
-        accessed_entities.insert(pointer.entity_id);
+        self.note_access(pointer.entity_id);
 
         let entity = Some(
             self.entities
@@ -155,8 +161,7 @@ impl EntityMap {
 
     pub fn read<T: 'static>(&self, entity: &Entity<T>) -> &T {
         self.assert_valid_context(entity);
-        let mut accessed_entities = self.accessed_entities.borrow_mut();
-        accessed_entities.insert(entity.entity_id);
+        self.note_access(entity.entity_id);
 
         self.entities
             .get(entity.entity_id)
@@ -171,10 +176,52 @@ impl EntityMap {
         );
     }
 
-    pub fn extend_accessed(&mut self, entities: &FxHashSet<EntityId>) {
-        self.accessed_entities
-            .get_mut()
-            .extend(entities.iter().copied());
+    /// Records that `entity_id` was accessed: for the window to be told when
+    /// it changes, and for any open recording.
+    #[inline]
+    fn note_access(&self, entity_id: EntityId) {
+        self.accessed_entities.borrow_mut().insert(entity_id);
+        if self.recordings.get() > 0 {
+            self.access_log.borrow_mut().push(entity_id);
+        }
+    }
+
+    pub fn extend_accessed<'a>(&mut self, entities: impl IntoIterator<Item = &'a EntityId>) {
+        let accessed_entities = self.accessed_entities.get_mut();
+        let recording = self.recordings.get() > 0;
+        for entity_id in entities {
+            accessed_entities.insert(*entity_id);
+            if recording {
+                self.access_log.get_mut().push(*entity_id);
+            }
+        }
+    }
+
+    /// Whether any recording is open.
+    #[inline]
+    pub(crate) fn is_recording(&self) -> bool {
+        self.recordings.get() > 0
+    }
+
+    /// Opens a recording, returning where in the access log it starts.
+    pub(crate) fn begin_recording(&mut self) -> usize {
+        self.recordings.set(self.recordings.get() + 1);
+        self.access_log.get_mut().len()
+    }
+
+    /// Closes the recording that started at `start`, returning the entities it
+    /// saw, sorted and without repeats.
+    pub(crate) fn finish_recording(&mut self, start: usize) -> Vec<EntityId> {
+        let log = self.access_log.get_mut();
+        let mut entities = log[start..].to_vec();
+        let recordings = self.recordings.get() - 1;
+        self.recordings.set(recordings);
+        if recordings == 0 {
+            log.clear();
+        }
+        entities.sort_unstable();
+        entities.dedup();
+        entities
     }
 
     pub fn clear_accessed(&mut self) {
