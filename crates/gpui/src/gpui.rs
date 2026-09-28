@@ -106,8 +106,6 @@ pub use ctor::ctor;
 pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
-#[allow(unused_imports)]
-pub use fast::*;
 pub use executor::*;
 pub use geometry::*;
 pub use gestures::*;

@@ -17,7 +17,7 @@
 //! on its own later, when what is around it has to be built.
 
 use super::*;
-use crate::{DependencyRecording, RenderDependencies};
+use crate::fast::dependencies::{DependencyRecording, RenderDependencies};
 
 /// The retained subtrees drawn in one frame, in the order they began
 /// prepainting, which puts a subtree's nested subtrees right after it.

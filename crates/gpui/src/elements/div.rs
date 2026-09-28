@@ -4352,7 +4352,7 @@ struct ScrollHandleState {
     active_item: Option<ScrollActiveItem>,
     /// Changes whenever the handle is scrolled from outside the element, so
     /// that a view drawn again from last frame is built again when it is.
-    version: crate::StateVersion,
+    version: crate::fast::dependencies::StateVersion,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
