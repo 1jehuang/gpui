@@ -143,9 +143,12 @@ Each of these is one commit, with its own measurements in the commit message.
 
 ### Getting the most out of it
 
-One thing is worth doing on your side: key list items by the data rather than
-by the loop index, so a row keeps its identity when something is inserted ahead
-of it.
+[`docs/performance-guide.md`](docs/performance-guide.md) covers what gpui-fast
+changes about a frame and everything an application can do to get more out of
+it: keys, cached views, `memo`, and measuring. The one thing most worth doing:
+
+Key list items by the data rather than by the loop index, so a row keeps its
+identity when something is inserted ahead of it.
 
 ```rust
 .children(rows.iter().map(|row| render_row(row).key(row.id)))
