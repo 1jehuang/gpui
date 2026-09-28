@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Checks that gpui-fast only adds small hooks to upstream files.
+
+Compares every file in the upstream directories listed in `UPSTREAM` with
+upstream's version of it and fails when a change is more than a hook. The
+rules and the reasons for them are in docs/upstream-sync.md.
+
+By default upstream's version is read from our own history, at the
+`import_commit` recorded in `UPSTREAM`. With `--zed <checkout>` it is read
+from a zed checkout at the recorded `zed_commit` instead.
+
+The working tree is checked, including uncommitted and untracked files.
+"""
+
+import argparse
+import difflib
+import fnmatch
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+UPSTREAM_FILE = os.path.join(ROOT, "UPSTREAM")
+ALLOWLIST_FILE = os.path.join(ROOT, "script", "upstream-allowlist")
+
+# Files that may differ from upstream, be added or be removed anywhere.
+ALWAYS_ALLOWED = ["LICENSE*"]
+
+
+def git(args, cwd=ROOT, input=None):
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        input=input,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.exit(f"git {' '.join(args)} failed:\n{result.stderr.decode(errors='replace')}")
+    return result.stdout
+
+
+def read_upstream_config():
+    """Reads the few keys `UPSTREAM` holds, without needing a TOML parser."""
+    with open(UPSTREAM_FILE, encoding="utf-8") as file:
+        text = re.sub(r"#.*", "", file.read())
+    config = dict(re.findall(r'^(\w+)\s*=\s*"([^"]*)"', text, re.M))
+    tracked = re.search(r"^tracked\s*=\s*\[(.*?)\]", text, re.M | re.S)
+    config["tracked"] = re.findall(r'"([^"]+)"', tracked.group(1)) if tracked else []
+    for key in ["zed_commit", "import_commit"]:
+        if key not in config:
+            sys.exit(f"UPSTREAM has no {key}")
+    return config
+
+
+class Allowance:
+    def __init__(self, pattern, reason):
+        self.pattern = pattern
+        self.reason = reason
+        self.max_hunk = None
+        self.max_added = None
+        self.max_removed = None
+        self.any_change = False
+        self.used = False
+
+
+def read_allowlist():
+    """Reads `script/upstream-allowlist`.
+
+    Each line is `<path or glob> [hunk=N] [added=N] [removed=N] [any] # <reason>`.
+    `hunk`, `added` and `removed` raise the budgets for matching files; `any`
+    allows any change, including adding or removing the file. A reason is
+    required.
+    """
+    allowances = []
+    if not os.path.exists(ALLOWLIST_FILE):
+        return allowances
+    with open(ALLOWLIST_FILE, encoding="utf-8") as file:
+        for number, line in enumerate(file, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            spec, _, reason = line.partition("#")
+            reason = reason.strip()
+            fields = spec.split()
+            if not fields or not reason:
+                sys.exit(f"{ALLOWLIST_FILE}:{number}: expected `<path> [hunk=N] [added=N] [removed=N] [any] # <reason>`")
+            allowance = Allowance(fields[0], reason)
+            for field in fields[1:]:
+                if field == "any":
+                    allowance.any_change = True
+                elif field.startswith("hunk="):
+                    allowance.max_hunk = int(field[5:])
+                elif field.startswith("added="):
+                    allowance.max_added = int(field[6:])
+                elif field.startswith("removed="):
+                    allowance.max_removed = int(field[8:])
+                else:
+                    sys.exit(f"{ALLOWLIST_FILE}:{number}: unknown field `{field}`")
+            allowances.append(allowance)
+    return allowances
+
+
+def find_allowance(allowances, path):
+    for allowance in allowances:
+        if fnmatch.fnmatchcase(path, allowance.pattern):
+            allowance.used = True
+            return allowance
+    return None
+
+
+def is_fast(path):
+    """Whether `path` is inside a `src/fast/` directory, where gpui-fast's code lives."""
+    return "/src/fast/" in path
+
+
+def is_always_allowed(path):
+    name = os.path.basename(path)
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in ALWAYS_ALLOWED)
+
+
+def upstream_blobs(repo, commit, tracked):
+    """Maps each upstream file to its blob id."""
+    blobs = {}
+    output = git(["ls-tree", "-r", "-z", commit, "--", *tracked], cwd=repo)
+    for entry in output.split(b"\0"):
+        if not entry:
+            continue
+        meta, path = entry.split(b"\t", 1)
+        mode, kind, blob = meta.split()
+        if kind == b"blob":
+            blobs[path.decode()] = (blob.decode(), mode.decode())
+    return blobs
+
+
+def our_blobs(tracked):
+    """Maps each file in our working tree to the blob id it would be committed as."""
+    output = git(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *tracked])
+    paths = sorted({path for path in output.decode().split("\0") if path})
+    paths = [path for path in paths if os.path.lexists(os.path.join(ROOT, path))]
+    blobs = {}
+    regular = [path for path in paths if not os.path.islink(os.path.join(ROOT, path))]
+    if regular:
+        hashes = git(["hash-object", "--stdin-paths"], input="\n".join(regular).encode())
+        for path, blob in zip(regular, hashes.decode().split()):
+            blobs[path] = blob
+    for path in paths:
+        if os.path.islink(os.path.join(ROOT, path)):
+            target = os.readlink(os.path.join(ROOT, path)).encode()
+            blobs[path] = git(["hash-object", "--stdin"], input=target).decode().strip()
+    return blobs
+
+
+def read_blobs(repo, blob_ids):
+    """Reads several blobs with one `git cat-file --batch`."""
+    if not blob_ids:
+        return {}
+    output = git(["cat-file", "--batch"], cwd=repo, input="\n".join(blob_ids).encode() + b"\n")
+    contents = {}
+    position = 0
+    for blob in blob_ids:
+        header_end = output.index(b"\n", position)
+        size = int(output[position:header_end].split()[2])
+        start = header_end + 1
+        contents[blob] = output[start : start + size]
+        position = start + size + 1
+    return contents
+
+
+def is_binary(data):
+    return b"\0" in data[:8192]
+
+
+# A visibility bump — `fn` to `pub(crate) fn`, a field made `pub(crate)` — is
+# how a `fast/` module reaches upstream's items. It is a hook, and merges like
+# one, so lines that differ only by it are counted apart from real changes.
+VISIBILITY = re.compile(r"\bpub\((?:crate|super)\)\s+")
+
+
+def normalize(line):
+    return VISIBILITY.sub("", line)
+
+
+def diff_hunks(old, new, normalized=True):
+    """Returns `(added, removed)` for each hunk of a diff without context lines.
+
+    With `normalized`, lines that differ only in visibility compare equal.
+    """
+    old_lines = old.decode("utf-8", errors="replace").splitlines()
+    new_lines = new.decode("utf-8", errors="replace").splitlines()
+    if normalized:
+        old_lines = [normalize(line) for line in old_lines]
+        new_lines = [normalize(line) for line in new_lines]
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    hunks = []
+    for group in matcher.get_grouped_opcodes(0):
+        added = sum(j2 - j1 for tag, _, _, j1, j2 in group if tag != "equal")
+        removed = sum(i2 - i1 for tag, i1, i2, _, _ in group if tag != "equal")
+        hunks.append((added, removed))
+    return hunks
+
+
+GLOB_FROM_FAST = re.compile(rb"\buse\s+[\w:]*\bfast(::\w+)*::\*")
+
+
+def fast_globs(paths):
+    """Finds `use ...fast::*` and `use ...fast::<topic>::*` lines, which hide where code lives."""
+    found = []
+    for path in paths:
+        if not path.endswith(".rs"):
+            continue
+        with open(os.path.join(ROOT, path), "rb") as file:
+            for number, line in enumerate(file, 1):
+                if GLOB_FROM_FAST.search(line):
+                    found.append(f"{path}:{number}")
+    return found
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--zed", metavar="PATH", help="compare against a zed checkout at the recorded zed_commit")
+    parser.add_argument("--max-hunk", type=int, default=8, help="most lines one hunk may add (default 8)")
+    parser.add_argument("--max-added", type=int, default=40, help="most lines a file may add (default 40)")
+    parser.add_argument("--max-removed", type=int, default=20, help="most lines a file may remove (default 20)")
+    parser.add_argument("--report", action="store_true", help="print the table without failing")
+    parser.add_argument("--all", action="store_true", help="also list files that pass")
+    args = parser.parse_args()
+
+    config = read_upstream_config()
+    allowances = read_allowlist()
+    tracked = config["tracked"]
+    if args.zed:
+        repo, commit = os.path.abspath(os.path.expanduser(args.zed)), config["zed_commit"]
+    else:
+        repo, commit = ROOT, config["import_commit"]
+
+    theirs = upstream_blobs(repo, commit, tracked)
+    ours = our_blobs(tracked)
+
+    changed = sorted(
+        path
+        for path in set(theirs) | set(ours)
+        if not is_fast(path)
+        and (path not in theirs or path not in ours or theirs[path][0] != ours[path])
+    )
+    upstream_contents = read_blobs(repo, [theirs[path][0] for path in changed if path in theirs and path in ours])
+
+    rows = []
+    violations = 0
+    for path in changed:
+        allowance = find_allowance(allowances, path)
+        max_hunk = allowance.max_hunk if allowance and allowance.max_hunk is not None else args.max_hunk
+        max_added = allowance.max_added if allowance and allowance.max_added is not None else args.max_added
+        max_removed = (
+            allowance.max_removed if allowance and allowance.max_removed is not None else args.max_removed
+        )
+        allowed_anything = is_always_allowed(path) or (allowance and allowance.any_change)
+
+        hunks, added, removed, largest, visibility = "", "", "", "", ""
+        problems = []
+        if path not in theirs:
+            problems.append("added")
+        elif path not in ours:
+            problems.append("removed")
+        else:
+            old = upstream_contents[theirs[path][0]]
+            full_path = os.path.join(ROOT, path)
+            if os.path.islink(full_path):
+                new = os.readlink(full_path).encode()
+            else:
+                with open(full_path, "rb") as file:
+                    new = file.read()
+            if is_binary(old) or is_binary(new):
+                problems.append("binary changed")
+            else:
+                file_hunks = diff_hunks(old, new)
+                raw_hunks = diff_hunks(old, new, normalized=False)
+                visibility = sum(a for a, _ in raw_hunks) - sum(a for a, _ in file_hunks)
+                hunks = len(file_hunks)
+                added = sum(a for a, _ in file_hunks)
+                removed = sum(r for _, r in file_hunks)
+                largest = max((a for a, _ in file_hunks), default=0)
+                if largest > max_hunk:
+                    problems.append(f"hunk adds {largest} > {max_hunk}")
+                if added > max_added:
+                    problems.append(f"adds {added} > {max_added}")
+                if removed > max_removed:
+                    problems.append(f"removes {removed} > {max_removed}")
+
+        if not problems:
+            status = "ok" + (" (allow-listed)" if allowance else "")
+        elif allowed_anything:
+            status = "allowed: " + ", ".join(problems)
+        else:
+            status = "FAIL: " + ", ".join(problems)
+            violations += 1
+        if args.all or not status.startswith("ok"):
+            rows.append(
+                (
+                    path,
+                    str(hunks),
+                    f"+{added}/-{removed}" if hunks != "" else "",
+                    str(visibility),
+                    str(largest),
+                    status,
+                )
+            )
+
+    if rows:
+        headers = ("file", "hunks", "+/-", "pub(crate)", "largest", "status")
+        widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+        for row in [headers, tuple("-" * width for width in widths), *rows]:
+            print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+        print()
+
+    globs = fast_globs(path for path in ours if os.path.isfile(os.path.join(ROOT, path)))
+    for location in globs:
+        print(f"FAIL: {location}: glob import from `fast`; name `crate::fast::<topic>::Name` instead")
+    violations += len(globs)
+    if globs:
+        print()
+    source = f"{args.zed} at {commit[:10]}" if args.zed else f"import commit {commit[:10]}"
+    print(
+        f"Compared {len(set(theirs) | set(ours))} files in {len(tracked)} upstream directories "
+        f"against {source}: {len(changed)} differ, {violations} violation(s) "
+        f"(max hunk {args.max_hunk}, max added {args.max_added}, max removed {args.max_removed})."
+    )
+    for allowance in allowances:
+        if not allowance.used:
+            print(f"note: allow-list entry `{allowance.pattern}` matches no changed file")
+    if violations and not args.report:
+        print("See docs/upstream-sync.md for how to move the change into a `fast/` module.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+# Justified exceptions to script/check-upstream's rules; see docs/upstream-sync.md.
+#
+# Each line: <path or glob> [hunk=N] [added=N] [removed=N] [any] # <reason>
+#   hunk=N     raises the most lines one hunk may add for matching files
+#   added=N    raises the most lines matching files may add
+#   removed=N  raises the most lines matching files may remove
+#   any        allows any change, including adding or removing the file
+# The first matching line applies. Keep entries few and the reasons specific.
+
+crates/gpui/src/view.rs removed=210 # ViewElement's cache-by-bounds is replaced by fast::retained's retained views; its Element methods forward to it
+crates/gpui/src/taffy.rs removed=50 # request_layout, request_measured_layout and stretch_auto_size_to_fill bodies are replaced by fast::layout's retained nodes; they forward to it

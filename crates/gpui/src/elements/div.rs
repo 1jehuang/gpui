@@ -37,7 +37,6 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     mem,
-    ops::{Deref, DerefMut},
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -2098,111 +2097,6 @@ impl IntoElement for Div {
     }
 }
 
-/// An element's accessibility properties, allocated once one of them is set.
-///
-/// Most elements set none, and an [`Interactivity`] moves with its element
-/// through every call of its builder, so the properties' 300-odd bytes are
-/// kept out of it until they are needed.
-#[derive(Default)]
-pub(crate) struct Aria(Option<Box<AriaProperties>>);
-
-static NO_ARIA: AriaProperties = AriaProperties {
-    author_id: None,
-    label: None,
-    description: None,
-    keyshortcuts: None,
-    selected: None,
-    expanded: None,
-    toggled: None,
-    numeric_value: None,
-    min_numeric_value: None,
-    max_numeric_value: None,
-    numeric_value_step: None,
-    value: None,
-    placeholder: None,
-    orientation: None,
-    level: None,
-    position_in_set: None,
-    size_of_set: None,
-    row_index: None,
-    column_index: None,
-    row_count: None,
-    column_count: None,
-};
-
-impl Deref for Aria {
-    type Target = AriaProperties;
-
-    fn deref(&self) -> &AriaProperties {
-        self.0.as_deref().unwrap_or(&NO_ARIA)
-    }
-}
-
-impl DerefMut for Aria {
-    fn deref_mut(&mut self) -> &mut AriaProperties {
-        self.0.get_or_insert_with(Default::default)
-    }
-}
-
-/// A list one pointer wide that allocates nothing while it is empty.
-///
-/// An [`Interactivity`] holds a score of listener lists, nearly all of them
-/// empty on any one element, and moves with its element through every call
-/// of its builder. As `Vec`s they were 500 of its bytes, copied every time.
-// A boxed `Vec` is one pointer where a `Vec` is three, which is the point;
-// the second allocation is paid only by a list that has something in it.
-#[allow(clippy::box_collection)]
-pub(crate) struct LazyVec<T>(Option<Box<Vec<T>>>);
-
-impl<T> Default for LazyVec<T> {
-    fn default() -> Self {
-        LazyVec(None)
-    }
-}
-
-impl<T: Clone> Clone for LazyVec<T> {
-    fn clone(&self) -> Self {
-        LazyVec(self.0.clone())
-    }
-}
-
-impl<T> LazyVec<T> {
-    pub(crate) fn push(&mut self, item: T) {
-        self.0.get_or_insert_with(Default::default).push(item);
-    }
-
-    /// Takes every item out, leaving the list empty.
-    pub(crate) fn drain(&mut self, _: std::ops::RangeFull) -> std::vec::IntoIter<T> {
-        mem::take(self).into_iter()
-    }
-}
-
-impl<T> Deref for LazyVec<T> {
-    type Target = [T];
-
-    fn deref(&self) -> &[T] {
-        self.0.as_deref().map_or(&[], Vec::as_slice)
-    }
-}
-
-impl<T> IntoIterator for LazyVec<T> {
-    type Item = T;
-    type IntoIter = std::vec::IntoIter<T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.map(|items| *items).unwrap_or_default().into_iter()
-    }
-}
-
-impl<'a, T> IntoIterator for &'a LazyVec<T> {
-    type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct AriaProperties {
     pub(crate) author_id: Option<SharedString>,
@@ -2259,27 +2153,27 @@ pub struct Interactivity {
     pub(crate) group_hover_style: Option<GroupStyle>,
     pub(crate) active_style: Option<Box<StyleRefinement>>,
     pub(crate) group_active_style: Option<GroupStyle>,
-    pub(crate) drag_over_styles: LazyVec<(
+    pub(crate) drag_over_styles: Vec<(
         TypeId,
         Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement>,
     )>,
-    pub(crate) group_drag_over_styles: LazyVec<(TypeId, GroupStyle)>,
-    pub(crate) mouse_down_listeners: LazyVec<MouseDownListener>,
-    pub(crate) mouse_up_listeners: LazyVec<MouseUpListener>,
-    pub(crate) mouse_pressure_listeners: LazyVec<MousePressureListener>,
-    pub(crate) mouse_move_listeners: LazyVec<MouseMoveListener>,
-    pub(crate) mouse_exit_listeners: LazyVec<MouseExitListener>,
-    pub(crate) file_drop_exit_listeners: LazyVec<FileDropExitListener>,
-    pub(crate) scroll_wheel_listeners: LazyVec<ScrollWheelListener>,
-    pub(crate) pinch_listeners: LazyVec<PinchListener>,
-    pub(crate) key_down_listeners: LazyVec<KeyDownListener>,
-    pub(crate) key_up_listeners: LazyVec<KeyUpListener>,
-    pub(crate) modifiers_changed_listeners: LazyVec<ModifiersChangedListener>,
-    pub(crate) action_listeners: LazyVec<(TypeId, ActionListener)>,
-    pub(crate) drop_listeners: LazyVec<(TypeId, DropListener)>,
+    pub(crate) group_drag_over_styles: Vec<(TypeId, GroupStyle)>,
+    pub(crate) mouse_down_listeners: Vec<MouseDownListener>,
+    pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
+    pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
+    pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
+    pub(crate) mouse_exit_listeners: Vec<MouseExitListener>,
+    pub(crate) file_drop_exit_listeners: Vec<FileDropExitListener>,
+    pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
+    pub(crate) pinch_listeners: Vec<PinchListener>,
+    pub(crate) key_down_listeners: Vec<KeyDownListener>,
+    pub(crate) key_up_listeners: Vec<KeyUpListener>,
+    pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
+    pub(crate) action_listeners: Vec<(TypeId, ActionListener)>,
+    pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
-    pub(crate) click_listeners: LazyVec<ClickListener>,
-    pub(crate) aux_click_listeners: LazyVec<ClickListener>,
+    pub(crate) click_listeners: Vec<ClickListener>,
+    pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<DragListener>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) hover_listener_mode: HoverListenerMode,
@@ -2292,11 +2186,11 @@ pub struct Interactivity {
     pub(crate) tab_stop: bool,
 
     pub(crate) a11y_action_listeners:
-        LazyVec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
+        Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
     pub(crate) a11y_synthetic_children: Option<Box<dyn FnOnce(&mut crate::A11ySubtreeBuilder)>>,
     pub(crate) report_active_descendant_focus: bool,
     pub(crate) override_role: Option<accesskit::Role>,
-    pub(crate) aria: Aria,
+    pub(crate) aria: AriaProperties,
 
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
@@ -2372,6 +2266,7 @@ impl Interactivity {
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
                     let scroll_handle_state = scroll_handle.0.borrow();
+                    cx.note_state_read(&scroll_handle_state.version);
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
                 } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
@@ -2484,7 +2379,8 @@ impl Interactivity {
                     }
                 }
 
-                window.with_text_style(style.text_style().cloned(), |window| {
+                let opacity = window.push_element_opacity(style.opacity);
+                let result = window.with_text_style(style.text_style().cloned(), |window| {
                     window.with_content_mask(
                         style.overflow_mask(bounds, window.rem_size()),
                         |window| {
@@ -2500,7 +2396,9 @@ impl Interactivity {
                             (result, element_state)
                         },
                     )
-                })
+                });
+                window.pop_element_opacity(opacity);
+                result
             },
         )
     }
@@ -2796,14 +2694,14 @@ impl Interactivity {
 
                         let was_hovered = hitbox.is_hovered(window);
                         let current_view = window.current_view();
-                        let memos = window.enclosing_memos();
+                        let subtrees = window.enclosing_retained_subtrees();
                         window.on_mouse_event({
                             let hitbox = hitbox.clone();
                             move |_: &MouseMoveEvent, phase, window, cx| {
                                 if phase == DispatchPhase::Capture {
                                     let hovered = hitbox.is_hovered(window);
                                     if hovered != was_hovered {
-                                        window.invalidate_memos(&memos);
+                                        window.invalidate_retained_subtrees(&subtrees);
                                         cx.notify(current_view)
                                     }
                                 }
@@ -2958,7 +2856,7 @@ impl Interactivity {
                     .cloned()
             });
             let current_view = window.current_view();
-            let memos = window.enclosing_memos();
+            let subtrees = window.enclosing_retained_subtrees();
 
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = hitbox.is_hovered(window);
@@ -2968,7 +2866,7 @@ impl Interactivity {
                 if phase == DispatchPhase::Capture && hovered != was_hovered {
                     if let Some(hover_state) = &hover_state {
                         hover_state.borrow_mut().element = hovered;
-                        window.invalidate_memos(&memos);
+                        window.invalidate_retained_subtrees(&subtrees);
                         cx.notify(current_view);
                     }
                 }
@@ -2982,7 +2880,7 @@ impl Interactivity {
                     .and_then(|element| element.hover_state.as_ref())
                     .cloned();
                 let current_view = window.current_view();
-                let memos = window.enclosing_memos();
+                let subtrees = window.enclosing_retained_subtrees();
 
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                     let group_hovered = group_hitbox_id.is_hovered(window);
@@ -2992,7 +2890,7 @@ impl Interactivity {
                     if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
                         if let Some(hover_state) = &hover_state {
                             hover_state.borrow_mut().group = group_hovered;
-                            window.invalidate_memos(&memos);
+                            window.invalidate_retained_subtrees(&subtrees);
                             cx.notify(current_view);
                         }
                     }
@@ -3420,11 +3318,11 @@ impl Interactivity {
         if let Some(group_hitbox) = group_hitbox {
             let was_hovered = group_hitbox.is_hovered(window);
             let current_view = window.current_view();
-            let memos = window.enclosing_memos();
+            let subtrees = window.enclosing_retained_subtrees();
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = group_hitbox.is_hovered(window);
                 if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    window.invalidate_memos(&memos);
+                    window.invalidate_retained_subtrees(&subtrees);
                     cx.notify(current_view);
                 }
             });
@@ -3446,7 +3344,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
-            let memos = window.enclosing_memos();
+            let subtrees = window.enclosing_retained_subtrees();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3490,7 +3388,7 @@ impl Interactivity {
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
-                        window.invalidate_memos(&memos);
+                        window.invalidate_retained_subtrees(&subtrees);
                         cx.notify(current_view);
                     }
                 }
@@ -3552,7 +3450,7 @@ impl Interactivity {
                     if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
                         let hovered =
                             !window.last_input_was_touch() && group_hitbox_id.is_hovered(window);
-                        window.note_memo_hover_dependency(group_hitbox_id, hovered);
+                        window.note_retained_hover_dependency(group_hitbox_id, hovered);
                         hovered
                     } else if let Some(element_state) = element_state.as_ref() {
                         !window.last_input_was_touch()
@@ -3573,7 +3471,7 @@ impl Interactivity {
             if let Some(hover_style) = self.hover_style.as_ref() {
                 let is_hovered = if let Some(hitbox) = hitbox {
                     let hovered = !window.last_input_was_touch() && hitbox.is_hovered(window);
-                    window.note_memo_hover_dependency(hitbox.id, hovered);
+                    window.note_retained_hover_dependency(hitbox.id, hovered);
                     hovered
                 } else if let Some(element_state) = element_state.as_ref() {
                     !window.last_input_was_touch()
@@ -4344,6 +4242,7 @@ struct ScrollHandleState {
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
     active_item: Option<ScrollActiveItem>,
+    version: crate::fast::dependencies::StateVersion,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4438,6 +4337,7 @@ impl ScrollHandle {
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
     pub fn scroll_to_item(&self, ix: usize) {
         let mut state = self.0.borrow_mut();
+        state.version.bump();
         state.active_item = Some(ScrollActiveItem {
             index: ix,
             strategy: ScrollStrategy::default(),
@@ -4448,6 +4348,7 @@ impl ScrollHandle {
     /// This scrolls the minimal amount to ensure that the child is the first visible element
     pub fn scroll_to_top_of_item(&self, ix: usize) {
         let mut state = self.0.borrow_mut();
+        state.version.bump();
         state.active_item = Some(ScrollActiveItem {
             index: ix,
             strategy: ScrollStrategy::Top,
@@ -4505,9 +4406,15 @@ impl ScrollHandle {
         state.active_item = active_item;
     }
 
+    /// Marks the handle as scrolled from outside the element it tracks.
+    pub(crate) fn changed(&self) {
+        self.0.borrow().version.bump();
+    }
+
     /// Scrolls to the bottom.
     pub fn scroll_to_bottom(&self) {
         let mut state = self.0.borrow_mut();
+        state.version.bump();
         state.scroll_to_bottom = true;
     }
 
@@ -4516,6 +4423,7 @@ impl ScrollHandle {
     /// As you scroll further down the offset becomes more negative.
     pub fn set_offset(&self, mut position: Point<Pixels>) {
         let state = self.0.borrow();
+        state.version.bump_if(*state.offset.borrow() != position);
         *state.offset.borrow_mut() = position;
     }
 

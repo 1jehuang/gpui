@@ -3,8 +3,7 @@
 //!
 //! Each run drives two windows holding the same view through the same random
 //! history of changes. One draws every frame as an application would, reusing
-//! retained layout nodes, shaped lines and last frame's orderings. The other
-//! forgets all of that before every frame, so it draws each one as though it
+//! retained layout nodes. The other forgets them before every frame, so it draws each one as though it
 //! were its first. Every frame, the two must paint the same primitives in the
 //! same places and leave the same hitboxes; any difference is something a
 //! retained shortcut got wrong.
@@ -17,12 +16,12 @@ use std::{borrow::Cow, sync::Arc};
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
 
 use crate::{
-    AnyElement, Bounds, Context, DevicePixels, Entity, Font, FontId, FontMetrics, FontRun, GlyphId,
-    Hsla, InputEvent as _, IntoElement, LineLayout, ListAlignment, ListOffset, ListState,
-    MouseMoveEvent, NoopTextSystem, Pixels, PlatformTextSystem, Render, RenderGlyphParams, Result,
-    SharedString, Size, StyleRefinement, TestAppContext, TextRenderingMode,
-    UniformListScrollHandle, Window, WindowHandle, div, hsla, list, memo, point, prelude::*, px,
-    size, uniform_list,
+    AnyElement, App, Bounds, Context, DevicePixels, Entity, Font, FontId, FontMetrics, FontRun,
+    Global, GlyphId, Hsla, InputEvent as _, IntoElement, LineLayout, ListAlignment, ListOffset,
+    ListState, MouseMoveEvent, NoopTextSystem, Pixels, PlatformTextSystem, Render,
+    RenderGlyphParams, Result, SharedString, Size, StyleRefinement, TestAppContext,
+    TextRenderingMode, UniformListScrollHandle, Window, WindowHandle, anchored, deferred, div,
+    hsla, list, point, prelude::*, px, size, uniform_list,
 };
 
 const WORDS: [&str; 10] = [
@@ -74,34 +73,98 @@ struct CellState {
 enum RowIdentity {
     Position,
     Id,
-    Key,
+    /// Wrapped in an element with the id, so switching to or from `Id`
+    /// hands a row's node to its wrapper or its first child.
+    Wrapped,
 }
 
 #[derive(Clone, Debug)]
 enum Change {
-    Word { cell: usize, word: usize },
-    Color { cell: usize, color: usize },
-    Width { cell: usize, width: f32 },
-    Toggle { cell: usize, flag: CellFlag },
-    Paragraph { words: usize, width: f32 },
-    InsertRow { at: usize },
-    RemoveRow { at: usize },
-    Scroll { top: f32 },
-    InsertChip { at: usize },
-    RemoveChip { at: usize },
-    RotateChips { by: usize },
+    Word {
+        cell: usize,
+        word: usize,
+    },
+    Color {
+        cell: usize,
+        color: usize,
+    },
+    Width {
+        cell: usize,
+        width: f32,
+    },
+    Toggle {
+        cell: usize,
+        flag: CellFlag,
+    },
+    Paragraph {
+        words: usize,
+        width: f32,
+    },
+    InsertRow {
+        at: usize,
+    },
+    RemoveRow {
+        at: usize,
+    },
+    Scroll {
+        top: f32,
+    },
+    InsertChip {
+        at: usize,
+    },
+    RemoveChip {
+        at: usize,
+    },
+    RotateChips {
+        by: usize,
+    },
     RowIdentity(RowIdentity),
     Direction,
     Badge,
-    MoveMouse { x: f32, y: f32 },
-    Resize { width: f32, height: f32 },
+    /// Changes one panel, notifying only it.
+    Panel {
+        panel: usize,
+        value: usize,
+    },
+    /// Changes the leaf view nested in a panel, notifying only it.
+    Leaf {
+        panel: usize,
+    },
+    /// Changes only the colors of a panel, notifying only it: its layout
+    /// stays as it was, so the view around it is drawn from last frame
+    /// around it.
+    TintPanel {
+        panel: usize,
+    },
+    /// Changes only the colors of the leaf in a panel, notifying only it: the
+    /// views around it are drawn from last frame around it.
+    TintLeaf {
+        panel: usize,
+    },
+    /// Changes the model some panels read without observing it, notifying
+    /// only the model.
+    Shared {
+        value: usize,
+    },
+    /// Changes a global some panels read.
+    Global {
+        value: usize,
+    },
+    MoveMouse {
+        x: f32,
+        y: f32,
+    },
+    Resize {
+        width: f32,
+        height: f32,
+    },
     Redraw,
 }
 
 impl Change {
     fn random(rng: &mut StdRng) -> Self {
         let cell = rng.random_range(0..GRID_CELLS);
-        match rng.random_range(0..100) {
+        match rng.random_range(0..124) {
             0..20 => Change::Word {
                 cell,
                 word: rng.random_range(0..WORDS.len()),
@@ -146,13 +209,33 @@ impl Change {
                 by: rng.random_range(1..4),
             },
             72..75 => Change::RowIdentity(
-                [RowIdentity::Position, RowIdentity::Id, RowIdentity::Key][rng.random_range(0..3)],
+                [RowIdentity::Position, RowIdentity::Id, RowIdentity::Wrapped]
+                    [rng.random_range(0..3)],
             ),
             75..77 => Change::Direction,
             77..83 => Change::Badge,
             83..92 => Change::MoveMouse {
                 x: rng.random_range(0.0..900.0),
                 y: rng.random_range(0.0..700.0),
+            },
+            100..105 => Change::Panel {
+                panel: rng.random_range(0..PANELS),
+                value: rng.random_range(0..WORDS.len()),
+            },
+            105..109 => Change::Leaf {
+                panel: rng.random_range(0..PANELS),
+            },
+            109..113 => Change::Shared {
+                value: rng.random_range(0..WORDS.len()),
+            },
+            113..116 => Change::Global {
+                value: rng.random_range(0..PALETTE.len()),
+            },
+            116..120 => Change::TintPanel {
+                panel: rng.random_range(0..PANELS),
+            },
+            120..124 => Change::TintLeaf {
+                panel: rng.random_range(0..PANELS),
             },
             92..95 => Change::Resize {
                 width: rng.random_range(300.0..1000.0),
@@ -163,10 +246,15 @@ impl Change {
     }
 }
 
-/// A small application: a grid of cells, wrapping paragraphs, a row of chips,
-/// a cached child view and the same rows in a uniform list and a list.
+const PANELS: usize = 6;
+
+/// A small application: a grid of cached cell views, wrapping paragraphs, a
+/// row of chips, a cached child view, child views that are not cached, one of
+/// them deferred, and the same rows in a uniform list and a list.
 struct OracleView {
     cells: Vec<CellState>,
+    /// A view per cell, showing the cell's state.
+    cell_views: Vec<Entity<GridCell>>,
     paragraph_words: usize,
     paragraph_width: Pixels,
     rows: Vec<u64>,
@@ -179,21 +267,29 @@ struct OracleView {
     uniform_scroll: UniformListScrollHandle,
     list_state: ListState,
     badge: Entity<Badge>,
+    panels: Vec<Entity<Panel>>,
+    shared: Entity<Shared>,
 }
 
 impl OracleView {
     fn new(cx: &mut Context<Self>) -> Self {
+        let shared = cx.new(|_| Shared { value: 0 });
+        let cells: Vec<CellState> = (0..GRID_CELLS)
+            .map(|ix| CellState {
+                word: ix % WORDS.len(),
+                color: ix % PALETTE.len(),
+                width: 40. + (ix % 5) as f32 * 30.,
+                background: ix.is_multiple_of(3),
+                truncate: ix.is_multiple_of(4),
+                ..CellState::default()
+            })
+            .collect();
         Self {
-            cells: (0..GRID_CELLS)
-                .map(|ix| CellState {
-                    word: ix % WORDS.len(),
-                    color: ix % PALETTE.len(),
-                    width: 40. + (ix % 5) as f32 * 30.,
-                    background: ix.is_multiple_of(3),
-                    truncate: ix.is_multiple_of(4),
-                    ..CellState::default()
-                })
+            cell_views: cells
+                .iter()
+                .map(|&cell| cx.new(|_| GridCell(cell)))
                 .collect(),
+            cells,
             paragraph_words: 12,
             paragraph_width: px(180.),
             rows: (0..INITIAL_ROWS).collect(),
@@ -205,24 +301,42 @@ impl OracleView {
             uniform_scroll: UniformListScrollHandle::new(),
             list_state: ListState::new(INITIAL_ROWS as usize, ListAlignment::Top, px(40.)),
             badge: cx.new(|_| Badge { count: 0 }),
+            panels: {
+                (0..PANELS)
+                    .map(|ix| {
+                        let shared = shared.clone();
+                        cx.new(|cx| Panel {
+                            ix,
+                            value: ix,
+                            tint: 0,
+                            shared,
+                            leaf: cx.new(|_| Leaf { count: ix, tint: 0 }),
+                        })
+                    })
+                    .collect()
+            },
+            shared,
         }
     }
 
     fn apply(&mut self, change: &Change, cx: &mut Context<Self>) {
         match *change {
-            Change::Word { cell, word } => self.cells[cell].word = word,
-            Change::Color { cell, color } => self.cells[cell].color = color,
-            Change::Width { cell, width } => self.cells[cell].width = width,
-            Change::Toggle { cell, flag } => {
-                let cell = &mut self.cells[cell];
-                let value = match flag {
-                    CellFlag::Background => &mut cell.background,
-                    CellFlag::Underline => &mut cell.underline,
-                    CellFlag::Truncate => &mut cell.truncate,
-                    CellFlag::Hover => &mut cell.hover,
-                };
-                *value = !*value;
-            }
+            Change::Word { cell, word } => self.update_cell(cell, |cell| cell.word = word, cx),
+            Change::Color { cell, color } => self.update_cell(cell, |cell| cell.color = color, cx),
+            Change::Width { cell, width } => self.update_cell(cell, |cell| cell.width = width, cx),
+            Change::Toggle { cell, flag } => self.update_cell(
+                cell,
+                |cell| {
+                    let value = match flag {
+                        CellFlag::Background => &mut cell.background,
+                        CellFlag::Underline => &mut cell.underline,
+                        CellFlag::Truncate => &mut cell.truncate,
+                        CellFlag::Hover => &mut cell.hover,
+                    };
+                    *value = !*value;
+                },
+                cx,
+            ),
             Change::Paragraph { words, width } => {
                 self.paragraph_words = words;
                 self.paragraph_width = px(width);
@@ -261,6 +375,64 @@ impl OracleView {
             }
             Change::RowIdentity(identity) => self.row_identity = identity,
             Change::Direction => self.column = !self.column,
+            Change::Badge
+            | Change::Panel { .. }
+            | Change::Leaf { .. }
+            | Change::TintPanel { .. }
+            | Change::TintLeaf { .. }
+            | Change::Shared { .. } => {
+                self.children().apply_to_children(change, cx);
+                return;
+            }
+            Change::Global { .. }
+            | Change::MoveMouse { .. }
+            | Change::Resize { .. }
+            | Change::Redraw => return,
+        }
+        cx.notify();
+    }
+
+    /// The views nested in this one and the model, for changes applied to
+    /// them alone.
+    fn children(&self) -> Children {
+        Children {
+            badge: self.badge.clone(),
+            panels: self.panels.clone(),
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// Changes a cell and notifies its view; the parent is notified too,
+    /// because it sizes the cell.
+    fn update_cell(
+        &mut self,
+        ix: usize,
+        change: impl FnOnce(&mut CellState),
+        cx: &mut Context<Self>,
+    ) {
+        change(&mut self.cells[ix]);
+        let cell = self.cells[ix];
+        self.cell_views[ix].update(cx, |view, cx| {
+            view.0 = cell;
+            cx.notify();
+        });
+    }
+}
+
+/// Handles on the views nested in an [`OracleView`], and on its model.
+struct Children {
+    badge: Entity<Badge>,
+    panels: Vec<Entity<Panel>>,
+    shared: Entity<Shared>,
+}
+
+impl Children {
+    /// Changes a nested view, or the model, notifying only it.
+    /// The harness applies these without updating this view, so that it is
+    /// dirty only because of what is nested in it, as it is when an
+    /// application notifies a nested view on its own.
+    fn apply_to_children(&self, change: &Change, cx: &mut App) {
+        match *change {
             Change::Badge => {
                 // Only the child is notified, so the parent's frame reuses
                 // whatever it can of the last one around it.
@@ -268,11 +440,50 @@ impl OracleView {
                     badge.count += 1;
                     cx.notify();
                 });
-                return;
             }
-            Change::MoveMouse { .. } | Change::Resize { .. } | Change::Redraw => return,
+            Change::Panel { panel, value } => {
+                self.panels[panel].update(cx, |panel, cx| {
+                    panel.value = value;
+                    cx.notify();
+                });
+            }
+            Change::Leaf { panel } => {
+                let leaf = self.panels[panel].read(cx).leaf.clone();
+                leaf.update(cx, |leaf, cx| {
+                    leaf.count += 1;
+                    cx.notify();
+                });
+            }
+            Change::TintPanel { panel } => {
+                self.panels[panel].update(cx, |panel, cx| {
+                    panel.tint += 1;
+                    cx.notify();
+                });
+            }
+            Change::TintLeaf { panel } => {
+                let leaf = self.panels[panel].read(cx).leaf.clone();
+                leaf.update(cx, |leaf, cx| {
+                    leaf.tint += 1;
+                    cx.notify();
+                });
+            }
+            Change::Shared { value } => {
+                self.shared.update(cx, |shared, cx| {
+                    shared.value = value;
+                    cx.notify();
+                });
+            }
+            _ => unreachable!("not a change to a nested view"),
         }
-        cx.notify();
+    }
+}
+
+/// A cell of the grid, drawn as a cached view.
+struct GridCell(CellState);
+
+impl Render for GridCell {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        render_cell(self.0)
     }
 }
 
@@ -322,7 +533,7 @@ fn render_row(row: u64, identity: RowIdentity) -> AnyElement {
     match identity {
         RowIdentity::Position => row_element.into_any_element(),
         RowIdentity::Id => row_element.id(("row", row)).into_any_element(),
-        RowIdentity::Key => row_element.key(("row", row)).into_any_element(),
+        RowIdentity::Wrapped => div().id(("row", row)).child(row_element).into_any_element(),
     }
 }
 
@@ -343,7 +554,10 @@ fn render_chip(chip: u64, identity: RowIdentity) -> AnyElement {
     match identity {
         RowIdentity::Position => chip_element.into_any_element(),
         RowIdentity::Id => chip_element.id(("chip", chip)).into_any_element(),
-        RowIdentity::Key => chip_element.key(("chip", chip)).into_any_element(),
+        RowIdentity::Wrapped => div()
+            .id(("chip", chip))
+            .child(chip_element)
+            .into_any_element(),
     }
 }
 
@@ -395,13 +609,13 @@ impl Render for OracleView {
                     .flex_wrap()
                     .w(px(420.))
                     .gap_1()
-                    // Every cell is a memo keyed by its state, so the window
-                    // drawing incrementally reuses the ones that did not change
-                    // while the one drawing from scratch builds them all.
-                    .children(self.cells.iter().copied().enumerate().map(|(ix, cell)| {
-                        memo(("cell", ix), cell, move |_, _| render_cell(cell))
-                            .w(px(cell.width))
-                            .h(px(18.))
+                    // Every cell is a cached view notified when it changes, so
+                    // the window drawing incrementally reuses the ones that did
+                    // not change while the one drawing from scratch builds them
+                    // all.
+                    .children(self.cells.iter().zip(&self.cell_views).map(|(cell, view)| {
+                        view.clone()
+                            .cached(StyleRefinement::default().w(px(cell.width)).h(px(18.)))
                     })),
             )
             .child(
@@ -433,8 +647,88 @@ impl Render for OracleView {
                     .gap_1()
                     .children(self.chips.iter().map(|&chip| render_chip(chip, identity))),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(self.panels[..PANELS - 1].iter().cloned()),
+            )
+            .child(
+                div()
+                    .size(px(10.))
+                    .child(deferred(anchored().child(self.panels[PANELS - 1].clone()))),
+            )
             .child(uniform_rows)
             .child(list_rows)
+    }
+}
+
+/// A model panels read without observing it.
+struct Shared {
+    value: usize,
+}
+
+/// A global panels read.
+struct Accent(usize);
+
+impl Global for Accent {}
+
+/// A child view that is not cached, so the window keeps it
+/// from one frame to the next by itself. Some panels read the shared model
+/// and the global.
+struct Panel {
+    ix: usize,
+    value: usize,
+    /// Shifts its colors, leaving its layout as it was.
+    tint: usize,
+    shared: Entity<Shared>,
+    leaf: Entity<Leaf>,
+}
+
+impl Render for Panel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let shared = if self.ix.is_multiple_of(2) {
+            self.shared.read(cx).value
+        } else {
+            0
+        };
+        let accent = if self.ix.is_multiple_of(3) {
+            cx.try_global::<Accent>().map_or(0, |accent| accent.0)
+        } else {
+            0
+        };
+        div()
+            .flex()
+            .flex_col()
+            .p_1()
+            .bg(PALETTE[(self.value + accent + self.tint) % PALETTE.len()])
+            .when(self.ix == 1, |this| {
+                this.hover(|style| style.bg(PALETTE[4]))
+            })
+            .child(WORDS[(self.value + shared) % WORDS.len()])
+            .child(self.leaf.clone())
+    }
+}
+
+/// A view nested in a panel, notified on its own.
+struct Leaf {
+    count: usize,
+    tint: usize,
+}
+
+impl Render for Leaf {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .children((0..self.count % 3 + 1).map(|ix| {
+                div()
+                    .w(px(4. + ix as f32 * 5.))
+                    .h(px(6.))
+                    .bg(PALETTE[(self.count + ix + self.tint) % PALETTE.len()])
+            }))
     }
 }
 
@@ -537,6 +831,16 @@ fn apply(cx: &mut TestAppContext, window: WindowHandle<OracleView>, change: &Cha
         Change::Resize { width, height } => {
             cx.simulate_window_resize(window.into(), size(px(width), px(height)));
         }
+        Change::Global { value } => cx.update(|cx| cx.set_global(Accent(value))),
+        Change::Badge
+        | Change::Panel { .. }
+        | Change::Leaf { .. }
+        | Change::TintPanel { .. }
+        | Change::TintLeaf { .. }
+        | Change::Shared { .. } => {
+            let view = window.read_with(cx, |view, _| view.children()).unwrap();
+            cx.update(|cx| view.apply_to_children(change, cx));
+        }
         _ => window
             .update(cx, |view, _, cx| view.apply(change, cx))
             .unwrap(),
@@ -549,7 +853,7 @@ fn draw(
     cx: &mut TestAppContext,
     window: WindowHandle<OracleView>,
     from_scratch: bool,
-) -> (Vec<String>, u64) {
+) -> (Vec<String>, u64, bool) {
     cx.update_window(window.into(), |_, window, cx| {
         if from_scratch {
             window.forget_retained_state();
@@ -559,6 +863,7 @@ fn draw(
         (
             window.describe_rendered_frame(),
             window.layout_stats().nodes_reused,
+            window.rendered_frame.retained.reused_any(),
         )
     })
     .unwrap()
@@ -566,13 +871,14 @@ fn draw(
 
 /// Drives both windows through one random history and returns how many
 /// layout nodes the incremental window reused along the way.
-fn run(seed: u64, steps: usize) -> u64 {
+fn run(seed: u64, steps: usize) -> (u64, usize) {
     let mut cx = TestAppContext::with_text_system(Arc::new(GlyphBoxTextSystem(NoopTextSystem)));
     let incremental = cx.add_window(|_, cx| OracleView::new(cx));
     let from_scratch = cx.add_window(|_, cx| OracleView::new(cx));
     let mut rng = StdRng::seed_from_u64(seed);
     let mut history: Vec<Vec<Change>> = Vec::new();
     let mut reused = 0;
+    let mut frames_reusing_subtrees = 0;
 
     for step in 0..steps {
         let changes: Vec<Change> = if step == 0 {
@@ -588,13 +894,19 @@ fn run(seed: u64, steps: usize) -> u64 {
         }
         history.push(changes);
 
-        let (expected, reused_from_scratch) = draw(&mut cx, from_scratch, true);
-        let (actual, reused_incrementally) = draw(&mut cx, incremental, false);
+        let (expected, reused_from_scratch, subtrees_from_scratch) =
+            draw(&mut cx, from_scratch, true);
+        let (actual, reused_incrementally, reused_subtrees) = draw(&mut cx, incremental, false);
         assert_eq!(
             reused_from_scratch, 0,
             "a window that forgot its layout nodes cannot have reused any"
         );
+        assert!(
+            !subtrees_from_scratch,
+            "a refreshed window cannot draw anything from its last frame"
+        );
         reused += reused_incrementally;
+        frames_reusing_subtrees += reused_subtrees as usize;
 
         if actual != expected {
             let first = actual
@@ -629,14 +941,20 @@ fn run(seed: u64, steps: usize) -> u64 {
             );
         }
     }
-    reused
+    (reused, frames_reusing_subtrees)
 }
 
 #[test]
 fn incremental_frames_match_frames_drawn_from_scratch() {
-    let reused: u64 = (0..24).map(|seed| run(seed, 60)).sum();
+    let (reused, frames_reusing_subtrees) = (0..24)
+        .map(|seed| run(seed, 60))
+        .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
     assert!(
         reused > 0,
         "the incremental window never reused a layout node, so nothing was compared"
+    );
+    assert!(
+        frames_reusing_subtrees > 0,
+        "the incremental window never drew a view again from its last frame"
     );
 }

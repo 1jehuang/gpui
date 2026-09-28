@@ -11,11 +11,11 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LayoutStats, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
@@ -28,7 +28,7 @@ use crate::{
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
-use collections::{FxHashMap, FxHashSet, FxHasher};
+use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
@@ -64,6 +64,8 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod prompts;
+
+use crate::fast::retained::{EnclosingRetained, RetainedState, RetainedSubtrees};
 
 pub use a11y::A11ySubtreeBuilder;
 
@@ -962,40 +964,31 @@ pub(crate) struct TooltipRequest {
 }
 
 pub(crate) struct DeferredDraw {
-    current_view: EntityId,
-    priority: usize,
-    parent_node: DispatchNodeId,
-    element_id_stack: SmallVec<[ElementId; 32]>,
-    text_style_stack: Vec<TextStyleRefinement>,
-    content_mask: Option<ContentMask<Pixels>>,
-    rem_size: Pixels,
-    element: Option<AnyElement>,
-    absolute_offset: Point<Pixels>,
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
-    /// The memos and cached views the element was deferred from. It is drawn
-    /// after they are, but is part of what they drew, so it is drawn inside
-    /// them again: what changes its look marks them.
-    memo_stack: Vec<GlobalElementId>,
-    /// The hovers the element was painted by, while inside a memo or cached
-    /// view; see [`Window::hovers_unchanged`].
-    hover_dependencies: Vec<(HitboxId, bool)>,
+    pub(crate) current_view: EntityId,
+    pub(crate) priority: usize,
+    pub(crate) parent_node: DispatchNodeId,
+    pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
+    pub(crate) text_style_stack: Vec<TextStyleRefinement>,
+    pub(crate) content_mask: Option<ContentMask<Pixels>>,
+    pub(crate) rem_size: Pixels,
+    pub(crate) element: Option<AnyElement>,
+    pub(crate) absolute_offset: Point<Pixels>,
+    pub(crate) prepaint_range: Range<PrepaintStateIndex>,
+    pub(crate) paint_range: Range<PaintIndex>,
+    pub(crate) enclosing_retained: EnclosingRetained,
 }
 
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
-    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    pub(crate) accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
-    /// The hovers what memos and cached views deferred was painted by, by
-    /// memo, so each can check them before it is reused.
-    deferred_hover_dependencies: FxHashMap<GlobalElementId, Vec<(HitboxId, bool)>>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
@@ -1006,58 +999,29 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    pub(crate) retained: RetainedSubtrees,
 }
 
-/// One level of [`Window::push_layout_key`]'s path stack.
-struct LayoutKeyFrame {
-    /// Hash of the path from the root of the element tree to this element.
-    key: u64,
-    /// How many children without an [`ElementId`] have been entered so far,
-    /// which is what identifies the next one.
-    next_unidentified_child: u32,
-}
-
-/// Where layout key paths start.
-const LAYOUT_ROOT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// Separates the elements laid out during an element's prepaint from that same
-/// element's children, which are keyed from the same point during request
-/// layout and would otherwise land on the same keys.
-const LAYOUT_PREPAINT_SALT: u64 = 0x5BF0_3635_931A_2E77;
-
-/// Mixes `value` into `state`, well enough that path hashes built out of small
-/// child indices do not collide in practice.
-///
-/// This is the finalizer from SplitMix64 applied to the combined value.
-fn mix(state: u64, value: u64) -> u64 {
-    let mut z = state
-        .rotate_left(27)
-        .wrapping_add(value)
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct PrepaintStateIndex {
-    hitboxes_index: usize,
-    tooltips_index: usize,
-    deferred_draws_index: usize,
-    dispatch_tree_index: usize,
-    accessed_element_states_index: usize,
-    line_layout_index: LineLayoutIndex,
+    pub(crate) hitboxes_index: usize,
+    pub(crate) tooltips_index: usize,
+    pub(crate) deferred_draws_index: usize,
+    pub(crate) dispatch_tree_index: usize,
+    pub(crate) accessed_element_states_index: usize,
+    pub(crate) line_layout_index: LineLayoutIndex,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct PaintIndex {
-    scene_index: usize,
-    mouse_listeners_index: usize,
-    input_handlers_index: usize,
-    cursor_styles_index: usize,
-    accessed_element_states_index: usize,
-    tab_handle_index: usize,
-    line_layout_index: LineLayoutIndex,
+    pub(crate) scene_index: usize,
+    pub(crate) window_control_hitboxes_index: usize,
+    pub(crate) mouse_listeners_index: usize,
+    pub(crate) input_handlers_index: usize,
+    pub(crate) cursor_styles_index: usize,
+    pub(crate) accessed_element_states_index: usize,
+    pub(crate) tab_handle_index: usize,
+    pub(crate) line_layout_index: LineLayoutIndex,
 }
 
 impl Frame {
@@ -1073,7 +1037,6 @@ impl Frame {
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
-            deferred_hover_dependencies: FxHashMap::default(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
@@ -1087,6 +1050,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            retained: RetainedSubtrees::default(),
         }
     }
 
@@ -1102,8 +1066,8 @@ impl Frame {
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
-        self.deferred_hover_dependencies.clear();
         self.tab_stops.clear();
+        self.retained.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1183,14 +1147,6 @@ enum InputModality {
     Touch,
 }
 
-/// How the glyphs of a run are rendered: what painting a glyph needs that
-/// depends on its run, not on the glyph. See [`Window::glyph_run_rendering`].
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) struct GlyphRunRendering {
-    subpixel_rendering: bool,
-    dilation: u8,
-}
-
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1208,43 +1164,13 @@ pub struct Window {
     ///
     /// This is used by `with_rem_size` to allow rendering an element tree with
     /// a given rem size.
-    rem_size_override_stack: SmallVec<[Pixels; 8]>,
+    pub(crate) rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
-    layout_engine: Option<TaffyLayoutEngine>,
-    /// Running hashes of the path from the root of the element tree down to the
-    /// element currently requesting layout. See [`Window::push_layout_key`].
-    layout_key_stack: SmallVec<[LayoutKeyFrame; 32]>,
-    /// How many unidentified element trees have been laid out under the
-    /// current scope. Window roots, prompts, drags and tooltips each start a
-    /// tree of their own and need keys that do not collide with each other.
-    layout_root_index: u32,
-    /// The layout key of the element currently being prepainted, which anything
-    /// it lays out from there hangs off. See [`Window::push_layout_key`].
-    layout_prepaint_scope: u64,
-    /// Measurement reuses recorded while the layout engine was moved out of the
-    /// window, waiting to be folded into its statistics.
-    pub(crate) pending_measure_reuses: u64,
-    /// How long each phase of the frame took, waiting to be folded into the
-    /// layout engine's statistics. Kept here because the phases are driven from
-    /// the window, not from the engine.
-    frame_phase_times: (Duration, Duration, Duration),
+    pub(crate) layout_engine: Option<TaffyLayoutEngine>,
+    pub(crate) fast_layout: crate::fast::layout_key::WindowLayout,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
-    pub(crate) global_ids: crate::element::GlobalIdCache,
-    /// The reusable subtrees — memos and cached views — being built or
-    /// painted, innermost last. An interaction inside one, a hover or a
-    /// scroll, marks all of them to be built again. See [`crate::memo`].
-    pub(crate) memo_stack: Vec<GlobalElementId>,
-    /// Reusable subtrees that an interaction inside them changed since they
-    /// were drawn.
-    pub(crate) dirty_memos: FxHashSet<GlobalElementId>,
-    /// Reusable subtrees found out of date too late in a frame to build them
-    /// again, which become [`Window::dirty_memos`] for the next one.
-    pub(crate) memos_dirty_next_frame: FxHashSet<GlobalElementId>,
-    /// Whether each hitbox whose hover a memo's subtree was painted by was
-    /// hovered then, in painting order. A memo keeps the stretch its subtree
-    /// added and is built again once any of them is hovered differently.
-    pub(crate) memo_hover_dependencies: Vec<(HitboxId, bool)>,
+    pub(crate) retained_state: RetainedState,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
@@ -2108,18 +2034,10 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
-            layout_key_stack: SmallVec::new(),
-            layout_root_index: 0,
-            layout_prepaint_scope: LAYOUT_ROOT_SEED,
-            pending_measure_reuses: 0,
-            frame_phase_times: (Duration::ZERO, Duration::ZERO, Duration::ZERO),
+            fast_layout: Default::default(),
             root: None,
             element_id_stack: SmallVec::default(),
-            global_ids: Default::default(),
-            memo_stack: Vec::new(),
-            dirty_memos: FxHashSet::default(),
-            memos_dirty_next_frame: FxHashSet::default(),
-            memo_hover_dependencies: Vec::new(),
+            retained_state: RetainedState::new(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
@@ -3027,7 +2945,7 @@ impl Window {
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
         self.with_id(element_id, |this| {
-            let global_id = this.global_ids.get(&this.element_id_stack);
+            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
 
             f(&global_id, this)
         })
@@ -3137,7 +3055,7 @@ impl Window {
     }
 
     #[inline]
-    pub(crate) fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+    fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.cover_bounds(self.content_mask().bounds),
         }
@@ -3317,13 +3235,9 @@ impl Window {
         }
 
         self.layout_engine.as_mut().unwrap().end_frame();
-        debug_assert!(self.layout_key_stack.is_empty());
-        self.layout_root_index = 0;
-        self.layout_prepaint_scope = LAYOUT_ROOT_SEED;
+        self.fast_layout.end_frame();
         self.text_system().finish_frame();
-        self.global_ids.finish_frame();
-        self.dirty_memos = mem::take(&mut self.memos_dirty_next_frame);
-        self.memo_hover_dependencies.clear();
+        self.finish_retained_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -3411,6 +3325,7 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
+        self.retained_state.note_notified(&views);
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
@@ -3484,7 +3399,7 @@ impl Window {
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
-        let build_started_at = Instant::now();
+        self.fast_layout.phase_times.begin();
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -3517,8 +3432,7 @@ impl Window {
         let scale_factor = self.scale_factor();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
-        self.frame_phase_times.0 += build_started_at.elapsed();
-        let prepaint_started_at = Instant::now();
+        self.fast_layout.phase_times.end_build();
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -3553,8 +3467,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.frame_phase_times.1 += prepaint_started_at.elapsed();
-        let paint_started_at = Instant::now();
+        self.fast_layout.phase_times.end_prepaint();
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
@@ -3576,7 +3489,7 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
-        self.frame_phase_times.2 += paint_started_at.elapsed();
+        self.fast_layout.phase_times.end_paint();
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
@@ -3723,8 +3636,7 @@ impl Window {
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
-                    self.memo_stack
-                        .clone_from(&self.next_frame.deferred_draws[deferred_draw_ix].memo_stack);
+                    let recording = self.begin_deferred_retained_prepaint(deferred_draw_ix, cx);
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
@@ -3732,7 +3644,7 @@ impl Window {
                             });
                         });
                     });
-                    self.memo_stack.clear();
+                    self.finish_deferred_retained(recording, cx);
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
@@ -3770,8 +3682,8 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
-                self.memo_stack.clone_from(&deferred_draw.memo_stack);
-                let dependencies_start = self.memo_hover_dependencies.len();
+                let recording =
+                    self.begin_deferred_retained_paint(&deferred_draw.enclosing_retained, cx);
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     window.with_content_mask(content_mask, |window| {
                         window.with_rem_size(Some(deferred_draw.rem_size), |window| {
@@ -3779,30 +3691,9 @@ impl Window {
                         });
                     })
                 });
-                deferred_draw.hover_dependencies =
-                    self.memo_hover_dependencies[dependencies_start..].to_vec();
-                self.memo_stack.clear();
+                self.finish_deferred_retained(recording, cx);
             } else {
-                // Reused with the memos it was deferred from, which checked
-                // their own hovers but not these; one that changed has them
-                // built on the next frame, which is asked for.
-                if !self.hovers_unchanged(&deferred_draw.hover_dependencies) {
-                    self.memos_dirty_next_frame
-                        .extend(deferred_draw.memo_stack.iter().cloned());
-                    self.with_rendered_view(deferred_draw.current_view, |window| {
-                        window.request_animation_frame()
-                    });
-                }
                 self.reuse_paint(deferred_draw.paint_range.clone());
-            }
-            if !deferred_draw.hover_dependencies.is_empty() {
-                for memo in &deferred_draw.memo_stack {
-                    self.next_frame
-                        .deferred_hover_dependencies
-                        .entry(memo.clone())
-                        .or_default()
-                        .extend_from_slice(&deferred_draw.hover_dependencies);
-                }
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
@@ -3876,8 +3767,7 @@ impl Window {
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
-                    memo_stack: deferred_draw.memo_stack.clone(),
-                    hover_dependencies: deferred_draw.hover_dependencies.clone(),
+                    enclosing_retained: EnclosingRetained::default(),
                 }),
         );
     }
@@ -3885,6 +3775,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
@@ -3895,6 +3786,7 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.reuse_window_control_hitboxes(&range);
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -4358,8 +4250,7 @@ impl Window {
             absolute_offset,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
-            memo_stack: self.memo_stack.clone(),
-            hover_dependencies: Vec::new(),
+            enclosing_retained: self.next_frame.retained.open_records(),
         });
     }
 
@@ -4685,48 +4576,6 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
-        let rendering = self.glyph_run_rendering(font_id, font_size, color);
-        let content_mask = self.snapped_content_mask();
-        self.paint_glyph_in_run(
-            origin,
-            font_id,
-            glyph_id,
-            font_size,
-            color,
-            rendering,
-            content_mask,
-        )
-    }
-
-    /// How the glyphs of a run in `font_id` at `font_size` and in `color` are
-    /// rendered, which [`Window::paint_glyph_in_run`] takes so that painting a
-    /// line works it out once a run rather than once a glyph: it asks the
-    /// window how it is drawn and converts the colour to find its dilation.
-    pub(crate) fn glyph_run_rendering(
-        &self,
-        font_id: FontId,
-        font_size: Pixels,
-        color: Hsla,
-    ) -> GlyphRunRendering {
-        GlyphRunRendering {
-            subpixel_rendering: self.should_use_subpixel_rendering(font_id, font_size),
-            dilation: self.text_system().glyph_dilation_for_color(color),
-        }
-    }
-
-    /// [`Window::paint_glyph`], for a glyph in a run whose rendering and
-    /// snapped content mask the caller has already worked out.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn paint_glyph_in_run(
-        &mut self,
-        origin: Point<Pixels>,
-        font_id: FontId,
-        glyph_id: GlyphId,
-        font_size: Pixels,
-        color: Hsla,
-        rendering: GlyphRunRendering,
-        content_mask: ContentMask<ScaledPixels>,
-    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
@@ -4744,10 +4593,8 @@ impl Window {
             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
-        let GlyphRunRendering {
-            subpixel_rendering,
-            dilation,
-        } = rendering;
+        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
+        let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -4772,6 +4619,7 @@ impl Window {
                 origin: integer_origin + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
+            let content_mask = self.snapped_content_mask();
 
             if subpixel_rendering {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
@@ -5118,7 +4966,6 @@ impl Window {
         let scale_factor = self.scale_factor();
 
         let key = self.layout_key();
-
         self.layout_engine.as_mut().unwrap().request_layout(
             key,
             style,
@@ -5146,259 +4993,10 @@ impl Window {
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
         let key = self.layout_key();
-        let (layout_id, _) = self
-            .layout_engine
+        self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(
-                key,
-                style,
-                rem_size,
-                scale_factor,
-                // Nothing is known about what this measurement depends on, so it is
-                // re-run every frame.
-                None,
-                None,
-                Rc::new(()) as Rc<dyn Any>,
-                |_| Box::new(measure),
-            );
-        layout_id
-    }
-
-    /// Like [`Window::request_measured_layout`], but tells the layout engine
-    /// what the measurement depends on so it can be skipped when nothing has.
-    ///
-    /// `measure_key` must cover every input that can change the measured size —
-    /// and *only* those inputs, since anything else folded into it costs a
-    /// needless relayout. While the key is unchanged, the node is left clean and
-    /// Taffy may answer its size from cache without calling the measurement.
-    ///
-    /// Measurements in GPUI generally do double duty, producing artifacts the
-    /// element later paints from. Those live in `state`: when a skipped
-    /// measurement means nothing was produced this frame, the state that went
-    /// with the previous one is returned instead, and the caller should adopt it.
-    ///
-    /// `closure_key` must cover everything the closure `build_measure` returns
-    /// depends on, including what it captures and `build_measure` itself does.
-    /// While both keys are unchanged the node keeps the closure it already
-    /// has, built around the same state, and `build_measure` is not called.
-    /// A closure that captures anything `measure_key` leaves out, colours for
-    /// example, would otherwise be rebuilt every frame just in case.
-    pub fn request_measured_layout_cached<S, F>(
-        &mut self,
-        style: Style,
-        measure_key: u64,
-        closure_key: u64,
-        state: Rc<S>,
-        build_measure: impl FnOnce(&Rc<S>) -> F,
-    ) -> (LayoutId, Rc<S>)
-    where
-        S: 'static,
-        F: FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
-            + 'static,
-    {
-        self.invalidator.debug_assert_prepaint();
-
-        let rem_size = self.rem_size();
-        let scale_factor = self.scale_factor();
-        let key = self.layout_key();
-        let (layout_id, state) = self
-            .layout_engine
-            .as_mut()
-            .unwrap()
-            .request_measured_layout(
-                key,
-                style,
-                rem_size,
-                scale_factor,
-                Some(measure_key),
-                Some(closure_key),
-                state as Rc<dyn Any>,
-                |state| {
-                    let state = state
-                        .clone()
-                        .downcast::<S>()
-                        .expect("layout state type is checked before it is handed back");
-                    Box::new(build_measure(&state))
-                },
-            );
-        let state = state
-            .downcast::<S>()
-            .expect("layout state type is checked before it is handed back");
-        (layout_id, state)
-    }
-
-    /// The key identifying the element currently requesting layout, used to
-    /// match it up with the Taffy node it had on the previous frame.
-    ///
-    /// `None` while no element tree is being walked — layout requested from the
-    /// prepaint phase, as uniform lists do when sizing their items, arrives
-    /// here. Those nodes are not reused.
-    fn layout_key(&self) -> Option<u64> {
-        self.layout_key_stack.last().map(|frame| frame.key)
-    }
-
-    /// Begins an element, deriving the key its layout node is matched by across
-    /// frames.
-    ///
-    /// The key is the hash of the path from the root: each element mixes either
-    /// its [`ElementId`], when it has one, or its index among its unidentified
-    /// siblings. Identified elements therefore keep their node when siblings are
-    /// inserted or reordered around them, while unidentified ones are matched
-    /// purely by position, which is the same bargain the element state map makes.
-    ///
-    /// Because the parent's key is always mixed in, a key encodes the whole
-    /// ancestor path, and a node can never be matched to an element that has
-    /// moved to a different parent.
-    pub(crate) fn push_layout_key(&mut self, id: Option<&ElementId>) -> u64 {
-        let component = match id {
-            Some(id) => {
-                let mut hasher = FxHasher::default();
-                id.hash(&mut hasher);
-                // Kept distinct from the positional case so that an element
-                // identified by index 3 and one whose `ElementId` hashes to 3
-                // do not collide.
-                mix(hasher.finish(), 1)
-            }
-            None => {
-                let index = match self.layout_key_stack.last_mut() {
-                    Some(parent) => &mut parent.next_unidentified_child,
-                    None => &mut self.layout_root_index,
-                };
-                let component = mix(*index as u64, 2);
-                *index += 1;
-                component
-            }
-        };
-        let parent = self
-            .layout_key_stack
-            .last()
-            .map(|parent| parent.key)
-            .unwrap_or_else(|| mix(self.layout_prepaint_scope, LAYOUT_PREPAINT_SALT));
-        let key = mix(parent, component);
-        self.layout_key_stack.push(LayoutKeyFrame {
-            key,
-            next_unidentified_child: 0,
-        });
-        key
-    }
-
-    /// Hangs elements laid out from here on the element whose prepaint is
-    /// running, and returns what [`Window::exit_prepaint_layout_scope`] needs to
-    /// undo it.
-    ///
-    /// The walk that assigns layout keys covers the request-layout phase only.
-    /// Elements laid out afterwards — list items, which a list can lay out only
-    /// once it knows how many of them fit — arrive with no path at all, and
-    /// would otherwise be keyed by the order they happened to be laid out in.
-    /// A list that scrolled by one row, or gained a row at the top, would
-    /// renumber every item and rebuild every item's layout nodes. Keyed under
-    /// the element that lays them out, an item carrying an [`ElementId`] keeps
-    /// its nodes wherever it moves within its list.
-    pub(crate) fn enter_prepaint_layout_scope(&mut self, layout_key: u64) -> (u64, u32) {
-        (
-            mem::replace(&mut self.layout_prepaint_scope, layout_key),
-            mem::replace(&mut self.layout_root_index, 0),
-        )
-    }
-
-    /// Restores what [`Window::enter_prepaint_layout_scope`] replaced.
-    pub(crate) fn exit_prepaint_layout_scope(&mut self, enclosing: (u64, u32)) {
-        (self.layout_prepaint_scope, self.layout_root_index) = enclosing;
-    }
-
-    /// Ends the element most recently begun by [`Window::push_layout_key`].
-    pub(crate) fn pop_layout_key(&mut self) {
-        self.layout_key_stack.pop();
-    }
-
-    /// Lays out whatever `f` lays out under a step of the layout key path
-    /// that names the list item at `index`, as though an element identified by
-    /// it enclosed them. No such element exists, so the element id stack, and
-    /// the element state keyed by it, are untouched. See
-    /// [`AnyElement::layout_as_list_item`].
-    pub(crate) fn with_list_item_layout_key<R>(
-        &mut self,
-        index: usize,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        // Named so that it cannot stand for an item that was given the same
-        // index as its id.
-        let key =
-            ElementId::NamedInteger(SharedString::new_static("gpui::list_item"), index as u64);
-        self.push_layout_key(Some(&key));
-        let result = f(self);
-        self.pop_layout_key();
-        result
-    }
-
-    /// Counters describing the work the layout engine has performed since the
-    /// last call to [`Window::reset_layout_stats`].
-    ///
-    /// Useful for confirming that a change actually reduced layout work rather
-    /// than only moving it around: `nodes_reused` against `nodes_created` shows
-    /// how much of the tree survived the frame, and `style_writes` shows how
-    /// much of it was dirtied again anyway.
-    pub fn layout_stats(&self) -> LayoutStats {
-        let (build_time, prepaint_time, paint_time) = self.frame_phase_times;
-        let (lines_shaped, shape_time) = self.text_system.shaping_stats();
-        LayoutStats {
-            build_time,
-            prepaint_time,
-            paint_time,
-            lines_shaped,
-            shape_time,
-            ..self.layout_engine.as_ref().unwrap().stats()
-        }
-    }
-
-    /// Drops everything this window keeps from one frame to the next to save
-    /// work — retained layout nodes and the measurements they hold, shaped
-    /// lines, recorded orderings — and asks for a full refresh, so the next
-    /// frame is drawn the way a window drawing its first frame would draw it.
-    /// State the application can observe, such as element state, is kept.
-    #[cfg(test)]
-    pub(crate) fn forget_retained_state(&mut self) {
-        self.layout_engine = Some(TaffyLayoutEngine::new());
-        self.text_system.forget_line_layouts();
-        self.rendered_frame.scene.forget_orderings();
-        self.next_frame.scene.forget_orderings();
-        self.refresh();
-    }
-
-    /// What the last drawn frame shows and where it can be hit, as text two
-    /// frames can be compared by. See [`Scene::describe`].
-    #[cfg(test)]
-    pub(crate) fn describe_rendered_frame(&self) -> Vec<String> {
-        let mut lines = self.rendered_frame.scene.describe();
-        lines.extend(self.rendered_frame.hitboxes.iter().map(|hitbox| {
-            format!(
-                "hitbox {:?} {:?} {:?}",
-                hitbox.bounds, hitbox.content_mask, hitbox.behavior
-            )
-        }));
-        lines
-    }
-
-    /// Zeroes the counters reported by [`Window::layout_stats`].
-    pub fn reset_layout_stats(&mut self) {
-        self.frame_phase_times = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-        self.layout_engine.as_mut().unwrap().reset_stats();
-        self.text_system.reset_shaping_stats();
-    }
-
-    /// Records that a measurement answered from a result the element already
-    /// had, for [`Window::layout_stats`].
-    ///
-    /// Measurements run with the layout engine moved out of the window, so this
-    /// is tallied here and folded in once layout is done.
-    pub(crate) fn record_measure_reuse(&mut self) {
-        self.pending_measure_reuses += 1;
-    }
-
-    /// How many layout nodes this window is currently holding on to.
-    pub fn layout_node_count(&self) -> usize {
-        self.layout_engine.as_ref().unwrap().node_count()
+            .request_measured_layout(key, style, rem_size, scale_factor, measure)
     }
 
     /// Compute the layout for the given id within the given available space.
@@ -7198,77 +6796,9 @@ impl Window {
     pub fn toggle_inspector(&mut self, cx: &mut App) {
         self.inspector = match self.inspector {
             None => Some(cx.new(|_| Inspector::new())),
-            Some(_) => {
-                self.rendered_frame.next_inspector_instance_ids = FxHashMap::default();
-                self.rendered_frame.inspector_hitboxes = FxHashMap::default();
-                self.next_frame.next_inspector_instance_ids = FxHashMap::default();
-                self.next_frame.inspector_hitboxes = FxHashMap::default();
-                None
-            }
+            Some(_) => None,
         };
         self.refresh();
-    }
-
-    /// The memos around the element being painted, for a listener to mark if
-    /// what it listens for changes the element's look. See [`crate::memo`].
-    pub(crate) fn enclosing_memos(&self) -> SmallVec<[GlobalElementId; 2]> {
-        self.memo_stack.iter().cloned().collect()
-    }
-
-    /// Notes that what is being painted inside a memo looks the way it does
-    /// because `hitbox` is, or is not, hovered. See [`crate::memo`].
-    pub(crate) fn note_memo_hover_dependency(&mut self, hitbox: HitboxId, hovered: bool) {
-        if !self.memo_stack.is_empty() {
-            self.memo_hover_dependencies.push((hitbox, hovered));
-        }
-    }
-
-    /// See [`TaffyLayoutEngine::record_claimed_keys`].
-    pub(crate) fn record_claimed_layout_keys(&mut self) -> usize {
-        self.layout_engine.as_mut().unwrap().record_claimed_keys()
-    }
-
-    /// See [`TaffyLayoutEngine::finish_recording_claimed_keys`].
-    pub(crate) fn finish_recording_claimed_layout_keys(&mut self, start: usize) -> Vec<u64> {
-        self.layout_engine
-            .as_mut()
-            .unwrap()
-            .finish_recording_claimed_keys(start)
-    }
-
-    /// See [`TaffyLayoutEngine::keep_retained`].
-    pub(crate) fn keep_retained_layout(&mut self, keys: &[u64]) {
-        self.layout_engine.as_mut().unwrap().keep_retained(keys);
-    }
-
-    /// Whether every hover in `dependencies`, recorded while a reusable
-    /// subtree — a memo or a cached view — was painted, is still as it was.
-    pub(crate) fn hovers_unchanged(&self, dependencies: &[(HitboxId, bool)]) -> bool {
-        let touch = self.last_input_was_touch();
-        dependencies
-            .iter()
-            .all(|(hitbox, hovered)| (!touch && hitbox.is_hovered(self)) == *hovered)
-    }
-
-    /// Whether every hover that what `memo` deferred was painted by last frame
-    /// is still as it was. It is painted after the memo, so its hovers are not
-    /// among the memo's own.
-    pub(crate) fn deferred_hovers_unchanged(&self, memo: &GlobalElementId) -> bool {
-        self.rendered_frame
-            .deferred_hover_dependencies
-            .get(memo)
-            .is_none_or(|dependencies| self.hovers_unchanged(dependencies))
-    }
-
-    /// Marks memos to be built again rather than reused on the next frame.
-    pub(crate) fn invalidate_memos(&mut self, memos: &[GlobalElementId]) {
-        self.dirty_memos.extend(memos.iter().cloned());
-    }
-
-    /// Whether the inspector is open, so elements need the ids it finds them by.
-    #[cfg(any(feature = "inspector", debug_assertions))]
-    pub(crate) fn inspector_enabled(&self) -> bool {
-        self.inspector.is_some()
     }
 
     /// Returns true if the window is in inspector mode.
@@ -7286,19 +6816,22 @@ impl Window {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub fn with_inspector_state<T: 'static, R>(
         &mut self,
-        inspector_id: Option<&crate::InspectorElementId>,
+        _inspector_id: Option<&crate::InspectorElementId>,
         cx: &mut App,
         f: impl FnOnce(&mut Option<T>, &mut Self) -> R,
-    ) -> Option<R> {
-        let inspector_id = inspector_id?;
-        let inspector = self.inspector.as_ref()?;
-        if inspector.read(cx).active_element_id() != Some(inspector_id) {
-            return None;
+    ) -> R {
+        if let Some(inspector_id) = _inspector_id
+            && let Some(inspector) = &self.inspector
+        {
+            let inspector = inspector.clone();
+            let active_element_id = inspector.read(cx).active_element_id();
+            if Some(inspector_id) == active_element_id {
+                return inspector.update(cx, |inspector, _cx| {
+                    inspector.with_active_element_state(self, f)
+                });
+            }
         }
-        let inspector = inspector.clone();
-        Some(inspector.update(cx, |inspector, _cx| {
-            inspector.with_active_element_state(self, f)
-        }))
+        f(&mut None, self)
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -7984,14 +7517,13 @@ mod tests {
     };
 
     use crate::{
-        AnyWindowHandle, App, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent,
-        Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle, Hsla,
+        AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent, Empty,
+        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
         InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
-        LayoutStats, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-        Pixels, PlatformInput, Point, Render, RenderOnce, RequestFrameOptions, SharedString,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, UniformListScrollHandle, Window, WindowAppearance, WindowHandle,
-        WindowOptions, canvas, div, hsla, point, px, size, uniform_list,
+        LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
+        PlatformInput, Point, Render, RequestFrameOptions, StatefulInteractiveElement as _, Styled,
+        TestAppContext, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window, WindowAppearance,
+        WindowOptions, canvas, div, point, px, size,
     };
 
     /// Visibility transitions reach observers exactly once each, with the new
@@ -9138,1001 +8670,5 @@ mod tests {
                 );
             })
             .unwrap();
-    }
-
-    /// Drives the retained-layout tests.
-    ///
-    /// The shape, the styling and the text of the tree are each controllable on
-    /// their own, and every row records the bounds its trailing probe resolved
-    /// to, so a frame assembled out of retained nodes can be compared against
-    /// the frame a fresh tree produces for the same inputs.
-    struct RetainedLayoutView {
-        rows: usize,
-        row_width: Pixels,
-        label: SharedString,
-        probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-        /// Identities of the rows, in order. Rows are keyed by these when
-        /// `keyed` is set, and by their position otherwise.
-        row_ids: Vec<u64>,
-        keyed: bool,
-        text_color: Hsla,
-    }
-
-    impl Render for RetainedLayoutView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let probes = self.probes.clone();
-            probes.borrow_mut().clear();
-            let label = self.label.clone();
-            let row_width = self.row_width;
-            let keyed = self.keyed;
-            let row_ids = self.row_ids.clone();
-            let text_color = self.text_color;
-            div()
-                .flex()
-                .flex_col()
-                .children((0..self.rows).map(move |ix| {
-                    let probes = probes.clone();
-                    // Rows have to be distinguishable for the test to mean
-                    // anything: interchangeable rows can be matched to the
-                    // wrong node and nobody is any the wiser.
-                    let row_id = row_ids.get(ix).copied().unwrap_or(ix as u64);
-                    let row = div()
-                        .flex()
-                        .flex_row()
-                        .w(row_width + px((row_id % 5) as f32 * 10.))
-                        .h(px(20.))
-                        .text_color(text_color)
-                        .child(label.clone())
-                        .child(
-                            canvas(
-                                move |bounds, _, _| probes.borrow_mut().push(bounds),
-                                |_, _, _, _| {},
-                            )
-                            .flex_1()
-                            .h_full(),
-                        );
-                    if keyed {
-                        row.id(("row", row_ids[ix])).into_any_element()
-                    } else {
-                        row.into_any_element()
-                    }
-                }))
-        }
-    }
-
-    /// Draws one frame and returns the layout work it took.
-    fn draw_frame(cx: &mut TestAppContext, window: AnyWindowHandle) -> LayoutStats {
-        cx.update_window(window, |_, window, cx| {
-            window.reset_layout_stats();
-            window.draw(cx).clear(cx);
-            window.layout_stats()
-        })
-        .unwrap()
-    }
-
-    /// Applies a change to the view and returns the layout work that followed.
-    ///
-    /// Notifying a view can draw a frame of its own before the explicit one
-    /// here, so the counters start before the change rather than before the
-    /// draw; otherwise the work the change caused would be measured a frame too
-    /// late, once the tree had already settled.
-    fn change_and_draw<V: Render>(
-        cx: &mut TestAppContext,
-        window: WindowHandle<V>,
-        change: impl FnOnce(&mut V),
-    ) -> LayoutStats {
-        cx.update_window(window.into(), |_, window, _| window.reset_layout_stats())
-            .unwrap();
-        window
-            .update(cx, |view, _, cx| {
-                change(view);
-                cx.notify();
-            })
-            .unwrap();
-        cx.update_window(window.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            window.layout_stats()
-        })
-        .unwrap()
-    }
-
-    fn retained_layout_window(
-        cx: &mut TestAppContext,
-        probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-    ) -> WindowHandle<RetainedLayoutView> {
-        cx.add_window(move |_, _| RetainedLayoutView {
-            rows: 4,
-            row_width: px(200.),
-            label: "ab".into(),
-            probes,
-            row_ids: (0..4).collect(),
-            keyed: false,
-            text_color: hsla(0.0, 0.0, 0.1, 1.0),
-        })
-    }
-
-    #[test]
-    fn an_unchanged_frame_reuses_every_layout_node_and_writes_to_none() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes.clone());
-
-        draw_frame(&mut cx, window.into());
-        let first = probes.borrow().clone();
-
-        let stats = draw_frame(&mut cx, window.into());
-        assert_eq!(
-            stats.nodes_created, 0,
-            "an unchanged frame should not allocate a single node"
-        );
-        assert!(stats.nodes_reused > 0);
-        assert_eq!(
-            stats.style_writes, 0,
-            "writing a style dirties the node and its ancestors, undoing the point of retaining it"
-        );
-        assert_eq!(stats.children_writes, 0);
-        assert_eq!(stats.measure_rebinds, 0);
-        assert_eq!(
-            &first,
-            &*probes.borrow(),
-            "a frame laid out from retained nodes must land in the same place as the frame before it"
-        );
-    }
-
-    #[test]
-    fn a_retained_frame_follows_a_style_change() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes.clone());
-
-        draw_frame(&mut cx, window.into());
-        let before = probes.borrow()[0];
-
-        change_and_draw(&mut cx, window, |view| view.row_width = px(400.));
-        let after = probes.borrow()[0];
-
-        assert_eq!(
-            after.size.width - before.size.width,
-            px(200.),
-            "the probe fills what is left of the row, so widening the row must widen it too"
-        );
-        assert_eq!(
-            probes.borrow().len(),
-            4,
-            "widening rows should not have changed how many there are"
-        );
-    }
-
-    #[test]
-    fn a_retained_frame_follows_a_text_change() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes.clone());
-
-        draw_frame(&mut cx, window.into());
-        let before = probes.borrow()[0];
-
-        let stats = change_and_draw(&mut cx, window, |view| {
-            view.label = "abcdefghijklmnop".into()
-        });
-        let after = probes.borrow()[0];
-
-        assert!(
-            stats.measure_rebinds > 0,
-            "changed text must invalidate the measurement it is cached under: {stats:?}"
-        );
-        assert!(
-            after.origin.x > before.origin.x,
-            "longer text should push the probe further along the row, \
-             got {before:?} then {after:?}"
-        );
-    }
-
-    #[test]
-    fn a_retained_frame_follows_a_structural_change() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes.clone());
-
-        draw_frame(&mut cx, window.into());
-        assert_eq!(probes.borrow().len(), 4);
-        let row_height = probes.borrow()[1].origin.y - probes.borrow()[0].origin.y;
-
-        change_and_draw(&mut cx, window, |view| view.rows = 7);
-        assert_eq!(probes.borrow().len(), 7);
-        assert_eq!(
-            probes.borrow()[6].origin.y - probes.borrow()[0].origin.y,
-            row_height * 6.,
-            "rows added to a retained tree must stack like the ones already there"
-        );
-
-        let stats = change_and_draw(&mut cx, window, |view| view.rows = 2);
-        assert_eq!(probes.borrow().len(), 2);
-        assert!(
-            stats.nodes_freed > 0,
-            "nodes that left the tree must be released rather than accumulated: {stats:?}"
-        );
-    }
-
-    /// Recoloring text changes nothing about how much space it takes, so it has
-    /// no business invalidating a measurement. It only does when the color is
-    /// baked into the shaped lines, which is why decoration is replaced on them
-    /// in place instead.
-    #[test]
-    fn recoloring_text_leaves_the_layout_alone() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes.clone());
-        draw_frame(&mut cx, window.into());
-        let before = probes.borrow().clone();
-
-        let stats = change_and_draw(&mut cx, window, |view| {
-            view.text_color = hsla(0.6, 0.9, 0.5, 1.0)
-        });
-
-        assert_eq!(
-            stats.measure_rebinds, 0,
-            "a color cannot change how much room the text needs: {stats:?}"
-        );
-        assert_eq!(
-            stats.style_writes, 0,
-            "colors are not part of a Taffy style in the first place: {stats:?}"
-        );
-        assert_eq!(
-            &before,
-            &*probes.borrow(),
-            "recolored text should land exactly where it did before"
-        );
-
-        // Lengthening it, on the other hand, has to.
-        let stats = change_and_draw(&mut cx, window, |view| {
-            view.label = "abcdefghijklmnop".into()
-        });
-        assert!(
-            stats.measure_rebinds > 0,
-            "changed text must still invalidate its measurement: {stats:?}"
-        );
-    }
-
-    /// Rows are matched to their nodes by position unless they say otherwise,
-    /// so inserting at the front of a list makes every row that follows look
-    /// like a different row. An `ElementId` is how a row says otherwise.
-    #[test]
-    fn rows_identified_by_an_element_id_keep_their_nodes_when_one_is_inserted_ahead() {
-        fn insert_at_head(cx: &mut TestAppContext, keyed: bool) -> LayoutStats {
-            let probes = Rc::new(RefCell::new(Vec::new()));
-            let window = retained_layout_window(cx, probes.clone());
-            change_and_draw(cx, window, |view| view.keyed = keyed);
-
-            let stats = change_and_draw(cx, window, |view| {
-                view.rows += 1;
-                view.row_ids.insert(0, 100);
-            });
-            assert_eq!(probes.borrow().len(), 5);
-            stats
-        }
-
-        let mut cx = TestAppContext::single();
-        let positional = insert_at_head(&mut cx, false);
-        let keyed = insert_at_head(&mut cx, true);
-
-        // Shifting keys do not throw nodes away — the row now at index 1
-        // claims the node index 1 had — they hand each node to a different row,
-        // which then has to write its own style over it. That write is what
-        // dirties the node and every ancestor above it.
-        assert!(
-            positional.style_writes > 0,
-            "rows matched by position should be restyled once they shift: {positional:?}"
-        );
-        assert_eq!(
-            keyed.style_writes, 0,
-            "rows matched by an ElementId should keep the node they styled, \
-             wrote {} against {} for positional rows",
-            keyed.style_writes, positional.style_writes
-        );
-    }
-
-    /// A row built as a component, which is what lists are mostly made of. It
-    /// identifies the element it renders into, which is as far as a
-    /// component's own id reaches: the component itself reports none.
-    #[derive(IntoElement)]
-    struct ComponentRow {
-        id: u64,
-        probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-    }
-
-    impl RenderOnce for ComponentRow {
-        fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-            let probes = self.probes;
-            div()
-                .id(("row", self.id))
-                .flex()
-                .flex_row()
-                .w(px(200.) + px((self.id % 5) as f32 * 10.))
-                .h(px(20.))
-                .child("ab")
-                .child(
-                    canvas(
-                        move |bounds, _, _| probes.borrow_mut().push(bounds),
-                        |_, _, _, _| {},
-                    )
-                    .flex_1()
-                    .h_full(),
-                )
-        }
-    }
-
-    /// A list of [`ComponentRow`]s, each keyed by its id when `keyed` is set.
-    struct ComponentRows {
-        row_ids: Vec<u64>,
-        keyed: bool,
-        probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-    }
-
-    impl Render for ComponentRows {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            self.probes.borrow_mut().clear();
-            let keyed = self.keyed;
-            let probes = self.probes.clone();
-            div()
-                .flex()
-                .flex_col()
-                .children(self.row_ids.iter().map(move |&id| {
-                    let row = ComponentRow {
-                        id,
-                        probes: probes.clone(),
-                    };
-                    if keyed {
-                        row.key(("row", id)).into_any_element()
-                    } else {
-                        row.into_any_element()
-                    }
-                }))
-        }
-    }
-
-    fn component_rows_window(
-        cx: &mut TestAppContext,
-        keyed: bool,
-    ) -> (
-        WindowHandle<ComponentRows>,
-        Rc<RefCell<Vec<Bounds<Pixels>>>>,
-    ) {
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = cx.add_window({
-            let probes = probes.clone();
-            move |_, _| ComponentRows {
-                row_ids: (0..4).collect(),
-                keyed,
-                probes,
-            }
-        });
-        draw_frame(cx, window.into());
-        (window, probes)
-    }
-
-    /// A component's id stops at the element it renders into, so a list of
-    /// components is matched by position however its rows are identified
-    /// inside. A key is what reaches the list.
-    #[test]
-    fn components_given_a_key_keep_their_nodes_when_one_is_inserted_ahead() {
-        fn insert_at_head(cx: &mut TestAppContext, keyed: bool) -> LayoutStats {
-            let (window, probes) = component_rows_window(cx, keyed);
-            let stats = change_and_draw(cx, window, |view| view.row_ids.insert(0, 100));
-            assert_eq!(probes.borrow().len(), 5);
-            stats
-        }
-
-        let mut cx = TestAppContext::single();
-        let identified_inside = insert_at_head(&mut cx, false);
-        let keyed = insert_at_head(&mut cx, true);
-
-        // Identified only inside, a shifted row is not handed its
-        // neighbour's node, since the id inside is part of the path; it gets a
-        // new one, which is as much a rebuild. Keyed, only the new row does.
-        assert_eq!(
-            keyed.style_writes, 0,
-            "keyed components should keep the node they styled: {keyed:?}"
-        );
-        assert!(
-            keyed.nodes_created > 0,
-            "the inserted row needs nodes of its own: {keyed:?}"
-        );
-        assert_eq!(
-            identified_inside.nodes_created,
-            5 * keyed.nodes_created,
-            "every component identified only inside should be rebuilt once the rows shift, \
-             and only the inserted one when they are keyed: {identified_inside:?} against {keyed:?}"
-        );
-    }
-
-    /// A key is only a step in the path a node is found by. It must not add a
-    /// node of its own or move anything.
-    #[test]
-    fn a_key_adds_no_layout_node_and_moves_nothing() {
-        let mut cx = TestAppContext::single();
-        let (plain, plain_probes) = component_rows_window(&mut cx, false);
-        let (keyed, keyed_probes) = component_rows_window(&mut cx, true);
-
-        let node_count = |cx: &mut TestAppContext, window: WindowHandle<ComponentRows>| {
-            cx.update_window(window.into(), |_, window, _| window.layout_node_count())
-                .unwrap()
-        };
-        assert_eq!(node_count(&mut cx, plain), node_count(&mut cx, keyed));
-        assert_eq!(*plain_probes.borrow(), *keyed_probes.borrow());
-    }
-
-    /// Timing a measurement or a shaped line reads the clock twice, which is
-    /// not free on a frame full of text, so the times are kept only once the
-    /// stats have been reset — which is how a benchmark asks for them. The
-    /// counts are kept all along.
-    #[test]
-    fn layout_times_are_kept_only_once_the_stats_are_reset() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes);
-        let stats = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.layout_stats()
-            })
-            .unwrap()
-        };
-
-        let untimed = stats(&mut cx);
-        assert!(untimed.compute_layout_calls > 0 && untimed.lines_shaped > 0);
-        assert_eq!(untimed.compute_layout_time, Duration::ZERO);
-        assert_eq!(untimed.measure_time, Duration::ZERO);
-        assert_eq!(untimed.shape_time, Duration::ZERO);
-
-        cx.update_window(window.into(), |_, window, _| window.reset_layout_stats())
-            .unwrap();
-        change_and_draw(&mut cx, window, |view| {
-            view.label = "a label to shape".into()
-        });
-        let timed = stats(&mut cx);
-        assert!(timed.compute_layout_time > Duration::ZERO);
-    }
-
-    /// Elements are given the ids the inspector finds them by only while it is
-    /// open, since building one copies the whole element id stack. Opening it
-    /// has to bring them back on the next frame.
-    #[test]
-    fn inspector_ids_are_built_only_while_the_inspector_is_open() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes);
-        let inspector_ids = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, window, _| {
-                window.rendered_frame.next_inspector_instance_ids.len()
-            })
-            .unwrap()
-        };
-
-        draw_frame(&mut cx, window.into());
-        assert_eq!(inspector_ids(&mut cx), 0);
-
-        cx.update_window(window.into(), |_, window, cx| window.toggle_inspector(cx))
-            .unwrap();
-        draw_frame(&mut cx, window.into());
-        assert!(
-            inspector_ids(&mut cx) > 0,
-            "opening the inspector should give elements their ids again"
-        );
-
-        cx.update_window(window.into(), |_, window, cx| window.toggle_inspector(cx))
-            .unwrap();
-        draw_frame(&mut cx, window.into());
-        assert_eq!(inspector_ids(&mut cx), 0);
-    }
-
-    /// A chip whose identity is given by a key or by an id.
-    struct ReparentedChip {
-        keyed: bool,
-        probes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-    }
-
-    impl Render for ReparentedChip {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let probes = self.probes.clone();
-            probes.borrow_mut().clear();
-            let chip = div().pl(px(7.)).child(
-                canvas(
-                    move |bounds, _, _| probes.borrow_mut().push(bounds),
-                    |_, _, _, _| {},
-                )
-                .w(px(10.))
-                .h(px(10.)),
-            );
-            div().flex().pl(px(50.)).child(if self.keyed {
-                chip.key("chip").into_any_element()
-            } else {
-                chip.id("chip").into_any_element()
-            })
-        }
-    }
-
-    /// A chip that trades its key for an id of the same value takes the key
-    /// its child used to find its node by, so it gets a new node, and the
-    /// child is handed the node the chip had. That node is still listed under
-    /// the row when the chip's new node adopts it, and the row rewriting its
-    /// children must not cut the link the child's position is added up along.
-    #[test]
-    fn a_node_adopted_from_another_parent_keeps_its_position() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = cx.add_window({
-            let probes = probes.clone();
-            move |_, _| ReparentedChip {
-                keyed: true,
-                probes,
-            }
-        });
-
-        draw_frame(&mut cx, window.into());
-        assert_eq!(probes.borrow()[0].origin.x, px(57.));
-
-        change_and_draw(&mut cx, window, |view| view.keyed = false);
-        assert_eq!(
-            probes.borrow()[0].origin.x,
-            px(57.),
-            "the child should still be offset by the row's and the chip's padding"
-        );
-    }
-
-    /// Rows of a uniform list five rows tall, scrolled to `scroll_top`.
-    struct ScrolledRows {
-        row_ids: Vec<u64>,
-        keyed: bool,
-        scroll_top: Pixels,
-        scroll: UniformListScrollHandle,
-    }
-
-    impl Render for ScrolledRows {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            self.scroll
-                .0
-                .borrow()
-                .base_handle
-                .set_offset(point(px(0.), -self.scroll_top));
-            let row_ids = self.row_ids.clone();
-            let keyed = self.keyed;
-            div().w(px(300.)).h(px(100.)).child(
-                uniform_list("rows", row_ids.len(), move |range, _, _| {
-                    range
-                        .map(|ix| {
-                            // Rows have to be distinguishable for a row landing
-                            // on a neighbour's node to show.
-                            let id = row_ids[ix];
-                            let row = div().w(px(200.) + px((id % 5) as f32 * 10.)).h(px(20.));
-                            if keyed {
-                                row.id(("row", id)).into_any_element()
-                            } else {
-                                row.into_any_element()
-                            }
-                        })
-                        .collect()
-                })
-                .track_scroll(&self.scroll)
-                .size_full(),
-            )
-        }
-    }
-
-    fn scrolled_rows_window(cx: &mut TestAppContext, keyed: bool) -> WindowHandle<ScrolledRows> {
-        let window = cx.add_window(move |_, _| ScrolledRows {
-            row_ids: (0..50).collect(),
-            keyed,
-            scroll_top: px(0.),
-            scroll: UniformListScrollHandle::new(),
-        });
-        draw_frame(cx, window.into());
-        draw_frame(cx, window.into());
-        window
-    }
-
-    /// A list lays out only the items in view, so an item without an id was
-    /// matched by where it came among them, and a list scrolled by one row
-    /// handed every item its neighbour's nodes. Matched by its index, an item
-    /// keeps its nodes while it stays in view.
-    #[test]
-    fn unidentified_list_items_keep_their_nodes_when_the_list_scrolls() {
-        let mut cx = TestAppContext::single();
-        let window = scrolled_rows_window(&mut cx, false);
-
-        let scrolled = change_and_draw(&mut cx, window, |view| view.scroll_top = px(20.));
-        assert_eq!(
-            scrolled.style_writes, 0,
-            "rows still in view should keep the node they styled: {scrolled:?}"
-        );
-        assert_eq!(
-            scrolled.nodes_created, 1,
-            "only the row scrolling in should need a node: {scrolled:?}"
-        );
-    }
-
-    /// Keying list items by index must not come between an item and an id of
-    /// its own: an item identified by its data keeps its nodes when an item
-    /// is inserted ahead of it, which its index could not do.
-    #[test]
-    fn identified_list_items_keep_their_nodes_when_one_is_inserted_ahead() {
-        let mut cx = TestAppContext::single();
-        let window = scrolled_rows_window(&mut cx, true);
-
-        let inserted = change_and_draw(&mut cx, window, |view| view.row_ids.insert(0, 100));
-        assert_eq!(
-            inserted.style_writes, 0,
-            "identified rows should keep the node they styled: {inserted:?}"
-        );
-        // The inserted row needs a node, and so does the first row, which the
-        // list lays out on its own to find the height of every row. The five
-        // rows in view keeping theirs is what an index would have broken.
-        assert!(
-            inserted.nodes_created < 5,
-            "identified rows should not be rebuilt when one is inserted ahead: {inserted:?}"
-        );
-    }
-
-    /// Shaping is counted only when the text cache cannot answer, so a frame
-    /// that shows the same text as the last one shapes nothing, and one that
-    /// shows new text shapes exactly that.
-    #[test]
-    fn only_text_the_cache_does_not_hold_is_counted_as_shaped() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes);
-        draw_frame(&mut cx, window.into());
-
-        let unchanged = draw_frame(&mut cx, window.into());
-        assert_eq!(
-            unchanged.lines_shaped, 0,
-            "text shown last frame should come from the cache: {unchanged:?}"
-        );
-
-        let relabeled = change_and_draw(&mut cx, window, |view| view.label = "cd".into());
-        assert!(
-            relabeled.lines_shaped > 0,
-            "text not shown before has to be shaped: {relabeled:?}"
-        );
-    }
-
-    /// Rows that each show text of their own, matched to their nodes by
-    /// position.
-    struct ShiftingRows {
-        row_ids: Vec<u64>,
-    }
-
-    impl Render for ShiftingRows {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .flex()
-                .flex_col()
-                .children(self.row_ids.iter().map(|id| {
-                    div()
-                        .h(px(20.))
-                        .child(SharedString::from(format!("row {id}")))
-                }))
-        }
-    }
-
-    /// A retained text node answers from the lines it already holds and never
-    /// asks the line layout cache for them. Those lines still have to stay in
-    /// the cache: when unidentified rows shift by one, every row lands on a
-    /// neighbour's node, and the text it brings was on screen all along.
-    #[test]
-    fn text_kept_by_its_node_is_not_reshaped_when_rows_shift_onto_other_nodes() {
-        let mut cx = TestAppContext::single();
-        let window = cx.add_window(|_, _| ShiftingRows {
-            row_ids: (0..8).collect(),
-        });
-        let handle: AnyWindowHandle = window.into();
-        // Enough frames for anything only the first frame asked the cache for
-        // to have been forgotten, had nobody asked since.
-        for _ in 0..3 {
-            draw_frame(&mut cx, handle);
-        }
-
-        // Counted from before the change, which can draw a frame of its own;
-        // see `change_and_draw`.
-        cx.update_window(handle, |_, window, _| window.reset_layout_stats())
-            .unwrap();
-        window
-            .update(&mut cx, |view, _, cx| {
-                view.row_ids.remove(0);
-                cx.notify();
-            })
-            .unwrap();
-        let shifted = cx
-            .update_window(handle, |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.layout_stats()
-            })
-            .unwrap();
-
-        assert!(
-            shifted.style_writes > 0 || shifted.measure_calls > 0,
-            "rows should have moved onto other nodes for this to test anything: {shifted:?}"
-        );
-        assert_eq!(
-            shifted.lines_shaped, 0,
-            "every row's text was on screen the frame before and should come from the cache: {shifted:?}"
-        );
-    }
-
-    /// Lines outlive the frames that asked for them only while something
-    /// holds them. Once the text is gone from the tree, and with it the nodes
-    /// that held its lines, the cache has to let them go too.
-    #[test]
-    fn text_nothing_holds_any_more_leaves_the_line_layout_cache() {
-        let mut cx = TestAppContext::single();
-        let window = cx.add_window(|_, _| ShiftingRows {
-            row_ids: (0..8).collect(),
-        });
-        let handle: AnyWindowHandle = window.into();
-        draw_frame(&mut cx, handle);
-
-        window
-            .update(&mut cx, |view, _, cx| {
-                view.row_ids.clear();
-                cx.notify();
-            })
-            .unwrap();
-        for _ in 0..3 {
-            draw_frame(&mut cx, handle);
-        }
-
-        cx.update_window(handle, |_, window, _| window.reset_layout_stats())
-            .unwrap();
-        window
-            .update(&mut cx, |view, _, cx| {
-                view.row_ids = (0..8).collect();
-                cx.notify();
-            })
-            .unwrap();
-        let shown_again = cx
-            .update_window(handle, |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.layout_stats()
-            })
-            .unwrap();
-        assert_eq!(
-            shown_again.lines_shaped, 8,
-            "text removed frames ago should have left the cache: {shown_again:?}"
-        );
-    }
-
-    /// The window root is the one node whose style Taffy does not hold as the
-    /// element wrote it, because an `auto` size is rewritten to fill the
-    /// viewport. Retaining that node means the rewrite has to stay recoverable
-    /// across frames, or the root silently stops following the window.
-    #[test]
-    fn a_retained_auto_sized_root_keeps_filling_a_resized_window() {
-        let mut cx = TestAppContext::single();
-        let child_bounds = Rc::new(Cell::new(Bounds::default()));
-        let window = cx.add_window({
-            let child_bounds = child_bounds.clone();
-            move |_, _| RootView {
-                explicit_size: false,
-                child_bounds,
-            }
-        });
-        let handle: AnyWindowHandle = window.into();
-
-        for resized_size in [
-            size(px(800.), px(600.)),
-            size(px(640.), px(480.)),
-            size(px(1024.), px(768.)),
-            // Back to a size already seen, to catch a stale record of the
-            // previous fill rather than of the request behind it.
-            size(px(800.), px(600.)),
-        ] {
-            cx.simulate_window_resize(handle, resized_size);
-            draw_frame(&mut cx, handle);
-            assert_eq!(
-                child_bounds.get().size,
-                resized_size,
-                "an auto-sized root must still fill the window after it is resized"
-            );
-        }
-
-        // And a frame that changes nothing must leave the stretched root alone
-        // rather than rewriting it and dirtying the whole tree.
-        let stats = draw_frame(&mut cx, handle);
-        assert_eq!(
-            stats.style_writes, 0,
-            "a settled auto-sized root should not be restyled every frame: {stats:?}"
-        );
-    }
-
-    #[test]
-    fn retaining_layout_nodes_does_not_grow_the_tree_over_time() {
-        let mut cx = TestAppContext::single();
-        let probes = Rc::new(RefCell::new(Vec::new()));
-        let window = retained_layout_window(&mut cx, probes.clone());
-
-        for frame in 0..12 {
-            // Oscillate the shape so nodes are created and released repeatedly
-            // rather than settling.
-            change_and_draw(&mut cx, window, |view| view.rows = 2 + frame % 5);
-        }
-
-        let live = cx
-            .update_window(window.into(), |_, window, _| window.layout_node_count())
-            .unwrap();
-        change_and_draw(&mut cx, window, |view| view.rows = 2);
-        let settled = cx
-            .update_window(window.into(), |_, window, _| window.layout_node_count())
-            .unwrap();
-
-        assert!(
-            settled <= live,
-            "the tree should shrink back down, held {live} nodes and settled at {settled}"
-        );
-        assert!(
-            settled < 40,
-            "two rows should not need {settled} layout nodes"
-        );
-    }
-}
-
-#[cfg(all(test, any(feature = "inspector", debug_assertions)))]
-mod inspector_tests {
-    use super::*;
-    use crate::{
-        DivInspectorState, InspectorElementId, MouseDownEvent, StyleRefinement, TestAppContext, div,
-    };
-
-    #[gpui::test]
-    fn inspector_only_tracks_its_open_window(cx: &mut TestAppContext) {
-        let windows = [
-            cx.add_window(|_, cx| InspectorTestRoot {
-                child: cx.new(|_| InspectorTestView::default()),
-            }),
-            cx.add_window(|_, cx| InspectorTestRoot {
-                child: cx.new(|_| InspectorTestView::default()),
-            }),
-        ];
-        for window in windows {
-            assert_closed_inspector(window.into(), cx);
-        }
-        for _ in 0..2 {
-            cx.update_window(windows[0].into(), |root, window, cx| {
-                let root = root.downcast::<InspectorTestRoot>().expect("test root");
-                let child_widths = root.read(cx).child.read(cx).child_widths.clone();
-                window.toggle_inspector(cx);
-                window.draw(cx).clear(cx);
-                assert_eq!(child_widths.borrow().as_slice(), &[px(10.); 3]);
-                let path = window
-                    .rendered_frame
-                    .next_inspector_instance_ids
-                    .iter()
-                    .find_map(|(path, count)| (*count == 3).then(|| path.clone()))
-                    .expect("anonymous siblings share an inspector path");
-                let selected_id = InspectorElementId {
-                    path,
-                    instance_id: 1,
-                };
-                let position = window
-                    .rendered_frame
-                    .hitboxes
-                    .iter()
-                    .find(|hitbox| {
-                        window.rendered_frame.inspector_hitboxes.get(&hitbox.id)
-                            == Some(&selected_id)
-                    })
-                    .expect("middle sibling is pickable")
-                    .bounds
-                    .center();
-                window.simulate_mouse_move(position, cx);
-                window.dispatch_event(
-                    PlatformInput::MouseDown(MouseDownEvent {
-                        position,
-                        button: MouseButton::Left,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                        first_mouse: false,
-                    }),
-                    cx,
-                );
-                window.dispatch_event(
-                    PlatformInput::MouseUp(MouseUpEvent {
-                        position,
-                        button: MouseButton::Left,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                    }),
-                    cx,
-                );
-                assert!(!window.is_inspector_picking(cx));
-                assert_eq!(
-                    window
-                        .inspector
-                        .as_ref()
-                        .expect("open inspector")
-                        .read(cx)
-                        .active_element_id(),
-                    Some(&selected_id)
-                );
-                window.draw(cx).clear(cx);
-                window.with_inspector_state::<DivInspectorState, _>(
-                    Some(&selected_id),
-                    cx,
-                    |state, _| {
-                        let state = state.as_mut().expect("selected div has style state");
-                        assert_eq!(
-                            state.base_style.size.width,
-                            Some(crate::Length::from(px(10.)))
-                        );
-                        state.base_style.size.width = Some(crate::Length::from(px(25.)));
-                    },
-                );
-                window.refresh();
-                window.draw(cx).clear(cx);
-                assert_eq!(
-                    child_widths.borrow().as_slice(),
-                    &[px(10.), px(25.), px(10.)]
-                );
-            })
-            .expect("pick and edit a cached child");
-            assert_closed_inspector(windows[1].into(), cx);
-            windows[0]
-                .update(cx, |_, window, cx| window.toggle_inspector(cx))
-                .expect("close inspector");
-            assert_closed_inspector(windows[0].into(), cx);
-        }
-    }
-
-    struct InspectorTestRoot {
-        child: Entity<InspectorTestView>,
-    }
-
-    impl Render for InspectorTestRoot {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            self.child
-                .clone()
-                .cached(StyleRefinement::default().size(px(100.)))
-        }
-    }
-
-    #[derive(Default)]
-    struct InspectorTestView {
-        child_widths: Rc<RefCell<Vec<Pixels>>>,
-    }
-
-    impl Render for InspectorTestView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let child_widths = self.child_widths.clone();
-            div()
-                .on_children_prepainted(move |bounds, _, _| {
-                    *child_widths.borrow_mut() =
-                        bounds.iter().map(|bounds| bounds.size.width).collect();
-                })
-                .with_dynamic_prepaint_order(|_, _| SmallVec::from_iter([2, 0, 1]))
-                .id("inspector-root")
-                .flex()
-                .children((0..3).map(|_| div().size(px(10.)).flex_shrink_0()))
-        }
-    }
-
-    fn assert_closed_inspector(window: AnyWindowHandle, cx: &mut TestAppContext) {
-        cx.update_window(window, |root, window, cx| {
-            window.draw(cx).clear(cx);
-            window.draw(cx).clear(cx);
-            let root = root.downcast::<InspectorTestRoot>().expect("test root");
-            assert_eq!(
-                root.read(cx)
-                    .child
-                    .read(cx)
-                    .child_widths
-                    .borrow()
-                    .as_slice(),
-                &[px(10.); 3]
-            );
-            for frame in [&window.rendered_frame, &window.next_frame] {
-                assert_eq!(frame.next_inspector_instance_ids.capacity(), 0);
-                assert_eq!(frame.inspector_hitboxes.capacity(), 0);
-            }
-        })
-        .expect("closed inspector has no bookkeeping and no style overrides");
     }
 }

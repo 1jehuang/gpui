@@ -56,6 +56,7 @@ impl Display for EntityId {
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
     pub accessed_entities: RefCell<FxHashSet<EntityId>>,
+    pub(crate) access_log: crate::fast::dependencies::EntityAccessLog,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
@@ -72,6 +73,7 @@ impl EntityMap {
         Self {
             entities: SecondaryMap::new(),
             accessed_entities: RefCell::new(FxHashSet::default()),
+            access_log: Default::default(),
             ref_counts: Arc::new(RwLock::new(EntityRefCounts {
                 counts: SlotMap::with_key(),
                 dropped_entity_ids: Vec::new(),
@@ -123,6 +125,7 @@ impl EntityMap {
     {
         let mut accessed_entities = self.accessed_entities.get_mut();
         accessed_entities.insert(slot.entity_id);
+        self.note_access(slot.entity_id);
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
@@ -135,6 +138,7 @@ impl EntityMap {
         self.assert_valid_context(pointer);
         let mut accessed_entities = self.accessed_entities.get_mut();
         accessed_entities.insert(pointer.entity_id);
+        self.note_update(pointer.entity_id);
 
         let entity = Some(
             self.entities
@@ -157,6 +161,7 @@ impl EntityMap {
         self.assert_valid_context(entity);
         let mut accessed_entities = self.accessed_entities.borrow_mut();
         accessed_entities.insert(entity.entity_id);
+        self.note_access(entity.entity_id);
 
         self.entities
             .get(entity.entity_id)
@@ -169,12 +174,6 @@ impl EntityMap {
             Weak::ptr_eq(&entity.entity_map, &Arc::downgrade(&self.ref_counts)),
             "used a entity with the wrong context"
         );
-    }
-
-    pub fn extend_accessed(&mut self, entities: &FxHashSet<EntityId>) {
-        self.accessed_entities
-            .get_mut()
-            .extend(entities.iter().copied());
     }
 
     pub fn clear_accessed(&mut self) {
@@ -195,6 +194,7 @@ impl EntityMap {
                     "dropped an entity that was referenced"
                 );
                 accessed_entities.remove(&entity_id);
+                self.access_log.forget(entity_id);
                 // If the EntityId was allocated with `Context::reserve`,
                 // the entity may not have been inserted.
                 Some((entity_id, self.entities.remove(entity_id)?))

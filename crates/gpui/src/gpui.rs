@@ -12,6 +12,9 @@ mod app;
 mod arena;
 mod asset_cache;
 mod assets;
+// gpui-fast replaces the bounds tree with one that replays last frame's
+// orderings, which is what drawing a retained view again costs most.
+#[path = "fast/bounds_tree.rs"]
 mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.
@@ -21,6 +24,7 @@ mod debug_overlay;
 mod element;
 mod elements;
 mod executor;
+mod fast;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
@@ -31,8 +35,6 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
-#[cfg(test)]
-mod oracle_tests;
 mod path_builder;
 mod platform;
 pub mod prelude;
@@ -104,6 +106,8 @@ pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use fast::stats::LayoutStats;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
@@ -158,7 +162,7 @@ pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
 use taffy::TaffyLayoutEngine;
-pub use taffy::{AvailableSpace, LayoutId, LayoutStats};
+pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;

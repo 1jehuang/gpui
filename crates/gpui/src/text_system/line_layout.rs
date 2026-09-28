@@ -1,17 +1,12 @@
 use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
-use scheduler::Instant;
 use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
     hash::{Hash, Hasher},
     ops::Range,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
+    sync::Arc,
 };
 
 use super::LineWrapper;
@@ -456,35 +451,11 @@ impl WrappedLineLayout {
     }
 }
 
-/// Leaves in `previous` everything the next frame may ask for: what this
-/// frame asked for, which is in `current`, and what it did not but something
-/// still holds. `current` is left empty.
-///
-/// Whichever of the two is larger is kept and the other moved into it, so a
-/// frame that asked for little costs little, and so does one that asked for
-/// everything.
-fn carry_over<K: Eq + Hash, V>(
-    previous: &mut FxHashMap<Arc<K>, Arc<V>>,
-    current: &mut FxHashMap<Arc<K>, Arc<V>>,
-) {
-    previous.retain(|_, layout| Arc::strong_count(layout) > 1);
-    if previous.len() < current.len() {
-        std::mem::swap(previous, current);
-    }
-    previous.extend(current.drain());
-}
-
 pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
-    /// Lines handed to the platform to be shaped, because neither this frame
-    /// nor the last one had them. See [`LineLayoutCache::shaping_stats`].
-    lines_shaped: AtomicU64,
-    /// Time spent in those calls, in nanoseconds.
-    shape_nanos: AtomicU64,
-    /// Whether to time shaping, which it does once the stats have been reset.
-    shape_timed: AtomicBool,
+    pub(crate) shaping: crate::fast::text::LineShaping,
 }
 
 #[derive(Default)]
@@ -506,12 +477,12 @@ struct FrameCache {
     used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Debug)]
 pub(crate) struct LineLayoutIndex {
-    lines_index: usize,
-    wrapped_lines_index: usize,
-    lines_by_hash_index: usize,
-    wrapped_lines_by_hash_index: usize,
+    pub(crate) lines_index: usize,
+    pub(crate) wrapped_lines_index: usize,
+    pub(crate) lines_by_hash_index: usize,
+    pub(crate) wrapped_lines_by_hash_index: usize,
 }
 
 impl LineLayoutCache {
@@ -520,40 +491,8 @@ impl LineLayoutCache {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
             platform_text_system,
-            lines_shaped: AtomicU64::new(0),
-            shape_nanos: AtomicU64::new(0),
-            shape_timed: AtomicBool::new(false),
+            shaping: Default::default(),
         }
-    }
-
-    /// How many lines have been shaped, and how long that took, since the last
-    /// [`LineLayoutCache::reset_shaping_stats`]. A line answered from the cache
-    /// is not counted, so this is the text work the cache failed to save.
-    pub fn shaping_stats(&self) -> (u64, Duration) {
-        (
-            self.lines_shaped.load(Ordering::Relaxed),
-            Duration::from_nanos(self.shape_nanos.load(Ordering::Relaxed)),
-        )
-    }
-
-    /// Zeroes the counters reported by [`LineLayoutCache::shaping_stats`], and
-    /// from then on times shaping too.
-    pub fn reset_shaping_stats(&self) {
-        self.lines_shaped.store(0, Ordering::Relaxed);
-        self.shape_nanos.store(0, Ordering::Relaxed);
-        self.shape_timed.store(true, Ordering::Relaxed);
-    }
-
-    /// Shapes a line the cache does not have, counting it.
-    fn shape_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        let started_at = self.shape_timed.load(Ordering::Relaxed).then(Instant::now);
-        let layout = self.platform_text_system.layout_line(text, font_size, runs);
-        self.lines_shaped.fetch_add(1, Ordering::Relaxed);
-        if let Some(started_at) = started_at {
-            self.shape_nanos
-                .fetch_add(started_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
-        layout
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
@@ -619,55 +558,19 @@ impl LineLayoutCache {
             .truncate(index.wrapped_lines_by_hash_index);
     }
 
-    /// Ends a frame: what it laid out becomes what the next frame can reuse.
-    ///
-    /// A line the frame did not ask for is dropped, unless something still
-    /// holds its layout. That something is usually a retained text node, which
-    /// answers from the lines it keeps without asking the cache for them, and
-    /// whose text can reach a different node at any moment — a row sliding into
-    /// its neighbour's slot — and ask for the same lines there.
-    /// Forgets every line laid out so far, so the next frame shapes what it
-    /// shows from scratch.
-    #[cfg(test)]
-    pub fn forget(&self) {
-        *self.previous_frame.lock() = FrameCache::default();
-        *self.current_frame.write() = FrameCache::default();
-    }
-
     pub fn finish_frame(&self) {
-        let mut previous = self.previous_frame.lock();
-        let mut current = self.current_frame.write();
-        let (previous, current) = (&mut *previous, &mut *current);
+        let mut prev_frame = self.previous_frame.lock();
+        let mut curr_frame = self.current_frame.write();
+        std::mem::swap(&mut *prev_frame, &mut *curr_frame);
+        curr_frame.lines.clear();
+        curr_frame.wrapped_lines.clear();
+        curr_frame.used_lines.clear();
+        curr_frame.used_wrapped_lines.clear();
 
-        // Wrapped lines hold the lines they were wrapped from, so they are
-        // swept first, letting a line they were the last to hold go with them.
-        carry_over(&mut previous.wrapped_lines, &mut current.wrapped_lines);
-        carry_over(
-            &mut previous.wrapped_lines_by_hash,
-            &mut current.wrapped_lines_by_hash,
-        );
-        carry_over(&mut previous.lines, &mut current.lines);
-        carry_over(&mut previous.lines_by_hash, &mut current.lines_by_hash);
-
-        // The used lists index what this frame laid out, which is what a view
-        // reused next frame looks its lines up by.
-        std::mem::swap(&mut previous.used_lines, &mut current.used_lines);
-        std::mem::swap(
-            &mut previous.used_wrapped_lines,
-            &mut current.used_wrapped_lines,
-        );
-        std::mem::swap(
-            &mut previous.used_lines_by_hash,
-            &mut current.used_lines_by_hash,
-        );
-        std::mem::swap(
-            &mut previous.used_wrapped_lines_by_hash,
-            &mut current.used_wrapped_lines_by_hash,
-        );
-        current.used_lines.clear();
-        current.used_wrapped_lines.clear();
-        current.used_lines_by_hash.clear();
-        current.used_wrapped_lines_by_hash.clear();
+        curr_frame.lines_by_hash.clear();
+        curr_frame.wrapped_lines_by_hash.clear();
+        curr_frame.used_lines_by_hash.clear();
+        curr_frame.used_wrapped_lines_by_hash.clear();
     }
 
     pub fn layout_wrapped_line<Text>(
@@ -766,7 +669,9 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let mut layout = self.shape_line(&text, font_size, runs);
+            let mut layout =
+                self.shaping
+                    .shape_line(&*self.platform_text_system, &text, font_size, runs);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -913,7 +818,9 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
-        let mut layout = self.shape_line(&text, font_size, runs);
+        let mut layout =
+            self.shaping
+                .shape_line(&*self.platform_text_system, &text, font_size, runs);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);

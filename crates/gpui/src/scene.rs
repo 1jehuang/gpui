@@ -11,7 +11,6 @@ use crate::{
 use std::{
     fmt::Debug,
     iter::Peekable,
-    mem,
     ops::{Add, Range, Sub},
     slice,
 };
@@ -41,17 +40,8 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
-    primitive_bounds: BoundsTree<ScaledPixels>,
+    pub(crate) primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
-    /// Where each primitive ended up once [`Scene::finish`] put them in
-    /// drawing order, indexed by the position it was emitted at.
-    ///
-    /// A replay names primitives by where they were emitted, which is the only
-    /// thing it can know; this is what turns that back into where they are.
-    sorted_positions: SortedPositions,
-    /// Room to gather each vector into while sorting, kept between frames so
-    /// that a frame does not allocate megabytes to reorder what it drew.
-    scratch: SceneScratch,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -60,83 +50,6 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
-}
-
-/// The inverse of the permutation [`Scene::finish`] applies, one vector per
-/// kind of primitive.
-#[derive(Default)]
-struct SortedPositions {
-    shadows: Vec<u32>,
-    quads: Vec<u32>,
-    paths: Vec<u32>,
-    underlines: Vec<u32>,
-    monochrome_sprites: Vec<u32>,
-    subpixel_sprites: Vec<u32>,
-    polychrome_sprites: Vec<u32>,
-    surfaces: Vec<u32>,
-}
-
-impl SortedPositions {
-    fn clear(&mut self) {
-        self.shadows.clear();
-        self.quads.clear();
-        self.paths.clear();
-        self.underlines.clear();
-        self.monochrome_sprites.clear();
-        self.subpixel_sprites.clear();
-        self.polychrome_sprites.clear();
-        self.surfaces.clear();
-    }
-}
-
-/// Buffers `Scene::finish` reorders through, kept so that sorting a scene
-/// allocates nothing.
-#[derive(Default)]
-struct SceneScratch {
-    order: Vec<u32>,
-    shadows: Vec<Shadow>,
-    quads: Vec<Quad>,
-    paths: Vec<Path<ScaledPixels>>,
-    underlines: Vec<Underline>,
-    monochrome_sprites: Vec<MonochromeSprite>,
-    subpixel_sprites: Vec<SubpixelSprite>,
-    polychrome_sprites: Vec<PolychromeSprite>,
-    surfaces: Vec<PaintSurface>,
-}
-
-/// Puts `items` in the order `key` gives, and records where each of them
-/// ended up.
-///
-/// Sorting indices and then gathering once moves each item a single time,
-/// where sorting the items themselves moves them as often as the sort needs
-/// to compare them — and these items are 112 to 168 bytes each. The positions
-/// fall out of the same pass, and are what lets a replay find a primitive it
-/// only knows the emission order of.
-fn sort_recording_positions<T: Clone, K: Ord>(
-    items: &mut Vec<T>,
-    order: &mut Vec<u32>,
-    gathered: &mut Vec<T>,
-    positions: &mut Vec<u32>,
-    key: impl Fn(&T) -> K,
-) {
-    let count = items.len();
-    positions.clear();
-    if count == 0 {
-        return;
-    }
-
-    order.clear();
-    order.extend(0..count as u32);
-    order.sort_unstable_by_key(|&index| key(&items[index as usize]));
-
-    gathered.clear();
-    gathered.extend(order.iter().map(|&index| items[index as usize].clone()));
-    mem::swap(items, gathered);
-
-    positions.resize(count, 0);
-    for (destination, &source) in order.iter().enumerate() {
-        positions[source as usize] = destination as u32;
-    }
 }
 
 #[expect(missing_docs)]
@@ -153,65 +66,10 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
-        self.sorted_positions.clear();
     }
 
     pub fn len(&self) -> usize {
         self.paint_operations.len()
-    }
-
-    /// Forgets the orderings recorded for replaying, so the next frame orders
-    /// every primitive from scratch.
-    #[cfg(test)]
-    pub(crate) fn forget_orderings(&mut self) {
-        self.primitive_bounds.forget();
-    }
-
-    /// Everything this finished scene draws, in drawing order, as text two
-    /// scenes can be compared by: each primitive with its bounds, clip, colours
-    /// and ordering, and each layer's bounds. Atlas tiles are left out, since
-    /// two windows need not place the same glyph in the same tile.
-    #[cfg(test)]
-    pub(crate) fn describe(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        for operation in &self.paint_operations {
-            match operation {
-                PaintOperation::StartLayer(bounds) => lines.push(format!("layer {bounds:?}")),
-                PaintOperation::EndLayer => lines.push("end layer".into()),
-                PaintOperation::Primitive(..) => {}
-            }
-        }
-        lines.extend(self.shadows.iter().map(|shadow| format!("{shadow:?}")));
-        lines.extend(self.quads.iter().map(|quad| format!("{quad:?}")));
-        lines.extend(
-            self.underlines
-                .iter()
-                .map(|underline| format!("{underline:?}")),
-        );
-        lines.extend(self.monochrome_sprites.iter().map(|sprite| {
-            format!(
-                "monochrome sprite {} {:?} {:?} {:?}",
-                sprite.order, sprite.bounds, sprite.content_mask, sprite.color
-            )
-        }));
-        lines.extend(self.subpixel_sprites.iter().map(|sprite| {
-            format!(
-                "subpixel sprite {} {:?} {:?} {:?}",
-                sprite.order, sprite.bounds, sprite.content_mask, sprite.color
-            )
-        }));
-        lines.extend(self.polychrome_sprites.iter().map(|sprite| {
-            format!(
-                "polychrome sprite {} {:?} {:?}",
-                sprite.order, sprite.bounds, sprite.content_mask
-            )
-        }));
-        lines.extend(
-            self.paths
-                .iter()
-                .map(|path| format!("path {} {:?}", path.order, path.bounds)),
-        );
-        lines
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
@@ -241,154 +99,67 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
-        let (kind, emitted_at) = match &mut primitive {
+        match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
                 self.shadows.push(*shadow);
-                (PrimitiveKind::Shadow, self.shadows.len())
             }
             Primitive::Quad(quad) => {
                 quad.order = order;
                 self.quads.push(*quad);
-                (PrimitiveKind::Quad, self.quads.len())
             }
             Primitive::Path(path) => {
                 path.order = order;
                 path.id = PathId(self.paths.len());
                 self.paths.push(path.clone());
-                (PrimitiveKind::Path, self.paths.len())
             }
             Primitive::Underline(underline) => {
                 underline.order = order;
                 self.underlines.push(*underline);
-                (PrimitiveKind::Underline, self.underlines.len())
             }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.order = order;
                 self.monochrome_sprites.push(*sprite);
-                (
-                    PrimitiveKind::MonochromeSprite,
-                    self.monochrome_sprites.len(),
-                )
             }
             Primitive::SubpixelSprite(sprite) => {
                 sprite.order = order;
                 self.subpixel_sprites.push(*sprite);
-                (PrimitiveKind::SubpixelSprite, self.subpixel_sprites.len())
             }
             Primitive::PolychromeSprite(sprite) => {
                 sprite.order = order;
                 self.polychrome_sprites.push(*sprite);
-                (
-                    PrimitiveKind::PolychromeSprite,
-                    self.polychrome_sprites.len(),
-                )
             }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
-                (PrimitiveKind::Surface, self.surfaces.len())
             }
-        };
+        }
         self.paint_operations
-            .push(PaintOperation::Primitive(kind, emitted_at as u32 - 1));
+            .push(PaintOperation::Primitive(primitive));
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(kind, emitted_at) => {
-                    if let Some(primitive) = prev_scene.primitive_emitted_at(*kind, *emitted_at) {
-                        self.insert_primitive(primitive);
-                    }
-                }
+                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
     }
 
-    /// The primitive this scene emitted in position `emitted_at`, wherever
-    /// [`Scene::finish`] has since moved it to.
-    fn primitive_emitted_at(&self, kind: PrimitiveKind, emitted_at: u32) -> Option<Primitive> {
-        fn at<T: Clone>(items: &[T], positions: &[u32], emitted_at: u32) -> Option<T> {
-            let index = *positions.get(emitted_at as usize)? as usize;
-            items.get(index).cloned()
-        }
-        let positions = &self.sorted_positions;
-        match kind {
-            PrimitiveKind::Shadow => {
-                at(&self.shadows, &positions.shadows, emitted_at).map(Primitive::Shadow)
-            }
-            PrimitiveKind::Quad => {
-                at(&self.quads, &positions.quads, emitted_at).map(Primitive::Quad)
-            }
-            PrimitiveKind::Path => {
-                at(&self.paths, &positions.paths, emitted_at).map(Primitive::Path)
-            }
-            PrimitiveKind::Underline => {
-                at(&self.underlines, &positions.underlines, emitted_at).map(Primitive::Underline)
-            }
-            PrimitiveKind::MonochromeSprite => at(
-                &self.monochrome_sprites,
-                &positions.monochrome_sprites,
-                emitted_at,
-            )
-            .map(Primitive::MonochromeSprite),
-            PrimitiveKind::SubpixelSprite => at(
-                &self.subpixel_sprites,
-                &positions.subpixel_sprites,
-                emitted_at,
-            )
-            .map(Primitive::SubpixelSprite),
-            PrimitiveKind::PolychromeSprite => at(
-                &self.polychrome_sprites,
-                &positions.polychrome_sprites,
-                emitted_at,
-            )
-            .map(Primitive::PolychromeSprite),
-            PrimitiveKind::Surface => {
-                at(&self.surfaces, &positions.surfaces, emitted_at).map(Primitive::Surface)
-            }
-        }
-    }
-
     pub fn finish(&mut self) {
-        let scratch = &mut self.scratch;
-        let positions = &mut self.sorted_positions;
-        macro_rules! sort {
-            ($field:ident, $key:expr) => {
-                sort_recording_positions(
-                    &mut self.$field,
-                    &mut scratch.order,
-                    &mut scratch.$field,
-                    &mut positions.$field,
-                    $key,
-                )
-            };
-        }
-        // Sprites of one order are grouped by texture: a batch draws from one
-        // texture, and tile ids, numbered per texture, would interleave them.
-        sort!(shadows, |shadow: &Shadow| shadow.order);
-        sort!(quads, |quad: &Quad| quad.order);
-        sort!(paths, |path: &Path<ScaledPixels>| path.order);
-        sort!(underlines, |underline: &Underline| underline.order);
-        sort!(monochrome_sprites, |sprite: &MonochromeSprite| (
-            sprite.order,
-            sprite.tile.texture_id.index,
-            sprite.tile.tile_id
-        ));
-        sort!(subpixel_sprites, |sprite: &SubpixelSprite| (
-            sprite.order,
-            sprite.tile.texture_id.index,
-            sprite.tile.tile_id
-        ));
-        sort!(polychrome_sprites, |sprite: &PolychromeSprite| (
-            sprite.order,
-            sprite.tile.texture_id.index,
-            sprite.tile.tile_id
-        ));
-        sort!(surfaces, |surface: &PaintSurface| surface.order);
+        self.shadows.sort_by_key(|shadow| shadow.order);
+        self.quads.sort_by_key(|quad| quad.order);
+        self.paths.sort_by_key(|path| path.order);
+        self.underlines.sort_by_key(|underline| underline.order);
+        self.monochrome_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.subpixel_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.polychrome_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.surfaces.sort_by_key(|surface| surface.order);
     }
 
     #[cfg_attr(
@@ -441,14 +212,7 @@ pub(crate) enum PrimitiveKind {
 }
 
 pub(crate) enum PaintOperation {
-    /// Which vector the primitive went into and where it was emitted, rather
-    /// than a second copy of the primitive itself.
-    ///
-    /// The copy this replaces was 168 bytes, which a frame wrote once and a
-    /// replay read back a frame later, by which time it had fallen out of every
-    /// cache. Writing it was free; reading it back was most of what a replay
-    /// cost.
-    Primitive(PrimitiveKind, u32),
+    Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
@@ -1181,61 +945,5 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{AtlasTextureKind, DevicePixels, TileId, point, size};
-
-    fn glyph(x: f32, texture: u32, tile: u32) -> MonochromeSprite {
-        let bounds = Bounds::new(
-            point(ScaledPixels(x), ScaledPixels(0.)),
-            size(ScaledPixels(8.), ScaledPixels(8.)),
-        );
-        MonochromeSprite {
-            order: 0,
-            pad: 0,
-            bounds,
-            content_mask: ContentMask { bounds },
-            color: Hsla::default(),
-            tile: AtlasTile {
-                texture_id: AtlasTextureId {
-                    index: texture,
-                    kind: AtlasTextureKind::Monochrome,
-                },
-                tile_id: TileId(tile),
-                padding: 0,
-                bounds: Bounds::new(
-                    point(DevicePixels(0), DevicePixels(0)),
-                    size(DevicePixels(8), DevicePixels(8)),
-                ),
-            },
-            transformation: TransformationMatrix::unit(),
-        }
-    }
-
-    /// Glyphs that do not overlap share an order however many atlas textures
-    /// they come from, and are drawn in one batch per texture, not one per run
-    /// of glyphs from the same texture.
-    #[test]
-    fn glyphs_of_one_order_are_batched_by_texture() {
-        let mut scene = Scene::default();
-        for i in 0..20 {
-            // Tile ids are numbered per texture, so both textures have each.
-            scene.insert_primitive(glyph(i as f32 * 10., i % 2, i / 2));
-        }
-        scene.finish();
-        let batches = scene
-            .batches()
-            .map(|batch| match batch {
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                    (texture_id.index, range.len())
-                }
-                _ => panic!("only glyphs were drawn"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(batches, vec![(0, 10), (1, 10)]);
     }
 }
