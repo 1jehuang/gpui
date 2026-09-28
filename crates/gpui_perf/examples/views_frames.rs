@@ -11,11 +11,11 @@
 //! panels change every frame.
 //!
 //! ```text
-//! cargo run -p gpui --example views_frames --release -- 60 64 2
-//! GPUI_VIEW_RETENTION=0 cargo run -p gpui --example views_frames --release -- 60 64 2
+//! cargo run -p gpui_perf --example views_frames --release -- 60 64 2
+//! GPUI_VIEW_RETENTION=0 cargo run -p gpui_perf --example views_frames --release -- 60 64 2
 //! ```
 
-#[path = "example_support/fonts.rs"]
+#[path = "../../gpui/examples/example_support/fonts.rs"]
 mod example_support;
 
 use gpui::{

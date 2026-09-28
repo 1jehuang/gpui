@@ -289,7 +289,7 @@ Two benchmarks draw through a real window:
 
 ```sh
 # a grid of labels, 25% of them changing every frame
-cargo run -p gpui --example grid_frames --release -- 50 50 25
+cargo run -p gpui_perf --example grid_frames --release -- 50 50 25
 # a list scrolled back and forth, rows keyed by index
-cargo run -p gpui --example scroll_frames --release -- uniform oscillate 12 index
+cargo run -p gpui_perf --example scroll_frames --release -- uniform oscillate 12 index
 ```

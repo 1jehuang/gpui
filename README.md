@@ -144,9 +144,9 @@ Each of these is one commit, with its own measurements in the commit message.
 - **An oracle test** drives two windows through the same random history, one
   drawing incrementally and one from scratch, and requires the frames to match.
 - **Benchmarks that draw through a real window**: a grid whose labels change,
-  `cargo run -p gpui --example grid_frames --release -- 50 50 25`, and a list
+  `cargo run -p gpui_perf --example grid_frames --release -- 50 50 25`, and a list
   being scrolled,
-  `cargo run -p gpui --example scroll_frames --release -- uniform oscillate 12 index`.
+  `cargo run -p gpui_perf --example scroll_frames --release -- uniform oscillate 12 index`.
 
 ### Getting the most out of it
 
