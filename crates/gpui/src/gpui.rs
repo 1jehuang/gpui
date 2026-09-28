@@ -32,8 +32,6 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
-#[cfg(test)]
-mod oracle_tests;
 mod path_builder;
 mod platform;
 pub mod prelude;
@@ -49,8 +47,6 @@ pub mod profiler;
 ))]
 #[expect(missing_docs)]
 pub mod queue;
-#[cfg(test)]
-mod retained_bench;
 mod scene;
 mod shared_uri;
 mod spring;
@@ -106,9 +102,9 @@ pub use ctor::ctor;
 pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
+pub use executor::*;
 #[allow(unused_imports)]
 pub use fast::*;
-pub use executor::*;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;

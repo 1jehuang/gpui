@@ -9,7 +9,7 @@
 //! rows that scroll in cannot.
 //!
 //! ```text
-//! cargo run -p gpui --example scroll_frames --release -- <container> <motion> <speed> <keying> [rows] [overdraw] [cells] [panes]
+//! cargo run -p gpui_perf --example scroll_frames --release -- <container> <motion> <speed> <keying> [rows] [overdraw] [cells] [panes]
 //! ```
 //!
 //! - `container`: `uniform` (`uniform_list`) or `list` (`list`, variable-height
@@ -38,7 +38,7 @@
 //! lays out and paints, and the whole process's, which adds the renderer's and
 //! the driver's threads and is noisier for it.
 
-#[path = "example_support/fonts.rs"]
+#[path = "../../gpui/examples/example_support/fonts.rs"]
 mod example_support;
 
 use gpui::{

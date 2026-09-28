@@ -2539,7 +2539,6 @@ dependencies = [
  "image",
  "inventory",
  "itertools 0.14.0",
- "libc",
  "log",
  "lyon",
  "num_cpus",
@@ -2718,6 +2717,7 @@ name = "gpui_perf"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "gpui_platform",
  "gpui_wgpu",
  "libc",
  "serde",

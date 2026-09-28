@@ -21,11 +21,11 @@
 //! more than one atlas texture holds, which is what a CJK interface draws.
 //!
 //! ```text
-//! cargo run -p gpui --example grid_frames --release -- 50 50 25
-//! cargo run -p gpui --example grid_frames --release -- 50 50 0 cjk
+//! cargo run -p gpui_perf --example grid_frames --release -- 50 50 25
+//! cargo run -p gpui_perf --example grid_frames --release -- 50 50 0 cjk
 //! ```
 
-#[path = "example_support/fonts.rs"]
+#[path = "../../gpui/examples/example_support/fonts.rs"]
 mod example_support;
 
 use gpui::{

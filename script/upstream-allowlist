@@ -1,0 +1,7 @@
+# Justified exceptions to script/check-upstream's rules; see docs/upstream-sync.md.
+#
+# Each line: <path or glob> [hunk=N] [file=N] [any] # <reason>
+#   hunk=N  raises the most lines one hunk may add for matching files
+#   file=N  raises the most lines added plus removed for matching files
+#   any     allows any change, including adding or removing the file
+# The first matching line applies. Keep entries few and the reasons specific.
