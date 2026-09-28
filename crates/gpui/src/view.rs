@@ -280,8 +280,8 @@ impl<V: View> IntoElement for ViewElement<V> {
 }
 
 impl<V: View> Element for ViewElement<V> {
-    type RequestLayoutState = crate::ViewLayoutState;
-    type PrepaintState = crate::ViewPrepaintState;
+    type RequestLayoutState = crate::fast::retained::ViewLayoutState;
+    type PrepaintState = crate::fast::retained::ViewPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         self.entity_id.map(ElementId::View)

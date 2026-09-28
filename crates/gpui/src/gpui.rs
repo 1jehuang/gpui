@@ -22,6 +22,8 @@ mod element;
 mod elements;
 mod executor;
 mod fast;
+pub use fast::memo::{AnyMemoKey, ContentHash, Memo, MemoPrepaint, Version, memo};
+pub use fast::retained::{ViewLayoutState, ViewPrepaintState};
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
@@ -106,8 +108,6 @@ pub use ctor::ctor;
 pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
-#[allow(unused_imports)]
-pub use fast::*;
 pub use executor::*;
 pub use geometry::*;
 pub use gestures::*;

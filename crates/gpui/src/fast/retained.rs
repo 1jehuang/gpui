@@ -18,9 +18,9 @@
 
 use crate::window::{LayoutKeyFrame, PaintIndex, PrepaintStateIndex};
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, DependencyRecording, Element, ElementId,
-    EntityId, GlobalElementId, HitboxId, InspectorElementId, IntoElement, LayoutId, Pixels,
-    RenderDependencies, Size, Style, TextStyle, View, ViewElement, Window,
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, DependencyRecording, ElementId, EntityId,
+    GlobalElementId, HitboxId, IntoElement, LayoutId, Pixels, RenderDependencies, Size, Style,
+    TextStyle, View, ViewElement, Window,
 };
 use collections::{FxHashMap, FxHashSet};
 use refineable::Refineable;
@@ -122,7 +122,7 @@ pub(crate) struct RetainedPaintRecording {
 pub(crate) struct RetainedState {
     /// The reusable subtrees — memos and cached views — being built or
     /// painted, innermost last. An interaction inside one, a hover or a
-    /// scroll, marks all of them to be built again. See [`crate::memo`].
+    /// scroll, marks all of them to be built again. See [`crate::fast::memo::memo`].
     memo_stack: Vec<GlobalElementId>,
     /// Reusable subtrees that an interaction inside them changed since they
     /// were drawn.
@@ -482,40 +482,6 @@ impl Window {
         (Some(Rc::new(layout)), dependencies)
     }
 
-    /// Runs `f` as though the element being prepainted were requesting its
-    /// layout, so that what `f` lays out is keyed as that element's children
-    /// were, and finds the nodes they had.
-    pub(crate) fn with_layout_key_of_prepainting_element<R>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        self.layout_key_stack.push(LayoutKeyFrame {
-            key: self.layout_prepaint_scope,
-            next_unidentified_child: 0,
-        });
-        let result = f(self);
-        self.layout_key_stack.pop();
-        result
-    }
-
-    /// How many writes that change a layout the engine has made. See
-    /// [`crate::TaffyLayoutEngine::layout_changes`].
-    pub(crate) fn layout_changes(&self) -> u64 {
-        self.layout_engine.as_ref().unwrap().layout_changes()
-    }
-
-    /// See [`crate::TaffyLayoutEngine::relayout_in_place`].
-    pub(crate) fn relayout_in_place(
-        &mut self,
-        layout_id: LayoutId,
-        available_space: Size<AvailableSpace>,
-        cx: &mut App,
-    ) {
-        let mut layout_engine = self.layout_engine.take().unwrap();
-        layout_engine.relayout_in_place(layout_id, available_space, self, cx);
-        self.layout_engine = Some(layout_engine);
-    }
-
     /// Draws the subtree last frame's record `previous` stands for again, as
     /// far as its prepaint goes, returning its record in this frame for
     /// [`Window::reuse_retained_paint`]. What it read is read again unless
@@ -749,13 +715,13 @@ impl Window {
     }
 
     /// The memos around the element being painted, for a listener to mark if
-    /// what it listens for changes the element's look. See [`crate::memo`].
+    /// what it listens for changes the element's look. See [`crate::fast::memo::memo`].
     pub(crate) fn enclosing_memos(&self) -> SmallVec<[GlobalElementId; 2]> {
         self.retained_state.memo_stack.iter().cloned().collect()
     }
 
     /// Notes that what is being painted inside a memo looks the way it does
-    /// because `hitbox` is, or is not, hovered. See [`crate::memo`].
+    /// because `hitbox` is, or is not, hovered. See [`crate::fast::memo::memo`].
     pub(crate) fn note_memo_hover_dependency(&mut self, hitbox: HitboxId, hovered: bool) {
         if !self.retained_state.memo_stack.is_empty() {
             self.retained_state
@@ -917,6 +883,45 @@ impl Window {
     }
 }
 
+// These reach into the window's layout state, for views drawn again at the
+// layout they kept.
+impl Window {
+    // Duplicate of fast::layout_key's; dropped at merge.
+    /// Runs `f` as though the element being prepainted were requesting its
+    /// layout, so that what `f` lays out is keyed as that element's children
+    /// were, and finds the nodes they had.
+    pub(crate) fn with_layout_key_of_prepainting_element<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.layout_key_stack.push(LayoutKeyFrame {
+            key: self.layout_prepaint_scope,
+            next_unidentified_child: 0,
+        });
+        let result = f(self);
+        self.layout_key_stack.pop();
+        result
+    }
+
+    /// How many writes that change a layout the engine has made. See
+    /// [`crate::TaffyLayoutEngine::layout_changes`].
+    pub(crate) fn layout_changes(&self) -> u64 {
+        self.layout_engine.as_ref().unwrap().layout_changes()
+    }
+
+    /// See [`crate::TaffyLayoutEngine::relayout_in_place`].
+    pub(crate) fn relayout_in_place(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) {
+        let mut layout_engine = self.layout_engine.take().unwrap();
+        layout_engine.relayout_in_place(layout_id, available_space, self, cx);
+        self.layout_engine = Some(layout_engine);
+    }
+}
+
 /// How a view was laid out, for its prepaint to follow up on.
 #[doc(hidden)]
 pub struct ViewLayoutState(ViewLayout);
@@ -953,7 +958,7 @@ enum ViewPrepaint {
 }
 
 impl<V: View> ViewElement<V> {
-    /// Lays the view out as [`Element::request_layout`] does, drawing it
+    /// Lays the view out as [`crate::Element::request_layout`] does, drawing it
     /// again from last frame when it is retained and nothing it depends on
     /// changed.
     pub(crate) fn request_view_layout(
@@ -1050,7 +1055,7 @@ impl<V: View> ViewElement<V> {
         }
     }
 
-    /// Prepaints the view as [`Element::prepaint`] does, following up on how
+    /// Prepaints the view as [`crate::Element::prepaint`] does, following up on how
     /// [`ViewElement::request_view_layout`] laid it out.
     pub(crate) fn prepaint_view(
         &mut self,
@@ -1197,7 +1202,7 @@ impl<V: View> ViewElement<V> {
         ViewPrepaint::Built { element, record }
     }
 
-    /// Paints the view as [`Element::paint`] does.
+    /// Paints the view as [`crate::Element::paint`] does.
     pub(crate) fn paint_view(
         &mut self,
         global_id: Option<&GlobalElementId>,
