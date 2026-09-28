@@ -1,1 +1,1257 @@
-//! Retained subtrees — views and memos — drawn again from the last frame while nothing they read changed.
+//! Subtrees drawn again from what they drew on the last frame.
+//!
+//! Views, cached views and memos are retained subtrees. Each one drawn in a
+//! frame leaves a record there: where its hitboxes, dispatch nodes, listeners
+//! and primitives went, what it read while it was built, the hovers it was
+//! painted by and the layout nodes it holds. On the next frame, a subtree
+//! whose record says nothing it depends on has changed is drawn again by
+//! copying those stretches of the last frame instead of building, laying out,
+//! prepainting and painting it.
+//!
+//! The records live in the frame rather than in element state because the
+//! stretches they point to belong to one frame. A subtree drawn again from
+//! last frame is not visited, so the records of subtrees nested in it would
+//! otherwise keep pointing into the frame they were last visited in. Instead,
+//! drawing a subtree again copies its record and the records nested in it,
+//! shifted to where the copy landed, so that any of them can be drawn again
+//! on its own later, when what is around it has to be built.
+
+use crate::fast::dependencies::{DependencyRecording, RenderDependencies};
+use crate::window::{LayoutKeyFrame, PaintIndex, PrepaintStateIndex};
+use crate::{
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, ElementId, EntityId, GlobalElementId,
+    HitboxId, IntoElement, LayoutId, Pixels, Size, Style, TextStyle, View, ViewElement, Window,
+};
+use collections::{FxHashMap, FxHashSet};
+use refineable::Refineable;
+use smallvec::SmallVec;
+use std::{any::TypeId, mem, ops::Range, rc::Rc};
+
+/// The retained subtrees drawn in one frame, in the order they began
+/// prepainting, which puts a subtree's nested subtrees right after it.
+#[derive(Default)]
+pub(crate) struct RetainedSubtrees {
+    records: Vec<RetainedSubtree>,
+    by_id: FxHashMap<GlobalElementId, usize>,
+    /// The records whose prepaint is under way, innermost last.
+    open: Vec<usize>,
+    reused_any: bool,
+}
+
+struct RetainedSubtree {
+    id: GlobalElementId,
+    prepaint_range: Range<PrepaintStateIndex>,
+    paint_range: Range<PaintIndex>,
+    paint: PaintStatus,
+    /// How many of the records following this one are nested inside it.
+    nested: usize,
+    context: Rc<RetainedContext>,
+    dependencies: RenderDependencies,
+    hover_dependencies: Rc<[(HitboxId, bool)]>,
+    /// The layout nodes the subtree claimed while it was prepainted, list
+    /// items for instance, kept while it is drawn again so that building it
+    /// again finds them.
+    layout_keys: Rc<[u64]>,
+    layout: Option<Rc<RetainedLayout>>,
+}
+
+enum PaintStatus {
+    /// Not painted, so `paint_range` means nothing.
+    Unpainted,
+    /// Painted this frame into `paint_range`. When that was drawn from last
+    /// frame, `source` is where it started there, for the records copied
+    /// along with it to shift their own ranges by.
+    Painted { source: Option<PaintIndex> },
+    /// Copied along with the subtree at `anchor` and still holding last
+    /// frame's `paint_range`, which is shifted once that one is painted.
+    Pending { anchor: usize },
+}
+
+/// What a subtree's prepaint and paint depended on besides what it read: the
+/// place it was drawn in and what it inherited there.
+#[derive(PartialEq)]
+struct RetainedContext {
+    bounds: Bounds<Pixels>,
+    content_mask: ContentMask<Pixels>,
+    text_style: TextStyle,
+    opacity: f32,
+}
+
+/// What it takes to lay a view out as it was laid out last frame without
+/// building it: the view is laid out by its content, so its layout is only
+/// known from the nodes its content left.
+pub(crate) struct RetainedLayout {
+    /// The node its content is laid out at.
+    root: LayoutId,
+    /// Every node its content claimed while its layout was requested.
+    keys: Vec<u64>,
+    /// The element states its content used while its layout was requested,
+    /// kept for as long as it is not built.
+    element_states: Vec<(GlobalElementId, TypeId)>,
+    text_style: TextStyle,
+    rem_size: Pixels,
+}
+
+/// A layout request being recorded as a [`RetainedLayout`].
+pub(crate) struct RetainedLayoutRecording {
+    keys: usize,
+    transient: usize,
+    element_states: usize,
+    dependencies: DependencyRecording,
+    text_style: TextStyle,
+    rem_size: Pixels,
+}
+
+/// A retained subtree being prepainted. See [`Window::begin_retained`].
+pub(crate) struct RetainedRecording {
+    index: Option<usize>,
+    dependencies: DependencyRecording,
+    layout_keys: usize,
+}
+
+/// A retained subtree being painted. See [`Window::begin_retained_paint`].
+pub(crate) struct RetainedPaintRecording {
+    index: Option<usize>,
+    start: PaintIndex,
+    hovers_start: usize,
+    dependencies: DependencyRecording,
+}
+
+/// A window's state for drawing retained subtrees again, besides the records
+/// its frames hold.
+pub(crate) struct RetainedState {
+    /// The reusable subtrees — memos and cached views — being built or
+    /// painted, innermost last. An interaction inside one, a hover or a
+    /// scroll, marks all of them to be built again. See [`crate::memo`].
+    memo_stack: Vec<GlobalElementId>,
+    /// Reusable subtrees that an interaction inside them changed since they
+    /// were drawn.
+    dirty_memos: FxHashSet<GlobalElementId>,
+    /// Reusable subtrees found out of date too late in a frame to build them
+    /// again, which become [`RetainedState::dirty_memos`] for the next one.
+    memos_dirty_next_frame: FxHashSet<GlobalElementId>,
+    /// Whether each hitbox whose hover a memo's subtree was painted by was
+    /// hovered then, in painting order. A memo keeps the stretch its subtree
+    /// added and is built again once any of them is hovered differently.
+    memo_hover_dependencies: Vec<(HitboxId, bool)>,
+    /// Every entity notified since the last frame was drawn, views or not. A
+    /// retained subtree that read any of them is built again.
+    notified_entities: FxHashSet<EntityId>,
+    /// Whether a view that was not notified since the last frame, and read
+    /// nothing that was, is drawn again from what it drew then. See
+    /// [`Window::set_view_retention`].
+    view_retention: bool,
+}
+
+impl RetainedState {
+    pub(crate) fn new() -> Self {
+        RetainedState {
+            memo_stack: Vec::new(),
+            dirty_memos: FxHashSet::default(),
+            memos_dirty_next_frame: FxHashSet::default(),
+            memo_hover_dependencies: Vec::new(),
+            notified_entities: FxHashSet::default(),
+            view_retention: std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
+        }
+    }
+
+    /// Notes the entities notified since the last frame was drawn, replacing
+    /// those noted then.
+    pub(crate) fn note_notified(&mut self, entities: &FxHashSet<EntityId>) {
+        self.notified_entities.clear();
+        self.notified_entities.extend(entities.iter().copied());
+    }
+}
+
+/// The retained subtrees, as indices into this frame's records, that were
+/// being drawn when something was deferred. What drawing it reads and the
+/// hovers it is painted by are theirs too, though it is drawn after them.
+#[derive(Clone, Default)]
+pub(crate) struct EnclosingRetained(SmallVec<[usize; 4]>);
+
+/// Something deferred from retained subtrees being drawn. See
+/// [`Window::begin_deferred_retained_prepaint`].
+pub(crate) struct DeferredRetainedRecording {
+    enclosing: EnclosingRetained,
+    dependencies: DependencyRecording,
+    /// Where the hovers it is painted by start, when it is being painted.
+    hovers_start: Option<usize>,
+}
+
+impl PrepaintStateIndex {
+    /// This index, taken from a range that started at `from`, as it falls in
+    /// a copy of that range starting at `to`.
+    fn shifted(&self, from: &Self, to: &Self) -> Self {
+        PrepaintStateIndex {
+            hitboxes_index: self.hitboxes_index - from.hitboxes_index + to.hitboxes_index,
+            tooltips_index: self.tooltips_index - from.tooltips_index + to.tooltips_index,
+            deferred_draws_index: self.deferred_draws_index - from.deferred_draws_index
+                + to.deferred_draws_index,
+            dispatch_tree_index: self.dispatch_tree_index - from.dispatch_tree_index
+                + to.dispatch_tree_index,
+            accessed_element_states_index: self.accessed_element_states_index
+                - from.accessed_element_states_index
+                + to.accessed_element_states_index,
+            line_layout_index: self
+                .line_layout_index
+                .shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
+impl PaintIndex {
+    /// See [`PrepaintStateIndex::shifted`].
+    fn shifted(&self, from: &Self, to: &Self) -> Self {
+        PaintIndex {
+            scene_index: self.scene_index - from.scene_index + to.scene_index,
+            window_control_hitboxes_index: self.window_control_hitboxes_index
+                - from.window_control_hitboxes_index
+                + to.window_control_hitboxes_index,
+            mouse_listeners_index: self.mouse_listeners_index - from.mouse_listeners_index
+                + to.mouse_listeners_index,
+            input_handlers_index: self.input_handlers_index - from.input_handlers_index
+                + to.input_handlers_index,
+            cursor_styles_index: self.cursor_styles_index - from.cursor_styles_index
+                + to.cursor_styles_index,
+            accessed_element_states_index: self.accessed_element_states_index
+                - from.accessed_element_states_index
+                + to.accessed_element_states_index,
+            tab_handle_index: self.tab_handle_index - from.tab_handle_index + to.tab_handle_index,
+            line_layout_index: self
+                .line_layout_index
+                .shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
+impl RetainedSubtrees {
+    pub(crate) fn clear(&mut self) {
+        self.records.clear();
+        self.by_id.clear();
+        self.open.clear();
+        self.reused_any = false;
+    }
+
+    /// Whether any subtree was drawn from last frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reused_any(&self) -> bool {
+        self.reused_any
+    }
+
+    /// The painted record `id` left, if any.
+    fn find(&self, id: &GlobalElementId) -> Option<usize> {
+        let index = *self.by_id.get(id)?;
+        matches!(self.records[index].paint, PaintStatus::Painted { .. }).then_some(index)
+    }
+
+    pub(crate) fn id(&self, index: usize) -> &GlobalElementId {
+        &self.records[index].id
+    }
+
+    /// The records being prepainted right now, for something deferred from
+    /// them to be counted as theirs.
+    pub(crate) fn open_records(&self) -> EnclosingRetained {
+        EnclosingRetained(self.open.iter().copied().collect())
+    }
+
+    /// Adds what was read while something deferred from `records` was drawn.
+    pub(crate) fn add_dependencies(
+        &mut self,
+        records: &[usize],
+        dependencies: &RenderDependencies,
+    ) {
+        for &index in records {
+            let record = &mut self.records[index];
+            record.dependencies = record.dependencies.union(dependencies);
+        }
+    }
+
+    /// Adds the hovers something deferred from `records` was painted by.
+    pub(crate) fn add_hover_dependencies(
+        &mut self,
+        records: &[usize],
+        hovers: &[(HitboxId, bool)],
+    ) {
+        if hovers.is_empty() {
+            return;
+        }
+        for &index in records {
+            let record = &mut self.records[index];
+            let mut all = record.hover_dependencies.to_vec();
+            all.extend_from_slice(hovers);
+            record.hover_dependencies = all.into();
+        }
+    }
+
+    fn push(&mut self, record: RetainedSubtree) -> usize {
+        let index = self.records.len();
+        // Two subtrees with one id can only both be drawn; neither can be
+        // found to be drawn again.
+        match self.by_id.entry(record.id.clone()) {
+            collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(index);
+            }
+            collections::hash_map::Entry::Occupied(entry) => {
+                let other = *entry.get();
+                self.records[other].paint = PaintStatus::Unpainted;
+            }
+        }
+        self.records.push(record);
+        index
+    }
+
+    /// Shifts the paint ranges of records copied along with a subtree drawn
+    /// from last frame, now that it has been painted, and forgets those that
+    /// were not.
+    pub(crate) fn finish_frame(&mut self) {
+        debug_assert!(self.open.is_empty());
+        for index in 0..self.records.len() {
+            let PaintStatus::Pending { anchor } = self.records[index].paint else {
+                continue;
+            };
+            let shift = match &self.records[anchor].paint {
+                PaintStatus::Painted {
+                    source: Some(source),
+                } if anchor != index => Some((
+                    source.clone(),
+                    self.records[anchor].paint_range.start.clone(),
+                )),
+                _ => None,
+            };
+            let record = &mut self.records[index];
+            match shift {
+                Some((from, to)) => {
+                    record.paint_range = record.paint_range.start.shifted(&from, &to)
+                        ..record.paint_range.end.shifted(&from, &to);
+                    record.paint = PaintStatus::Painted { source: None };
+                }
+                None => record.paint = PaintStatus::Unpainted,
+            }
+        }
+    }
+}
+
+impl Window {
+    /// Sets whether a view is drawn again from what it drew on the last frame
+    /// while nothing it depends on has changed, which is the default. A view
+    /// depends on itself, on every entity and global read while it was
+    /// rendered, laid out, prepainted and painted, on what it inherits from
+    /// where it is drawn — bounds, content mask, text style, opacity — and on
+    /// the hovers it was painted by. Anything else a view's render reads, it
+    /// is notified of, as a cached view is.
+    ///
+    /// Turning it off draws every view from scratch each frame, as upstream
+    /// GPUI does. The `GPUI_VIEW_RETENTION=0` environment variable turns it
+    /// off for every window.
+    pub fn set_view_retention(&mut self, enabled: bool) {
+        if self.retained_state.view_retention != enabled {
+            self.retained_state.view_retention = enabled;
+            self.refresh();
+        }
+    }
+
+    /// Whether views are drawn again from what they drew on the last frame.
+    /// See [`Window::set_view_retention`].
+    pub fn view_retention(&self) -> bool {
+        self.retained_state.view_retention
+    }
+
+    /// The record `id` left last frame, if nothing about this frame rules out
+    /// drawing it again: it did not read anything that changed, is not
+    /// hovered differently and was not marked by an interaction.
+    ///
+    /// Where it is drawn is not checked here; see
+    /// [`Window::retained_context_matches`].
+    pub(crate) fn reusable_retained(&self, id: &GlobalElementId, cx: &App) -> Option<usize> {
+        if self.refreshing
+            || cx.has_active_drag()
+            || self.a11y.is_active()
+            || self.is_inspector_picking(cx)
+            || self.retained_state.dirty_memos.contains(id)
+            || self.next_frame.retained.by_id.contains_key(id)
+        {
+            return None;
+        }
+        let index = self.rendered_frame.retained.find(id)?;
+        let record = &self.rendered_frame.retained.records[index];
+        if cx.dependencies_changed(&record.dependencies, &self.retained_state.notified_entities)
+            || !self.hovers_unchanged(&record.hover_dependencies)
+        {
+            return None;
+        }
+        Some(index)
+    }
+
+    /// Whether the subtree last frame's record `previous` stands for would be
+    /// drawn at `bounds` just as it was.
+    pub(crate) fn retained_context_matches(&self, previous: usize, bounds: Bounds<Pixels>) -> bool {
+        let context = &self.rendered_frame.retained.records[previous].context;
+        context.bounds == bounds
+            && context.opacity == self.element_opacity
+            && context.content_mask == self.content_mask()
+            && context.text_style == self.text_style()
+    }
+
+    /// Lays out the view last frame's record `previous` stands for as it was
+    /// laid out then, without building it, if it can be: its content left
+    /// every node it was laid out with, and inherits what it did.
+    pub(crate) fn reuse_retained_layout(
+        &mut self,
+        previous: usize,
+        cx: &mut App,
+    ) -> Option<LayoutId> {
+        let record = &self.rendered_frame.retained.records[previous];
+        let layout = record.layout.as_ref()?;
+        if layout.rem_size != self.rem_size() || layout.text_style != self.text_style() {
+            return None;
+        }
+        if !self
+            .layout_engine
+            .as_mut()
+            .unwrap()
+            .try_keep_retained(&layout.keys)
+        {
+            return None;
+        }
+        self.next_frame
+            .accessed_element_states
+            .extend(layout.element_states.iter().cloned());
+        let root = layout.root;
+        cx.replay_dependencies(&record.dependencies);
+        Some(root)
+    }
+
+    /// Gives back the layout nodes [`Window::reuse_retained_layout`] kept, for
+    /// a view that has to be built after all.
+    pub(crate) fn release_retained_layout(&mut self, previous: usize) {
+        if let Some(layout) = self.rendered_frame.retained.records[previous]
+            .layout
+            .as_ref()
+        {
+            self.layout_engine
+                .as_mut()
+                .unwrap()
+                .release_kept(&layout.keys);
+        }
+    }
+
+    /// The node the view last frame's record `previous` stands for was laid
+    /// out at.
+    pub(crate) fn retained_layout_root(&self, previous: usize) -> Option<LayoutId> {
+        self.rendered_frame.retained.records[previous]
+            .layout
+            .as_ref()
+            .map(|layout| layout.root)
+    }
+
+    /// Starts recording a view's layout request, to lay it out again as it
+    /// was without building it. See [`RetainedLayout`].
+    pub(crate) fn begin_retained_layout(&mut self, cx: &mut App) -> RetainedLayoutRecording {
+        RetainedLayoutRecording {
+            keys: self.record_claimed_layout_keys(),
+            transient: self.layout_engine.as_ref().unwrap().transient_count(),
+            element_states: self.next_frame.accessed_element_states.len(),
+            dependencies: cx.begin_recording_dependencies(),
+            text_style: self.text_style(),
+            rem_size: self.rem_size(),
+        }
+    }
+
+    /// Ends `recording` for a layout request that produced `root`, returning
+    /// what was read during it and, if its layout can be reused, how.
+    pub(crate) fn finish_retained_layout(
+        &mut self,
+        recording: RetainedLayoutRecording,
+        root: LayoutId,
+        cx: &mut App,
+    ) -> (Option<Rc<RetainedLayout>>, RenderDependencies) {
+        let keys = self.finish_recording_claimed_layout_keys(recording.keys);
+        let dependencies = cx.finish_recording_dependencies(recording.dependencies);
+        // A node nothing retains is gone at the end of the frame.
+        if self.layout_engine.as_ref().unwrap().transient_count() != recording.transient {
+            return (None, dependencies);
+        }
+        let layout = RetainedLayout {
+            root,
+            keys,
+            element_states: self.next_frame.accessed_element_states[recording.element_states..]
+                .to_vec(),
+            text_style: recording.text_style,
+            rem_size: recording.rem_size,
+        };
+        (Some(Rc::new(layout)), dependencies)
+    }
+
+    /// Runs `f` as though the element being prepainted were requesting its
+    /// layout, so that what `f` lays out is keyed as that element's children
+    /// were, and finds the nodes they had.
+    pub(crate) fn with_layout_key_of_prepainting_element<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.layout_key_stack.push(LayoutKeyFrame {
+            key: self.layout_prepaint_scope,
+            next_unidentified_child: 0,
+        });
+        let result = f(self);
+        self.layout_key_stack.pop();
+        result
+    }
+
+    /// How many writes that change a layout the engine has made. See
+    /// [`crate::TaffyLayoutEngine::layout_changes`].
+    pub(crate) fn layout_changes(&self) -> u64 {
+        self.layout_engine.as_ref().unwrap().layout_changes()
+    }
+
+    /// See [`crate::TaffyLayoutEngine::relayout_in_place`].
+    pub(crate) fn relayout_in_place(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) {
+        let mut layout_engine = self.layout_engine.take().unwrap();
+        layout_engine.relayout_in_place(layout_id, available_space, self, cx);
+        self.layout_engine = Some(layout_engine);
+    }
+
+    /// Draws the subtree last frame's record `previous` stands for again, as
+    /// far as its prepaint goes, returning its record in this frame for
+    /// [`Window::reuse_retained_paint`]. What it read is read again unless
+    /// its layout already was reused, which did that.
+    pub(crate) fn reuse_retained_prepaint(
+        &mut self,
+        previous: usize,
+        layout_reused: bool,
+        cx: &mut App,
+    ) -> usize {
+        let (prepaint_range, layout_keys) = {
+            let record = &self.rendered_frame.retained.records[previous];
+            (record.prepaint_range.clone(), record.layout_keys.clone())
+        };
+        self.keep_retained_layout(&layout_keys);
+        let start = self.prepaint_index();
+        self.reuse_prepaint(prepaint_range.clone());
+        let end = self.prepaint_index();
+        if !layout_reused {
+            cx.replay_dependencies(&self.rendered_frame.retained.records[previous].dependencies);
+        }
+
+        // The nested records can be shifted into this frame only if the copy
+        // is what it was copied from, entry for entry.
+        let copied_whole = end == prepaint_range.end.shifted(&prepaint_range.start, &start);
+        debug_assert!(copied_whole, "a reused prepaint range changed length");
+        let source = &self.rendered_frame.retained;
+        let target = &mut self.next_frame.retained;
+        target.reused_any = true;
+        let anchor = target.records.len();
+        let nested = if copied_whole {
+            source.records[previous].nested
+        } else {
+            0
+        };
+        for index in previous..=previous + nested {
+            let record = &source.records[index];
+            let paint = match record.paint {
+                PaintStatus::Painted { .. } => PaintStatus::Pending { anchor },
+                _ => PaintStatus::Unpainted,
+            };
+            let prepaint_range = if index == previous {
+                start.clone()..end.clone()
+            } else {
+                record
+                    .prepaint_range
+                    .start
+                    .shifted(&prepaint_range.start, &start)
+                    ..record
+                        .prepaint_range
+                        .end
+                        .shifted(&prepaint_range.start, &start)
+            };
+            target.push(RetainedSubtree {
+                id: record.id.clone(),
+                prepaint_range,
+                paint_range: record.paint_range.clone(),
+                paint,
+                nested: if index == previous {
+                    nested
+                } else {
+                    record.nested
+                },
+                context: record.context.clone(),
+                dependencies: record.dependencies.clone(),
+                hover_dependencies: record.hover_dependencies.clone(),
+                layout_keys: record.layout_keys.clone(),
+                layout: record.layout.clone(),
+            });
+        }
+        anchor
+    }
+
+    /// Draws the subtree whose prepaint [`Window::reuse_retained_prepaint`]
+    /// drew again as far as its paint goes.
+    pub(crate) fn reuse_retained_paint(&mut self, index: usize) {
+        let record = &self.next_frame.retained.records[index];
+        let PaintStatus::Pending { .. } = record.paint else {
+            return;
+        };
+        let source = record.paint_range.clone();
+        let hovers = record.hover_dependencies.clone();
+        let id = record.id.clone();
+
+        let start = self.paint_index();
+        self.reuse_paint(source.clone());
+        let end = self.paint_index();
+        let copied_whole = end == source.end.shifted(&source.start, &start);
+        debug_assert!(copied_whole, "a reused paint range changed length");
+        let record = &mut self.next_frame.retained.records[index];
+        record.paint_range = start..end;
+        record.paint = PaintStatus::Painted {
+            source: copied_whole.then_some(source.start),
+        };
+
+        // The hovers were checked against last frame's hitboxes; this
+        // frame's could put something over the subtree. That is found out
+        // only now, too late to build it again, so it is built on the next
+        // frame, which is asked for.
+        if !self.hovers_unchanged(&hovers) {
+            self.retained_state
+                .memos_dirty_next_frame
+                .extend(self.retained_state.memo_stack.iter().cloned());
+            self.retained_state.memos_dirty_next_frame.insert(id);
+            self.request_animation_frame();
+        }
+        // Subtrees around this one depend on these hovers too.
+        if !self.retained_state.memo_stack.is_empty() {
+            self.retained_state
+                .memo_hover_dependencies
+                .extend_from_slice(&hovers);
+        }
+    }
+
+    /// Starts recording the prepaint of the retained subtree `id`, which is
+    /// being built. Interactions inside it mark it to be built again, and
+    /// whatever it lays out, reads and inherits is recorded.
+    pub(crate) fn begin_retained(
+        &mut self,
+        id: &GlobalElementId,
+        cx: &mut App,
+    ) -> RetainedRecording {
+        let start = self.prepaint_index();
+        let retained = &mut self.next_frame.retained;
+        let index = (!retained.by_id.contains_key(id)).then(|| {
+            let index = retained.push(RetainedSubtree {
+                id: id.clone(),
+                prepaint_range: start.clone()..start,
+                paint_range: PaintIndex::default()..PaintIndex::default(),
+                paint: PaintStatus::Unpainted,
+                nested: 0,
+                context: Rc::new(RetainedContext {
+                    bounds: Bounds::default(),
+                    content_mask: ContentMask::default(),
+                    text_style: TextStyle::default(),
+                    opacity: 1.,
+                }),
+                dependencies: RenderDependencies::default(),
+                hover_dependencies: Rc::new([]),
+                layout_keys: Rc::new([]),
+                layout: None,
+            });
+            retained.open.push(index);
+            index
+        });
+        self.retained_state.memo_stack.push(id.clone());
+        RetainedRecording {
+            index,
+            dependencies: cx.begin_recording_dependencies(),
+            layout_keys: self.record_claimed_layout_keys(),
+        }
+    }
+
+    /// Ends `recording` for a subtree prepainted at `bounds`, returning its
+    /// record, if it has one, for [`Window::begin_retained_paint`].
+    /// `layout` and `layout_dependencies` come from its layout request, when
+    /// it was laid out by its content.
+    pub(crate) fn finish_retained_prepaint(
+        &mut self,
+        recording: RetainedRecording,
+        bounds: Bounds<Pixels>,
+        layout: Option<Rc<RetainedLayout>>,
+        layout_dependencies: Option<RenderDependencies>,
+        cx: &mut App,
+    ) -> Option<usize> {
+        let layout_keys = self.finish_recording_claimed_layout_keys(recording.layout_keys);
+        let mut dependencies = cx.finish_recording_dependencies(recording.dependencies);
+        self.retained_state.memo_stack.pop();
+        let index = recording.index?;
+        if let Some(layout_dependencies) = layout_dependencies {
+            dependencies = layout_dependencies.union(&dependencies);
+        }
+        let context = RetainedContext {
+            bounds,
+            content_mask: self.content_mask(),
+            text_style: self.text_style(),
+            opacity: self.element_opacity,
+        };
+        let end = self.prepaint_index();
+        let retained = &mut self.next_frame.retained;
+        debug_assert_eq!(retained.open.last(), Some(&index));
+        retained.open.pop();
+        let nested = retained.records.len() - index - 1;
+        let record = &mut retained.records[index];
+        record.prepaint_range.end = end;
+        record.nested = nested;
+        record.context = Rc::new(context);
+        record.dependencies = dependencies;
+        record.layout_keys = layout_keys.into();
+        record.layout = layout;
+        Some(index)
+    }
+
+    /// Starts recording the paint of the retained subtree `id`, whose
+    /// prepaint left the record `index`.
+    pub(crate) fn begin_retained_paint(
+        &mut self,
+        index: Option<usize>,
+        id: &GlobalElementId,
+        cx: &mut App,
+    ) -> RetainedPaintRecording {
+        self.retained_state.memo_stack.push(id.clone());
+        RetainedPaintRecording {
+            index,
+            start: self.paint_index(),
+            hovers_start: self.retained_state.memo_hover_dependencies.len(),
+            dependencies: cx.begin_recording_dependencies(),
+        }
+    }
+
+    /// Ends `recording`, keeping what the subtree painted, the hovers it was
+    /// painted by and what it read.
+    pub(crate) fn finish_retained_paint(
+        &mut self,
+        recording: RetainedPaintRecording,
+        cx: &mut App,
+    ) {
+        self.retained_state.memo_stack.pop();
+        let dependencies = cx.finish_recording_dependencies(recording.dependencies);
+        let Some(index) = recording.index else {
+            return;
+        };
+        let end = self.paint_index();
+        let hovers: Rc<[(HitboxId, bool)]> =
+            self.retained_state.memo_hover_dependencies[recording.hovers_start..].into();
+        let record = &mut self.next_frame.retained.records[index];
+        record.paint_range = recording.start..end;
+        record.paint = PaintStatus::Painted { source: None };
+        record.hover_dependencies = hovers;
+        record.dependencies = record.dependencies.union(&dependencies);
+    }
+
+    /// The memos around the element being painted, for a listener to mark if
+    /// what it listens for changes the element's look. See [`crate::memo`].
+    pub(crate) fn enclosing_memos(&self) -> SmallVec<[GlobalElementId; 2]> {
+        self.retained_state.memo_stack.iter().cloned().collect()
+    }
+
+    /// Notes that what is being painted inside a memo looks the way it does
+    /// because `hitbox` is, or is not, hovered. See [`crate::memo`].
+    pub(crate) fn note_memo_hover_dependency(&mut self, hitbox: HitboxId, hovered: bool) {
+        if !self.retained_state.memo_stack.is_empty() {
+            self.retained_state
+                .memo_hover_dependencies
+                .push((hitbox, hovered));
+        }
+    }
+
+    /// See [`crate::TaffyLayoutEngine::record_claimed_keys`].
+    pub(crate) fn record_claimed_layout_keys(&mut self) -> usize {
+        self.layout_engine.as_mut().unwrap().record_claimed_keys()
+    }
+
+    /// See [`crate::TaffyLayoutEngine::finish_recording_claimed_keys`].
+    pub(crate) fn finish_recording_claimed_layout_keys(&mut self, start: usize) -> Vec<u64> {
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .finish_recording_claimed_keys(start)
+    }
+
+    /// See [`crate::TaffyLayoutEngine::keep_retained`].
+    pub(crate) fn keep_retained_layout(&mut self, keys: &[u64]) {
+        self.layout_engine.as_mut().unwrap().keep_retained(keys);
+    }
+
+    /// Whether every hover in `dependencies`, recorded while a reusable
+    /// subtree — a memo or a cached view — was painted, is still as it was.
+    pub(crate) fn hovers_unchanged(&self, dependencies: &[(HitboxId, bool)]) -> bool {
+        let touch = self.last_input_was_touch();
+        dependencies
+            .iter()
+            .all(|(hitbox, hovered)| (!touch && hitbox.is_hovered(self)) == *hovered)
+    }
+
+    /// Marks memos to be built again rather than reused on the next frame.
+    pub(crate) fn invalidate_memos(&mut self, memos: &[GlobalElementId]) {
+        self.retained_state
+            .dirty_memos
+            .extend(memos.iter().cloned());
+    }
+
+    /// Multiplies the opacity of what is painted from here on by `opacity`,
+    /// returning the opacity to go back to with
+    /// [`Window::pop_element_opacity`]. See [`Window::with_element_opacity`].
+    ///
+    /// Opacity only affects what is painted, but a retained subtree inside is
+    /// drawn again from what it painted only if it would be painted at the
+    /// opacity it was, which prepaint decides.
+    pub(crate) fn push_element_opacity(&mut self, opacity: Option<f32>) -> f32 {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let previous_opacity = self.element_opacity;
+        if let Some(opacity) = opacity {
+            self.element_opacity = previous_opacity * opacity;
+        }
+        previous_opacity
+    }
+
+    /// Goes back to the opacity [`Window::push_element_opacity`] returned.
+    pub(crate) fn pop_element_opacity(&mut self, previous_opacity: f32) {
+        self.element_opacity = previous_opacity;
+    }
+
+    /// Starts prepainting the deferred draw at `deferred_draw_ix` as a part of
+    /// the retained subtrees it was deferred from, though it is drawn after
+    /// them: what it listens for marks them, and what it reads is theirs.
+    pub(crate) fn begin_deferred_retained_prepaint(
+        &mut self,
+        deferred_draw_ix: usize,
+        cx: &mut App,
+    ) -> Option<DeferredRetainedRecording> {
+        let enclosing = &self.next_frame.deferred_draws[deferred_draw_ix].enclosing_retained;
+        if enclosing.0.is_empty() {
+            return None;
+        }
+        let enclosing = enclosing.clone();
+        self.retained_state.memo_stack.extend(
+            enclosing
+                .0
+                .iter()
+                .map(|&index| self.next_frame.retained.id(index).clone()),
+        );
+        Some(DeferredRetainedRecording {
+            enclosing,
+            dependencies: cx.begin_recording_dependencies(),
+            hovers_start: None,
+        })
+    }
+
+    /// Starts painting a deferred draw as a part of the retained subtrees it
+    /// was deferred from, though it is painted after them: an interaction in
+    /// it marks them, and what it reads and is hovered by is theirs.
+    pub(crate) fn begin_deferred_retained_paint(
+        &mut self,
+        enclosing: &EnclosingRetained,
+        cx: &mut App,
+    ) -> Option<DeferredRetainedRecording> {
+        if enclosing.0.is_empty() {
+            return None;
+        }
+        self.retained_state.memo_stack.extend(
+            enclosing
+                .0
+                .iter()
+                .map(|&index| self.next_frame.retained.id(index).clone()),
+        );
+        Some(DeferredRetainedRecording {
+            enclosing: enclosing.clone(),
+            dependencies: cx.begin_recording_dependencies(),
+            hovers_start: Some(self.retained_state.memo_hover_dependencies.len()),
+        })
+    }
+
+    /// Ends `recording`, adding what the deferred draw read, and the hovers it
+    /// was painted by, to the retained subtrees it was deferred from.
+    pub(crate) fn finish_deferred_retained(
+        &mut self,
+        recording: Option<DeferredRetainedRecording>,
+        cx: &mut App,
+    ) {
+        let Some(recording) = recording else {
+            return;
+        };
+        let dependencies = cx.finish_recording_dependencies(recording.dependencies);
+        self.retained_state.memo_stack.clear();
+        let enclosing = &recording.enclosing.0;
+        self.next_frame
+            .retained
+            .add_dependencies(enclosing, &dependencies);
+        if let Some(hovers_start) = recording.hovers_start {
+            let hovers = self
+                .retained_state
+                .memo_hover_dependencies
+                .split_off(hovers_start);
+            self.next_frame
+                .retained
+                .add_hover_dependencies(enclosing, &hovers);
+        }
+    }
+
+    /// Ends the retained bookkeeping of the frame being drawn, before it
+    /// becomes the rendered frame.
+    pub(crate) fn finish_retained_frame(&mut self) {
+        self.retained_state.dirty_memos =
+            mem::take(&mut self.retained_state.memos_dirty_next_frame);
+        self.retained_state.memo_hover_dependencies.clear();
+        self.next_frame.retained.finish_frame();
+        #[cfg(any(test, feature = "test-support"))]
+        if self.next_frame.retained.reused_any() {
+            // Reused subtrees do not paint, and the bounds they would have
+            // recorded for tests to find them by are last frame's.
+            for (selector, bounds) in &self.rendered_frame.debug_bounds {
+                self.next_frame
+                    .debug_bounds
+                    .entry(selector.clone())
+                    .or_insert(*bounds);
+            }
+        }
+    }
+}
+
+/// How a view was laid out, for its prepaint to follow up on.
+#[doc(hidden)]
+pub struct ViewLayoutState(ViewLayout);
+
+/// What a view's prepaint left for its paint.
+#[doc(hidden)]
+pub struct ViewPrepaintState(ViewPrepaint);
+
+enum ViewLayout {
+    /// Laid out by the style it is cached with; built at prepaint if at all.
+    Cached,
+    /// Built, and laid out by its content.
+    Built {
+        element: AnyElement,
+        /// How to lay it out again without building it, and what it read
+        /// while it was built and laid out, when it is retained.
+        retained: Option<(Option<Rc<RetainedLayout>>, RenderDependencies)>,
+    },
+    /// Laid out as it was last frame without being built, from the record
+    /// it left then, which it is drawn again from if nothing moved it.
+    Retained { previous: usize },
+    /// Moved on to prepaint.
+    Taken,
+}
+
+enum ViewPrepaint {
+    /// Built this frame, into its record in this frame if it has one.
+    Built {
+        element: AnyElement,
+        record: Option<usize>,
+    },
+    /// Drawn from last frame, as the record at this index in this frame.
+    Reused(usize),
+}
+
+impl<V: View> ViewElement<V> {
+    /// Lays the view out as [`Element::request_layout`] does, drawing it
+    /// again from last frame when it is retained and nothing it depends on
+    /// changed.
+    pub(crate) fn request_view_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ViewLayoutState) {
+        let (layout_id, layout) = self.request_view_layout_inner(global_id, window, cx);
+        (layout_id, ViewLayoutState(layout))
+    }
+
+    fn request_view_layout_inner(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ViewLayout) {
+        if let Some(entity_id) = self.entity_id {
+            // Stateful path: create a reactive boundary.
+            window.with_rendered_view(entity_id, |window| {
+                let caching_disabled = window.is_inspector_picking(cx);
+                match self.cached_style.as_ref() {
+                    Some(style) if !caching_disabled => {
+                        let mut root_style = Style::default();
+                        root_style.refine(style);
+                        let layout_id = window.request_layout(root_style, None, cx);
+                        (layout_id, ViewLayout::Cached)
+                    }
+                    _ if window.view_retention() => {
+                        let global_id = global_id.expect("a view always has an id");
+                        if !window.dirty_views.contains(&entity_id)
+                            && let Some(previous) = window.reusable_retained(global_id, cx)
+                            && let Some(layout_id) = window.reuse_retained_layout(previous, cx)
+                        {
+                            return (layout_id, ViewLayout::Retained { previous });
+                        }
+                        let recording = window.begin_retained_layout(cx);
+                        let mut element = self
+                            .view
+                            .take()
+                            .unwrap()
+                            .render(window, cx)
+                            .into_any_element();
+                        let layout_id = element.request_layout(window, cx);
+                        let retained = window.finish_retained_layout(recording, layout_id, cx);
+                        (
+                            layout_id,
+                            ViewLayout::Built {
+                                element,
+                                retained: Some(retained),
+                            },
+                        )
+                    }
+                    _ => {
+                        let mut element = self
+                            .view
+                            .take()
+                            .unwrap()
+                            .render(window, cx)
+                            .into_any_element();
+                        let layout_id = element.request_layout(window, cx);
+                        (
+                            layout_id,
+                            ViewLayout::Built {
+                                element,
+                                retained: None,
+                            },
+                        )
+                    }
+                }
+            })
+        } else {
+            // Stateless path: isolate subtree via type name (no entity identity).
+            window.with_id(
+                ElementId::Name(std::any::type_name::<V>().into()),
+                |window| {
+                    let mut element = self
+                        .view
+                        .take()
+                        .unwrap()
+                        .render(window, cx)
+                        .into_any_element();
+                    let layout_id = element.request_layout(window, cx);
+                    (
+                        layout_id,
+                        ViewLayout::Built {
+                            element,
+                            retained: None,
+                        },
+                    )
+                },
+            )
+        }
+    }
+
+    /// Prepaints the view as [`Element::prepaint`] does, following up on how
+    /// [`ViewElement::request_view_layout`] laid it out.
+    pub(crate) fn prepaint_view(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut ViewLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> ViewPrepaintState {
+        let layout = mem::replace(&mut layout.0, ViewLayout::Taken);
+        ViewPrepaintState(self.prepaint_view_inner(global_id, bounds, layout, window, cx))
+    }
+
+    fn prepaint_view_inner(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        layout: ViewLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> ViewPrepaint {
+        let Some(entity_id) = self.entity_id else {
+            // Stateless path: just prepaint the element.
+            let ViewLayout::Built { mut element, .. } = layout else {
+                unreachable!("a stateless view is always built");
+            };
+            window.with_id(
+                ElementId::Name(std::any::type_name::<V>().into()),
+                |window| {
+                    element.prepaint(window, cx);
+                },
+            );
+            return ViewPrepaint::Built {
+                element,
+                record: None,
+            };
+        };
+
+        window.set_view_id(entity_id);
+        window.with_rendered_view(entity_id, |window| {
+            let global_id = global_id.expect("a view always has an id");
+            match layout {
+                ViewLayout::Built {
+                    mut element,
+                    retained: None,
+                } => {
+                    element.prepaint(window, cx);
+                    ViewPrepaint::Built {
+                        element,
+                        record: None,
+                    }
+                }
+                ViewLayout::Built {
+                    mut element,
+                    retained: Some((layout, dependencies)),
+                } => {
+                    let recording = window.begin_retained(global_id, cx);
+                    element.prepaint(window, cx);
+                    let record = window.finish_retained_prepaint(
+                        recording,
+                        bounds,
+                        layout,
+                        Some(dependencies),
+                        cx,
+                    );
+                    ViewPrepaint::Built { element, record }
+                }
+                ViewLayout::Retained { previous } => {
+                    if window.retained_context_matches(previous, bounds) {
+                        return ViewPrepaint::Reused(
+                            window.reuse_retained_prepaint(previous, true, cx),
+                        );
+                    }
+                    self.build_at_retained_layout(previous, global_id, bounds, window, cx)
+                }
+                ViewLayout::Cached => {
+                    if !window.dirty_views.contains(&entity_id)
+                        && let Some(previous) = window.reusable_retained(global_id, cx)
+                        && window.retained_context_matches(previous, bounds)
+                    {
+                        return ViewPrepaint::Reused(
+                            window.reuse_retained_prepaint(previous, false, cx),
+                        );
+                    }
+                    let recording = window.begin_retained(global_id, cx);
+                    let mut element = self
+                        .view
+                        .take()
+                        .unwrap()
+                        .render(window, cx)
+                        .into_any_element();
+                    element.layout_as_root(bounds.size.into(), window, cx);
+                    element.prepaint_at(bounds.origin, window, cx);
+                    let record = window.finish_retained_prepaint(recording, bounds, None, None, cx);
+                    ViewPrepaint::Built { element, record }
+                }
+                ViewLayout::Taken => unreachable!("a view is prepainted once"),
+            }
+        })
+    }
+
+    /// Builds a view whose layout was reused, but which cannot be drawn again
+    /// from last frame because it is drawn somewhere else: it moved, or what it
+    /// inherits changed. It is laid out at the nodes it kept, which it finds
+    /// again as it requests them. Nothing it depends on changed, so it asks
+    /// for the layout it had; if it asks for another after all, it is laid out
+    /// within the bounds it was given, and on the next frame from scratch.
+    #[inline(never)]
+    fn build_at_retained_layout(
+        &mut self,
+        previous: usize,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> ViewPrepaint {
+        let root = window.retained_layout_root(previous);
+        window.release_retained_layout(previous);
+        let layout_recording = window.begin_retained_layout(cx);
+        let changes_before = window.layout_changes();
+        let view = self.view.take().unwrap();
+        let (mut element, layout_id) = window.with_layout_key_of_prepainting_element(|window| {
+            let mut element = view.render(window, cx).into_any_element();
+            let layout_id = element.request_layout(window, cx);
+            (element, layout_id)
+        });
+        let unchanged = window.layout_changes() == changes_before;
+        let (layout, dependencies) = window.finish_retained_layout(layout_recording, layout_id, cx);
+
+        let recording = window.begin_retained(global_id, cx);
+        if Some(layout_id) == root {
+            if !unchanged {
+                window.relayout_in_place(layout_id, bounds.size.into(), cx);
+                window.request_animation_frame();
+            }
+            element.prepaint(window, cx);
+        } else {
+            element.layout_as_root(bounds.size.into(), window, cx);
+            element.prepaint_at(bounds.origin, window, cx);
+            window.request_animation_frame();
+        }
+        let record =
+            window.finish_retained_prepaint(recording, bounds, layout, Some(dependencies), cx);
+        ViewPrepaint::Built { element, record }
+    }
+
+    /// Paints the view as [`Element::paint`] does.
+    pub(crate) fn paint_view(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        prepaint: &mut ViewPrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(entity_id) = self.entity_id {
+            // Stateful path.
+            paint_view(entity_id, global_id, &mut prepaint.0, window, cx);
+        } else {
+            // Stateless path: just paint the element.
+            paint_component(std::any::type_name::<V>(), &mut prepaint.0, window, cx);
+        }
+    }
+}
+
+#[inline(never)]
+fn paint_view(
+    entity_id: EntityId,
+    global_id: Option<&GlobalElementId>,
+    prepaint: &mut ViewPrepaint,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.with_rendered_view(entity_id, |window| match prepaint {
+        ViewPrepaint::Reused(index) => window.reuse_retained_paint(*index),
+        ViewPrepaint::Built {
+            element,
+            record: None,
+        } => element.paint(window, cx),
+        ViewPrepaint::Built {
+            element,
+            record: Some(record),
+        } => {
+            let global_id = global_id.expect("a view always has an id");
+            let recording = window.begin_retained_paint(Some(*record), global_id, cx);
+            element.paint(window, cx);
+            window.finish_retained_paint(recording, cx);
+        }
+    });
+}
+
+#[inline(never)]
+fn paint_component(
+    name: &'static str,
+    prepaint: &mut ViewPrepaint,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ViewPrepaint::Built { element, .. } = prepaint else {
+        unreachable!("a stateless view is always built");
+    };
+    window.with_id(ElementId::Name(name.into()), |window| {
+        element.paint(window, cx);
+    });
+}

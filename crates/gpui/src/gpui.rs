@@ -105,6 +105,7 @@ pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
+pub use fast::memo::{AnyMemoKey, ContentHash, Memo, MemoPrepaint, Version, memo};
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
