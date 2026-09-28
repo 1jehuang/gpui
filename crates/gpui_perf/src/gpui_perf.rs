@@ -8,6 +8,7 @@
 //! headlessly, with real text shaping, once with retained views and once
 //! without, and reports what each frame cost.
 
+pub mod alloc;
 pub mod runner;
 pub mod scenarios;
 
@@ -42,5 +43,6 @@ pub fn all_scenarios() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(scenarios::list::scenarios());
     scenarios.extend(scenarios::table::scenarios());
     scenarios.extend(scenarios::settings::scenarios());
+    scenarios.extend(scenarios::layout::scenarios());
     scenarios
 }

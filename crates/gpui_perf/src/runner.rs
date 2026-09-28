@@ -19,6 +19,9 @@
 //! Times are per-thread CPU time (`CLOCK_THREAD_CPUTIME_ID`) where available,
 //! which doesn't count time the thread spent descheduled; wall time is kept
 //! alongside.
+//!
+//! Allocations are counted process-wide by [`crate::alloc::CountingAllocator`]
+//! when the binary installs it, and, like time, exclude the step's own.
 
 use std::{
     borrow::Cow,
@@ -33,7 +36,7 @@ use gpui::{
 };
 use serde::Serialize;
 
-use crate::{Scenario, all_scenarios};
+use crate::{Scenario, alloc::allocations, all_scenarios};
 
 /// Which retention modes to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +170,10 @@ pub struct RunReport {
     /// What `Scenario::step` itself took; not part of `frame`.
     pub step: Summary,
     pub phases: PhaseAverages,
+    /// Allocations per frame, step excluded.
+    pub allocations: f64,
+    /// Bytes allocated per frame, in KiB, step excluded.
+    pub allocated_kib: f64,
     /// Measured frames whose step left the window clean, drawn explicitly.
     pub forced_draws: usize,
 }
@@ -372,6 +379,8 @@ struct FrameSample {
     cost_wall: Duration,
     step: Duration,
     forced: bool,
+    allocations: u64,
+    allocated_bytes: u64,
 }
 
 fn draws_so_far(cx: &mut HeadlessAppContext, window: AnyWindowHandle) -> u64 {
@@ -390,12 +399,23 @@ fn frame(
 ) -> FrameSample {
     let draws_before = draws_so_far(cx, window);
 
+    let allocations_before = allocations();
     let start = Stamp::now();
-    let (step, step_wall) = cx
+    let (step, step_wall, step_allocations) = cx
         .update_window(window, |_, window, cx| {
+            let allocations_before = allocations();
             let start = Stamp::now();
             scenario.step(root, frame, window, cx);
-            start.elapsed()
+            let (step, step_wall) = start.elapsed();
+            let allocations_after = allocations();
+            (
+                step,
+                step_wall,
+                (
+                    allocations_after.0 - allocations_before.0,
+                    allocations_after.1 - allocations_before.1,
+                ),
+            )
         })
         .unwrap();
     cx.run_until_parked();
@@ -413,12 +433,17 @@ fn frame(
         cost += cpu;
         cost_wall += wall;
     }
+    let allocations_after = allocations();
 
     FrameSample {
         cost,
         cost_wall,
         step,
         forced,
+        allocations: (allocations_after.0 - allocations_before.0)
+            .saturating_sub(step_allocations.0),
+        allocated_bytes: (allocations_after.1 - allocations_before.1)
+            .saturating_sub(step_allocations.1),
     }
 }
 
@@ -439,13 +464,18 @@ fn measure(index: usize, retention: bool, options: &Options) -> RunReport {
     let mut costs_wall = Vec::with_capacity(options.frames);
     let mut steps = Vec::with_capacity(options.frames);
     let mut forced_draws = 0;
+    let mut allocation_count = 0;
+    let mut allocated_bytes = 0;
     for n in 0..options.frames {
         let sample = frame(&mut cx, window, &*scenario, &root, options.warmup + n);
         costs.push(sample.cost);
         costs_wall.push(sample.cost_wall);
         steps.push(sample.step);
         forced_draws += sample.forced as usize;
+        allocation_count += sample.allocations;
+        allocated_bytes += sample.allocated_bytes;
     }
+    let frames = options.frames.max(1) as f64;
 
     let stats = cx
         .update_window(window, |_, window, _| window.layout_stats())
@@ -460,6 +490,8 @@ fn measure(index: usize, retention: bool, options: &Options) -> RunReport {
         frame_wall: Summary::of(&costs_wall),
         step: Summary::of(&steps),
         phases: PhaseAverages::of(&stats, options.frames),
+        allocations: allocation_count as f64 / frames,
+        allocated_kib: allocated_bytes as f64 / 1024. / frames,
         forced_draws,
     }
 }
@@ -597,7 +629,7 @@ pub fn format_reports(reports: &[ScenarioReport]) -> String {
         let _ = writeln!(out);
 
         type Row = (&'static str, fn(&RunReport) -> f64, usize);
-        let rows: [Row; 19] = [
+        let rows: [Row; 21] = [
             ("frame mean ms", |r| r.frame.mean_ms, 3),
             ("frame p50 ms", |r| r.frame.p50_ms, 3),
             ("frame p95 ms", |r| r.frame.p95_ms, 3),
@@ -616,6 +648,8 @@ pub fn format_reports(reports: &[ScenarioReport]) -> String {
             ("measure rebinds", |r| r.phases.measure_rebinds, 1),
             ("layout computes", |r| r.phases.compute_layout_calls, 1),
             ("draws", |r| r.phases.draws, 2),
+            ("allocations", |r| r.allocations, 1),
+            ("allocated KiB", |r| r.allocated_kib, 1),
             ("step ms (not counted)", |r| r.step.mean_ms, 3),
         ];
         for (label, value, precision) in rows {

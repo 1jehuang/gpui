@@ -2612,15 +2612,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui_benchmarks"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "gpui",
- "gpui_platform",
-]
-
-[[package]]
 name = "gpui_linux"
 version = "0.1.0"
 dependencies = [

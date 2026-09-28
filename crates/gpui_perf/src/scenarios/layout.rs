@@ -1,25 +1,117 @@
-//! Fixtures for GPUI benchmarks.
+//! A watchlist: a toolbar above a table of quote rows, redrawn every frame
+//! with exactly one kind of change.
 //!
-//! [`QuoteTable`] is a deliberately ordinary application view: a scrolling table
-//! of rows, each built from nested flex containers with a mix of fixed-width
-//! columns and content-sized ones. It exists to exercise the layout engine with
-//! a tree whose *shape* is stable across frames while its *content* is not,
-//! which is the common case in a live application and the case the layout
-//! engine has the most room to exploit.
+//! Where the other scenarios simulate what a user does, these isolate what the
+//! layout engine charges for a given kind of change. The tree's *shape* is
+//! stable across frames while its *content* is not, which is the common case
+//! in a live application. `layout-unchanged` is the floor, `layout-colors`
+//! changes nothing the layout engine can see, `layout-text` changes leaf
+//! measurements, and the `layout-rows*` scenarios change the shape of the
+//! tree.
 
 use gpui::{
-    AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StyleRefinement, Styled, Window, div, hsla, px,
+    AnyView, App, AppContext as _, Context, Entity, FontWeight, Hsla, IntoElement, Render,
+    SharedString, Window, div, hsla, prelude::*, px,
 };
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
+    vec![
+        Box::new(LayoutScenario {
+            name: "layout-unchanged",
+            description: "A 200-row watchlist whose model is untouched; the view is only asked to redraw.",
+            mutation: Mutation::None,
+            keyed: false,
+            panel: false,
+        }),
+        Box::new(LayoutScenario {
+            name: "layout-colors",
+            description: "A 200-row watchlist where every row changes color each frame, and nothing else.",
+            mutation: Mutation::Colors,
+            keyed: false,
+            panel: false,
+        }),
+        Box::new(LayoutScenario {
+            name: "layout-text",
+            description: "A 200-row watchlist where every row's numeric cells change text each frame.",
+            mutation: Mutation::Text,
+            keyed: false,
+            panel: false,
+        }),
+        Box::new(LayoutScenario {
+            name: "layout-rows",
+            description: "A 200-row watchlist that adds and removes rows at the end each frame.",
+            mutation: Mutation::Rows,
+            keyed: false,
+            panel: false,
+        }),
+        Box::new(LayoutScenario {
+            name: "layout-rows-at-head",
+            description: "A 200-row watchlist that adds and removes rows at the front each frame, rows keyed by position.",
+            mutation: Mutation::RowsAtHead,
+            keyed: false,
+            panel: false,
+        }),
+        Box::new(LayoutScenario {
+            name: "layout-rows-at-head-keyed",
+            description: "A 200-row watchlist that adds and removes rows at the front each frame, each row carrying its own ElementId.",
+            mutation: Mutation::RowsAtHead,
+            keyed: true,
+            panel: false,
+        }),
+        Box::new(LayoutScenario {
+            name: "layout-panel",
+            description: "A 200-row watchlist whose cells change text each frame, beside a 200-entry panel that never changes.",
+            mutation: Mutation::Text,
+            keyed: false,
+            panel: true,
+        }),
+    ]
+}
+
+const ROW_COUNT: usize = 200;
+
+struct LayoutScenario {
+    name: &'static str,
+    description: &'static str,
+    mutation: Mutation,
+    keyed: bool,
+    panel: bool,
+}
+
+impl crate::Scenario for LayoutScenario {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn description(&self) -> &'static str {
+        self.description
+    }
+
+    fn build(&self, _: &mut Window, cx: &mut App) -> AnyView {
+        let (mutation, keyed, panel) = (self.mutation, self.keyed, self.panel);
+        cx.new(|cx| {
+            let mut table = QuoteTable::new(ROW_COUNT, mutation);
+            table.keyed = keyed;
+            if panel {
+                table.panel = Some(cx.new(|_| StaticPanel { entries: ROW_COUNT }));
+            }
+            table
+        })
+        .into()
+    }
+
+    fn step(&self, root: &AnyView, _: usize, _: &mut Window, cx: &mut App) {
+        let table: Entity<QuoteTable> = root.clone().downcast().unwrap();
+        table.update(cx, |table, cx| {
+            table.tick();
+            cx.notify();
+        });
+    }
+}
 
 /// How a frame differs from the one before it.
-///
-/// Each variant isolates one kind of change so a benchmark can attribute layout
-/// cost to it rather than to an undifferentiated "redraw".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mutation {
+enum Mutation {
     /// The model is untouched; the view is only asked to redraw.
     None,
     /// Colors change. No text and no geometry changes, so nothing that reaches
@@ -57,7 +149,7 @@ impl Row {
             last: SharedString::default(),
             change: SharedString::default(),
             volume: SharedString::default(),
-            up: index % 3 != 0,
+            up: !index.is_multiple_of(3),
         };
         row.symbol = format!("{:04}.HK", (index * 37) % 9999).into();
         row.name = NAMES[index % NAMES.len()].into();
@@ -97,7 +189,7 @@ const NAMES: &[&str] = &[
 /// A panel that never changes, standing in for the parts of an application that
 /// are redrawn every frame despite having nothing new to say: sidebars,
 /// toolbars, status bars, inactive tabs.
-pub struct StaticPanel {
+struct StaticPanel {
     entries: usize,
 }
 
@@ -126,7 +218,7 @@ impl Render for StaticPanel {
 }
 
 /// A watchlist-shaped view: a toolbar above a table of quote rows.
-pub struct QuoteTable {
+struct QuoteTable {
     rows: Vec<Row>,
     base_row_count: usize,
     tick: u64,
@@ -139,14 +231,10 @@ pub struct QuoteTable {
     keyed: bool,
     /// The half of the interface that has nothing new to say each frame.
     panel: Option<Entity<StaticPanel>>,
-    /// Whether that half is embedded as a cached view, which decides whether
-    /// its subtree is rendered again every frame or reused.
-    cache_panel: bool,
 }
 
 impl QuoteTable {
-    /// Builds a table of `row_count` rows that will apply `mutation` on each tick.
-    pub fn new(row_count: usize, mutation: Mutation) -> Self {
+    fn new(row_count: usize, mutation: Mutation) -> Self {
         QuoteTable {
             rows: (0..row_count).map(Row::new).collect(),
             base_row_count: row_count,
@@ -155,28 +243,7 @@ impl QuoteTable {
             mutation,
             keyed: false,
             panel: None,
-            cache_panel: false,
         }
-    }
-
-    /// Adds a panel of `entries` rows that never changes, and says whether to
-    /// embed it as a cached view.
-    pub fn with_static_panel(
-        mut self,
-        entries: usize,
-        cached: bool,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        self.panel = Some(cx.new(|_| StaticPanel { entries }));
-        self.cache_panel = cached;
-        self
-    }
-
-    /// Gives every row an `ElementId` derived from its own identity rather than
-    /// from where it currently sits.
-    pub fn keyed(mut self, keyed: bool) -> Self {
-        self.keyed = keyed;
-        self
     }
 
     fn new_row(&mut self) -> Row {
@@ -187,7 +254,7 @@ impl QuoteTable {
     }
 
     /// Advances the model by one frame's worth of change.
-    pub fn tick(&mut self) {
+    fn tick(&mut self) {
         self.tick += 1;
         match self.mutation {
             Mutation::None => {}
@@ -237,25 +304,13 @@ const DOWN: Hsla = hsla(0.99, 0.60, 0.60, 1.0);
 
 impl Render for QuoteTable {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let panel = self.panel.clone().map(|panel| {
-            if self.cache_panel {
-                // A definite size is what the current API asks for in exchange
-                // for skipping the subtree's render.
-                panel
-                    .cached(StyleRefinement::default().w(px(240.)).h(px(4000.)))
-                    .into_any_element()
-            } else {
-                panel.into_any_element()
-            }
-        });
-
         div()
             .flex()
             .flex_row()
             .size_full()
             .bg(BG)
             .text_color(FG)
-            .children(panel)
+            .children(self.panel.clone())
             .child(
                 div()
                     .flex()
@@ -271,11 +326,7 @@ impl Render for QuoteTable {
                             .py_2()
                             .border_b_1()
                             .border_color(BORDER)
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child("Watchlist"),
-                            )
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("Watchlist"))
                             .child(div().flex_1())
                             .children(["All", "HK", "US", "A"].map(|label| {
                                 div()
@@ -344,88 +395,4 @@ impl Render for QuoteTable {
                     })),
             )
     }
-}
-
-/// Prints the layout work behind a benchmark, averaged per frame.
-///
-/// Criterion reports how long a frame took; these counters say where the time
-/// went, which is what tells a real improvement apart from a benchmark that
-/// merely stopped doing the work it was supposed to measure.
-pub fn report_layout_stats(label: &str, stats: gpui::LayoutStats, allocations: (u64, u64)) {
-    let frames = stats.frames.max(1);
-    let per_frame = |n: u64| n as f64 / frames as f64;
-    let touched = stats.nodes_created + stats.nodes_reused;
-    let reuse_pct = if touched == 0 {
-        0.0
-    } else {
-        100.0 * stats.nodes_reused as f64 / touched as f64
-    };
-    println!(
-        "\n  layout/{label}: {frames} frames\n    \
-         nodes/frame       {:>9.1} created  {:>9.1} reused  ({reuse_pct:.1}% reused)\n    \
-         writes/frame      {:>9.1} style    {:>9.1} children  {:>9.1} measure-rebind\n    \
-         style compares    {:>9.1}/frame\n    \
-         measure calls     {:>9.1}/frame  {:>9.1}µs/frame ({:.0}% answered from a kept result)\n    \
-         taffy compute     {:>9.1}µs/frame ({:.1} calls/frame), of which {:.0}% is measuring\n    \
-         frame phases      {:>9.1}µs build  {:>9.1}µs prepaint  {:>9.1}µs paint\n    \
-         allocations       {:>9.1}/frame  {:>9.1} KiB/frame",
-        per_frame(stats.nodes_created),
-        per_frame(stats.nodes_reused),
-        per_frame(stats.style_writes),
-        per_frame(stats.children_writes),
-        per_frame(stats.measure_rebinds),
-        per_frame(stats.style_compares),
-        per_frame(stats.measure_calls),
-        stats.measure_time.as_secs_f64() * 1e6 / frames as f64,
-        if stats.measure_calls == 0 {
-            0.0
-        } else {
-            100.0 * stats.measure_reuses as f64 / stats.measure_calls as f64
-        },
-        stats.compute_layout_time.as_secs_f64() * 1e6 / frames as f64,
-        per_frame(stats.compute_layout_calls),
-        if stats.compute_layout_time.is_zero() {
-            0.0
-        } else {
-            100.0 * stats.measure_time.as_secs_f64() / stats.compute_layout_time.as_secs_f64()
-        },
-        stats.build_time.as_secs_f64() * 1e6 / frames as f64,
-        stats.prepaint_time.as_secs_f64() * 1e6 / frames as f64,
-        stats.paint_time.as_secs_f64() * 1e6 / frames as f64,
-        allocations.0 as f64 / frames as f64,
-        allocations.1 as f64 / 1024.0 / frames as f64,
-    );
-}
-
-/// Counts every allocation the process makes, so a frame's cost can be split
-/// into work the allocator did and work it did not.
-pub struct CountingAllocator;
-
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        ALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-/// Allocations and bytes handed out so far.
-pub fn allocations() -> (u64, u64) {
-    (
-        ALLOCATIONS.load(Ordering::Relaxed),
-        ALLOCATED_BYTES.load(Ordering::Relaxed),
-    )
 }

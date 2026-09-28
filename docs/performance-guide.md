@@ -270,10 +270,19 @@ times take a clock read per measurement, so they are kept only once
 
 `crates/gpui_perf` drives simulated application screens — forms, lists, a data
 table, a settings page — headlessly with real text shaping, with retained views
-on and off, and compares what each frame cost:
+on and off, and compares what each frame cost, allocations included:
 
 ```sh
 cargo run -p gpui_perf --release
+```
+
+Its `layout-*` scenarios redraw one watchlist with exactly one kind of change
+per frame — nothing, colors, text, rows at the end, rows at the front with and
+without an `ElementId` per row — to isolate what the layout engine charges for
+each:
+
+```sh
+cargo run -p gpui_perf --release -- --scenario layout
 ```
 
 Two benchmarks draw through a real window:

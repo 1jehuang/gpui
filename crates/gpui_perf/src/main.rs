@@ -19,7 +19,13 @@
 
 use std::process::ExitCode;
 
-use gpui_perf::runner::{self, Options, RetentionModes};
+use gpui_perf::{
+    alloc::CountingAllocator,
+    runner::{self, Options, RetentionModes},
+};
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 const USAGE: &str = "usage: gpui_perf [--scenario SUBSTRING]... [--frames N] [--warmup N] \
 [--retention on|off|both] [--json PATH] [--verify] [--list]";
