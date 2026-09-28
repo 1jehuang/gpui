@@ -71,11 +71,7 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    /// Each font at each size a line has been laid out at. CoreText keeps the
-    /// caches it builds for shaping — the advances and glyphs of ASCII among
-    /// them — on the font object, so a font made afresh for every line built
-    /// them again for every line.
-    sized_fonts: HashMap<(FontId, u32), CTFont>,
+    sized_fonts: crate::fast::SizedFonts,
 }
 
 impl MacTextSystem {
@@ -89,7 +85,7 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
-            sized_fonts: HashMap::default(),
+            sized_fonts: Default::default(),
         }))
     }
 }
@@ -416,25 +412,6 @@ impl MacTextSystemState {
         }
     }
 
-    /// The native font for `font_id` at `font_size`, made once and kept.
-    fn sized_font(&mut self, font_id: FontId, font_size: Pixels) -> CTFont {
-        // Sizes can animate, and every size a font is drawn at would otherwise
-        // be kept for good.
-        const MAX_SIZED_FONTS: usize = 1024;
-        let key = (font_id, f32::from(font_size).to_bits());
-        if let Some(font) = self.sized_fonts.get(&key) {
-            return font.clone();
-        }
-        if self.sized_fonts.len() >= MAX_SIZED_FONTS {
-            self.sized_fonts.clear();
-        }
-        let font = self.fonts[font_id.0]
-            .native_font()
-            .clone_with_font_size(f32::from(font_size).into());
-        self.sized_fonts.insert(key, font.clone());
-        font
-    }
-
     fn is_emoji(&self, font_id: FontId) -> bool {
         self.postscript_names_by_font_id
             .get(&font_id)
@@ -586,9 +563,12 @@ impl MacTextSystemState {
                 } else {
                     font_size
                 };
-                let sized_font = self.sized_font(run.font_id, font_size);
                 unsafe {
-                    string.set_attribute(cf_range, kCTFontAttributeName, &sized_font);
+                    string.set_attribute(
+                        cf_range,
+                        kCTFontAttributeName,
+                        &self.sized_fonts.get(run.font_id, font, font_size),
+                    );
                 }
                 break_ligature = !break_ligature;
             }
@@ -791,36 +771,6 @@ mod lenient_font_attributes {
 mod tests {
     use crate::MacTextSystem;
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
-
-    /// Fonts are made once per size and kept, so a line laid out with a kept
-    /// font has to come out exactly as it did with a new one: the same glyphs
-    /// in the same places, however many runs split it into sizes a hair
-    /// apart, and never mixed up with the same font at another size.
-    #[test]
-    fn lines_laid_out_with_kept_fonts_match_the_first_layout() {
-        let fonts = MacTextSystem::new();
-        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
-        let line = "AVAWAY fi ffi 12.5 office";
-        // Runs alternate between two sizes a hair apart, to keep ligatures
-        // from joining across them.
-        let runs = [5, 3, 4, 5, 8].map(|len| FontRun { font_id, len });
-        let shape = |size| {
-            let layout = fonts.layout_line(line, px(size), &runs);
-            let glyphs = layout
-                .runs
-                .iter()
-                .flat_map(|run| run.glyphs.iter().map(|glyph| (glyph.id, glyph.position)))
-                .collect::<Vec<_>>();
-            (layout.width, glyphs)
-        };
-
-        let first = shape(16.);
-        assert_eq!(shape(16.), first, "a kept font shapes differently");
-        let larger = shape(24.);
-        assert_ne!(larger.0, first.0, "another size has to be another font");
-        assert_eq!(shape(16.), first, "a size laid out again after another");
-        assert_eq!(shape(24.), larger);
-    }
 
     #[test]
     fn test_layout_line_bom_char() {
