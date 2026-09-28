@@ -113,6 +113,7 @@ impl FramePhaseTimes {
     }
 
     /// Zeroes the times, leaving a phase being timed to go on being timed.
+    #[cfg(any(test, feature = "test-support"))]
     fn reset(&mut self) {
         self.build = Duration::ZERO;
         self.prepaint = Duration::ZERO;
@@ -147,13 +148,15 @@ impl MeasureTally {
 
 impl TaffyLayoutEngine {
     /// Counters for the work performed since the last call to [`Self::reset_stats`].
-    pub fn stats(&self) -> LayoutStats {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn stats(&self) -> LayoutStats {
         self.retention.stats
     }
 
     /// Zeroes the counters returned by [`Self::stats`].
     /// From then on the times are kept too.
-    pub fn reset_stats(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reset_stats(&mut self) {
         self.retention.stats = LayoutStats::default();
         self.retention.timed = true;
     }
@@ -191,6 +194,7 @@ impl Window {
     /// than only moving it around: `nodes_reused` against `nodes_created` shows
     /// how much of the tree survived the frame, and `style_writes` shows how
     /// much of it was dirtied again anyway.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn layout_stats(&self) -> LayoutStats {
         let phases = &self.fast_layout.phase_times;
         let (lines_shaped, shape_time) = self.text_system().shaping_stats();
@@ -205,6 +209,7 @@ impl Window {
     }
 
     /// Zeroes the counters reported by [`Window::layout_stats`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reset_layout_stats(&mut self) {
         self.fast_layout.phase_times.reset();
         self.layout_engine.as_mut().unwrap().reset_stats();
@@ -221,6 +226,7 @@ impl Window {
     }
 
     /// How many layout nodes this window is currently holding on to.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn layout_node_count(&self) -> usize {
         self.layout_engine.as_ref().unwrap().node_count()
     }

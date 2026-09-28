@@ -23,7 +23,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
 };
 
 // Text measurement.
@@ -505,15 +504,17 @@ impl LineShaping {
     /// How many lines have been shaped, and how long that took, since the last
     /// [`LineShaping::reset`]. A line answered from the cache is not counted,
     /// so this is the text work the cache failed to save.
-    pub(crate) fn stats(&self) -> (u64, Duration) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn stats(&self) -> (u64, std::time::Duration) {
         (
             self.lines_shaped.load(Ordering::Relaxed),
-            Duration::from_nanos(self.shape_nanos.load(Ordering::Relaxed)),
+            std::time::Duration::from_nanos(self.shape_nanos.load(Ordering::Relaxed)),
         )
     }
 
     /// Zeroes the counters reported by [`LineShaping::stats`], and from then
     /// on times shaping too.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reset(&self) {
         self.lines_shaped.store(0, Ordering::Relaxed);
         self.shape_nanos.store(0, Ordering::Relaxed);
@@ -542,11 +543,13 @@ impl LineShaping {
 impl WindowTextSystem {
     /// Lines shaped by the platform, and the time that took, since the last
     /// [`Self::reset_shaping_stats`]. Lines answered from the cache do not count.
-    pub(crate) fn shaping_stats(&self) -> (u64, Duration) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn shaping_stats(&self) -> (u64, std::time::Duration) {
         self.line_layout_cache.shaping.stats()
     }
 
     /// Zeroes the counters reported by [`Self::shaping_stats`].
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reset_shaping_stats(&self) {
         self.line_layout_cache.shaping.reset()
     }

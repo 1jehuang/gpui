@@ -149,14 +149,26 @@ fn a_cached_view_covered_while_hovered_is_rendered_on_the_next_frame() {
             cx.notify();
         })
         .unwrap();
+    let frame_asked_for = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, _| {
+            !window.next_frame_callbacks.borrow().is_empty()
+        })
+        .unwrap()
+    };
+    let mut asked_for_a_frame = frame_asked_for(&mut cx);
     let mut look = None;
     for _ in 0..3 {
         if builds.get() > builds_before {
             break;
         }
+        asked_for_a_frame |= frame_asked_for(&mut cx);
         look = Some(draw(&mut cx, window));
     }
     assert_eq!(builds.get(), builds_before + 1);
+    assert!(
+        asked_for_a_frame,
+        "a frame should be asked for to render it"
+    );
     assert_ne!(Some(hovered), look);
 }
 
@@ -243,7 +255,7 @@ fn draw_siblings(cx: &mut TestAppContext, window: WindowHandle<Siblings>) -> Vec
     .unwrap()
 }
 
-/// A view that is neither cached nor memoized is drawn again from the
+/// A view that is not cached is drawn again from the
 /// last frame while nothing it read changed, even when the view around it
 /// is rendered again, and rendered again once something it read did.
 #[test]
@@ -328,4 +340,343 @@ fn views_are_rendered_every_frame_without_retention() {
     s.window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
     draw_siblings(&mut cx, s.window);
     assert!(s.first_builds.get() > before.0 && s.second_builds.get() > before.1);
+}
+
+struct Sized {
+    row: Entity<Row>,
+    width: f32,
+}
+
+impl Render for Sized {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().child(
+            self.row
+                .clone()
+                .cached(StyleRefinement::default().w(px(self.width)).h(px(20.))),
+        )
+    }
+}
+
+/// A cached view is rendered again when its bounds change or the window is
+/// refreshed, and otherwise reused, showing what it showed.
+#[test]
+fn a_cached_view_is_rendered_again_only_when_it_has_to_be() {
+    let mut cx = TestAppContext::single();
+    let builds = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let builds = builds.clone();
+        move |_, cx| Sized {
+            row: cx.new(|_| Row { label: 0, builds }),
+            width: 100.,
+        }
+    });
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.describe_rendered_frame()
+        })
+        .unwrap()
+    };
+    let change = |cx: &mut TestAppContext, f: fn(&mut Sized)| {
+        window
+            .update(cx, |view, _, cx| {
+                f(view);
+                cx.notify();
+            })
+            .unwrap()
+    };
+
+    let first = draw(&mut cx);
+    assert_eq!(builds.get(), 1);
+    change(&mut cx, |_| {});
+    assert_eq!(first, draw(&mut cx), "a reused view shows what it showed");
+    assert_eq!(builds.get(), 1);
+
+    change(&mut cx, |view| view.width = 150.);
+    draw(&mut cx);
+    assert_eq!(builds.get(), 2, "new bounds render it again");
+
+    cx.update_window(window.into(), |_, window, _| window.refresh())
+        .unwrap();
+    draw(&mut cx);
+    assert_eq!(builds.get(), 3, "a refreshed window renders every view");
+
+    cx.simulate_window_resize(window.into(), crate::size(px(800.), px(600.)));
+    draw(&mut cx);
+    change(&mut cx, |_| {});
+    draw(&mut cx);
+    assert_eq!(
+        builds.get(),
+        4,
+        "a resize refreshes once, then it is reused"
+    );
+}
+
+struct PopoverRow {
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for PopoverRow {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        div().size_full().child(crate::deferred(
+            div()
+                .id("popover")
+                .w(px(50.))
+                .h(px(20.))
+                .bg(crate::black())
+                .hover(|style| style.bg(crate::white())),
+        ))
+    }
+}
+
+struct WithPopover {
+    row: Entity<PopoverRow>,
+}
+
+impl Render for WithPopover {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().child(
+            self.row
+                .clone()
+                .cached(StyleRefinement::default().w(px(100.)).h(px(20.))),
+        )
+    }
+}
+
+/// Something a cached view draws deferred, such as a popover, is prepainted
+/// and painted after the view, but is part of what the view drew: the pointer
+/// moving over it changes how the view looks.
+#[test]
+fn a_cached_view_is_rendered_again_when_the_pointer_moves_over_what_it_deferred() {
+    let mut cx = TestAppContext::single();
+    let builds = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let builds = builds.clone();
+        move |_, cx| WithPopover {
+            row: cx.new(|_| PopoverRow { builds }),
+        }
+    });
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.describe_rendered_frame()
+        })
+        .unwrap()
+    };
+    let move_to = |cx: &mut TestAppContext, x: f32, y: f32| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_mouse_move(crate::point(px(x), px(y)), cx);
+        })
+        .unwrap();
+    };
+
+    // The pointer starts out at the origin, over the popover.
+    draw(&mut cx);
+    assert_eq!(builds.get(), 1);
+    move_to(&mut cx, 500., 500.);
+    let away = draw(&mut cx);
+    assert_eq!(
+        builds.get(),
+        2,
+        "the pointer leaving the popover changes its look"
+    );
+    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    draw(&mut cx);
+    assert_eq!(builds.get(), 2, "and nothing else does");
+
+    move_to(&mut cx, 10., 10.);
+    let over = draw(&mut cx);
+    assert_eq!(builds.get(), 3, "the pointer coming back changes it again");
+    assert_ne!(away, over);
+
+    move_to(&mut cx, 500., 500.);
+    let away_again = draw(&mut cx);
+    assert_eq!(builds.get(), 4);
+    assert_eq!(away, away_again);
+}
+
+/// An input handler that answers every question about its text with its
+/// name, so a test can tell which one the platform was handed.
+struct NamedInput(&'static str);
+
+impl crate::InputHandler for NamedInput {
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut crate::App,
+    ) -> Option<crate::UTF16Selection> {
+        None
+    }
+    fn marked_text_range(
+        &mut self,
+        _: &mut Window,
+        _: &mut crate::App,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut crate::App,
+    ) -> Option<String> {
+        Some(self.0.to_string())
+    }
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: &mut Window,
+        _: &mut crate::App,
+    ) {
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut crate::App,
+    ) {
+    }
+    fn unmark_text(&mut self, _: &mut Window, _: &mut crate::App) {}
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Window,
+        _: &mut crate::App,
+    ) -> Option<crate::Bounds<crate::Pixels>> {
+        None
+    }
+    fn character_index_for_point(
+        &mut self,
+        _: crate::Point<crate::Pixels>,
+        _: &mut Window,
+        _: &mut crate::App,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+fn text_input(focus: crate::FocusHandle, name: &'static str) -> impl IntoElement {
+    crate::canvas(
+        |_, _, _| {},
+        move |_, _, window, cx| window.handle_input(&focus, NamedInput(name), cx),
+    )
+    .size_full()
+}
+
+struct Field {
+    focus: crate::FocusHandle,
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for Field {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        text_input(self.focus.clone(), "inside")
+    }
+}
+
+struct Inputs {
+    field: Entity<Field>,
+    outside: crate::FocusHandle,
+    cached_first: bool,
+}
+
+impl Render for Inputs {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let cached = self
+            .field
+            .clone()
+            .cached(StyleRefinement::default().w(px(100.)).h(px(20.)))
+            .into_any_element();
+        let outside = div()
+            .w(px(100.))
+            .h(px(20.))
+            .child(text_input(self.outside.clone(), "outside"))
+            .into_any_element();
+        let children = if self.cached_first {
+            [cached, outside]
+        } else {
+            [outside, cached]
+        };
+        div().children(children)
+    }
+}
+
+/// The input handler of a focused field inside a reused cached view is
+/// handed to the platform on every frame, and a field focused elsewhere
+/// takes over.
+#[test]
+fn a_reused_cached_view_hands_the_platform_its_input_handler() {
+    for cached_first in [true, false] {
+        let mut cx = TestAppContext::single();
+        let builds = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let builds = builds.clone();
+            move |_, cx| Inputs {
+                field: cx.new(|cx| Field {
+                    focus: cx.focus_handle(),
+                    builds,
+                }),
+                outside: cx.focus_handle(),
+                cached_first,
+            }
+        });
+        let (inside, outside) = window
+            .update(&mut cx, |view, _, cx| {
+                (view.field.read(cx).focus.clone(), view.outside.clone())
+            })
+            .unwrap();
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap()
+        };
+        // Asked outside of any update, as the platform asks it.
+        let handed = |cx: &mut TestAppContext| {
+            let mut handler = cx
+                .update_window(window.into(), |_, window, _| {
+                    window.platform_window.take_input_handler()
+                })
+                .unwrap()?;
+            let name = handler.text_for_range(0..1, &mut None);
+            cx.update_window(window.into(), |_, window, _| {
+                window.platform_window.set_input_handler(handler)
+            })
+            .unwrap();
+            name
+        };
+        let focus = |cx: &mut TestAppContext, handle: &crate::FocusHandle| {
+            cx.update_window(window.into(), |_, window, cx| window.focus(handle, cx))
+                .unwrap()
+        };
+
+        focus(&mut cx, &inside);
+        draw(&mut cx);
+        assert_eq!(handed(&mut cx).as_deref(), Some("inside"));
+        let builds_then = builds.get();
+        for _ in 0..3 {
+            window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+            draw(&mut cx);
+            assert_eq!(handed(&mut cx).as_deref(), Some("inside"));
+        }
+        assert_eq!(builds.get(), builds_then, "the cached view was reused");
+
+        focus(&mut cx, &outside);
+        draw(&mut cx);
+        assert_eq!(handed(&mut cx).as_deref(), Some("outside"));
+        window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        draw(&mut cx);
+        assert_eq!(handed(&mut cx).as_deref(), Some("outside"));
+
+        focus(&mut cx, &inside);
+        draw(&mut cx);
+        window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        draw(&mut cx);
+        assert_eq!(handed(&mut cx).as_deref(), Some("inside"));
+    }
 }

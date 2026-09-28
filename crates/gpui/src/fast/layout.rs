@@ -43,10 +43,10 @@ pub(crate) struct LayoutRetention {
     /// orphaned and the sweep can be skipped entirely.
     claimed_this_frame: usize,
     /// The keys claimed while [`TaffyLayoutEngine::record_claimed_keys`] is
-    /// recording, for a memo to keep its subtree's nodes by. See
-    /// [`crate::memo`].
+    /// recording, for a retained subtree to keep its nodes by. See
+    /// [`crate::fast::retained`].
     claimed_key_log: Vec<u64>,
-    /// How many recordings are open, nested memos each having one.
+    /// How many recordings are open, nested retained subtrees each having one.
     open_key_recordings: usize,
     pub(crate) stats: LayoutStats,
     /// Whether to time layout and measurements. See [`LayoutStats`].
@@ -133,7 +133,8 @@ struct RetainedMeasure {
 impl TaffyLayoutEngine {
     /// How many nodes the tree is currently holding, retained and transient
     /// alike. Used by tests to check that retention does not leak.
-    pub fn node_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn node_count(&self) -> usize {
         self.taffy.total_node_count()
     }
 
@@ -646,7 +647,7 @@ impl TaffyLayoutEngine {
     /// Computing a layout from a node treats it as a root and moves it to the
     /// origin; its absolute position, worked out before, is put back so that
     /// the bounds of everything under it are found relative to it as before.
-    pub fn relayout_in_place(
+    pub(crate) fn relayout_in_place(
         &mut self,
         id: LayoutId,
         available_space: Size<AvailableSpace>,

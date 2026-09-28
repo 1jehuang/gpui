@@ -20,7 +20,6 @@ pub(crate) mod interactivity;
 pub(crate) mod keyed;
 pub(crate) mod layout;
 pub(crate) mod layout_key;
-pub(crate) mod memo;
 pub(crate) mod retained;
 pub(crate) mod scene;
 pub(crate) mod stats;
