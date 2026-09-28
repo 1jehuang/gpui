@@ -16,6 +16,7 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::StateVersion;
+use crate::fast::{Aria, LazyVec};
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
@@ -38,7 +39,6 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     mem,
-    ops::{Deref, DerefMut},
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -2096,111 +2096,6 @@ impl IntoElement for Div {
 
     fn into_element(self) -> Self::Element {
         self
-    }
-}
-
-/// An element's accessibility properties, allocated once one of them is set.
-///
-/// Most elements set none, and an [`Interactivity`] moves with its element
-/// through every call of its builder, so the properties' 300-odd bytes are
-/// kept out of it until they are needed.
-#[derive(Default)]
-pub(crate) struct Aria(Option<Box<AriaProperties>>);
-
-static NO_ARIA: AriaProperties = AriaProperties {
-    author_id: None,
-    label: None,
-    description: None,
-    keyshortcuts: None,
-    selected: None,
-    expanded: None,
-    toggled: None,
-    numeric_value: None,
-    min_numeric_value: None,
-    max_numeric_value: None,
-    numeric_value_step: None,
-    value: None,
-    placeholder: None,
-    orientation: None,
-    level: None,
-    position_in_set: None,
-    size_of_set: None,
-    row_index: None,
-    column_index: None,
-    row_count: None,
-    column_count: None,
-};
-
-impl Deref for Aria {
-    type Target = AriaProperties;
-
-    fn deref(&self) -> &AriaProperties {
-        self.0.as_deref().unwrap_or(&NO_ARIA)
-    }
-}
-
-impl DerefMut for Aria {
-    fn deref_mut(&mut self) -> &mut AriaProperties {
-        self.0.get_or_insert_with(Default::default)
-    }
-}
-
-/// A list one pointer wide that allocates nothing while it is empty.
-///
-/// An [`Interactivity`] holds a score of listener lists, nearly all of them
-/// empty on any one element, and moves with its element through every call
-/// of its builder. As `Vec`s they were 500 of its bytes, copied every time.
-// A boxed `Vec` is one pointer where a `Vec` is three, which is the point;
-// the second allocation is paid only by a list that has something in it.
-#[allow(clippy::box_collection)]
-pub(crate) struct LazyVec<T>(Option<Box<Vec<T>>>);
-
-impl<T> Default for LazyVec<T> {
-    fn default() -> Self {
-        LazyVec(None)
-    }
-}
-
-impl<T: Clone> Clone for LazyVec<T> {
-    fn clone(&self) -> Self {
-        LazyVec(self.0.clone())
-    }
-}
-
-impl<T> LazyVec<T> {
-    pub(crate) fn push(&mut self, item: T) {
-        self.0.get_or_insert_with(Default::default).push(item);
-    }
-
-    /// Takes every item out, leaving the list empty.
-    pub(crate) fn drain(&mut self, _: std::ops::RangeFull) -> std::vec::IntoIter<T> {
-        mem::take(self).into_iter()
-    }
-}
-
-impl<T> Deref for LazyVec<T> {
-    type Target = [T];
-
-    fn deref(&self) -> &[T] {
-        self.0.as_deref().map_or(&[], Vec::as_slice)
-    }
-}
-
-impl<T> IntoIterator for LazyVec<T> {
-    type Item = T;
-    type IntoIter = std::vec::IntoIter<T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.map(|items| *items).unwrap_or_default().into_iter()
-    }
-}
-
-impl<'a, T> IntoIterator for &'a LazyVec<T> {
-    type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
     }
 }
 
