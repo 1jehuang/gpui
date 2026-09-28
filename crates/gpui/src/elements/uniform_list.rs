@@ -148,9 +148,8 @@ impl UniformListScrollHandle {
     /// If the item is out of view, it scrolls the minimum amount to bring it into view according
     /// to the strategy.
     pub fn scroll_to_item(&self, ix: usize, strategy: ScrollStrategy) {
-        let mut state = self.0.borrow_mut();
-        state.base_handle.changed();
-        state.deferred_scroll_to_item = Some(DeferredScrollToItem {
+        self.0.borrow().base_handle.changed();
+        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset: 0,
@@ -163,9 +162,8 @@ impl UniformListScrollHandle {
     /// This uses strict scrolling: the item will always be scrolled to match the strategy position,
     /// even if it's already visible. Use this when you need precise positioning.
     pub fn scroll_to_item_strict(&self, ix: usize, strategy: ScrollStrategy) {
-        let mut state = self.0.borrow_mut();
-        state.base_handle.changed();
-        state.deferred_scroll_to_item = Some(DeferredScrollToItem {
+        self.0.borrow().base_handle.changed();
+        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset: 0,
@@ -184,9 +182,8 @@ impl UniformListScrollHandle {
     /// - `ScrollStrategy::Center`: Shrinks from top, centers item in the reduced viewport
     /// - `ScrollStrategy::Bottom`: Shrinks from bottom, positions item at the new bottom
     pub fn scroll_to_item_with_offset(&self, ix: usize, strategy: ScrollStrategy, offset: usize) {
-        let mut state = self.0.borrow_mut();
-        state.base_handle.changed();
-        state.deferred_scroll_to_item = Some(DeferredScrollToItem {
+        self.0.borrow().base_handle.changed();
+        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset,
@@ -210,9 +207,8 @@ impl UniformListScrollHandle {
         strategy: ScrollStrategy,
         offset: usize,
     ) {
-        let mut state = self.0.borrow_mut();
-        state.base_handle.changed();
-        state.deferred_scroll_to_item = Some(DeferredScrollToItem {
+        self.0.borrow().base_handle.changed();
+        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset,

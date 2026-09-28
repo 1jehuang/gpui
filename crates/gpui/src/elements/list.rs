@@ -10,8 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, StateVersion, Style,
-    StyleRefinement, Styled, Window, point, px, size,
+    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
+    Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -75,7 +75,7 @@ struct StateInner {
     follow_state: FollowState,
     /// Changes whenever the state is changed from outside the list, so that a
     /// view drawn again from last frame is built again when its list changed.
-    version: StateVersion,
+    version: crate::StateVersion,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -328,7 +328,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
-            version: StateVersion::default(),
+            version: Default::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -655,11 +655,9 @@ impl ListState {
     /// diagram) and the current position should stay put rather than snapping
     /// to the end.
     pub fn pause_following_tail(&self) {
-        let state = &mut *self.0.borrow_mut();
-        if state.follow_state != FollowState::Normal {
-            state.version.bump();
-        }
-        state.follow_state.stop_following();
+        let following = self.0.borrow().follow_state != FollowState::Normal;
+        self.0.borrow().version.bump_if(following);
+        self.0.borrow_mut().follow_state.stop_following();
     }
 
     /// Returns whether the list is currently actively following the
@@ -685,15 +683,9 @@ impl ListState {
             state.follow_state.stop_following();
         }
 
-        // Scrolling to where it already is, as a view that scrolls its list
-        // while rendering does every frame, changes nothing.
-        let unchanged = state.logical_scroll_top.is_some_and(|current| {
-            current.item_ix == scroll_top.item_ix
-                && current.offset_in_item == scroll_top.offset_in_item
-        }) && state.pending_scroll.is_none();
-        if !unchanged || state.follow_state != follow_state {
-            state.version.bump();
-        }
+        let moved = scroll_top.moves_from(state.logical_scroll_top, &state.pending_scroll);
+        let changed = moved || state.follow_state != follow_state;
+        state.version.bump_if(changed);
         state.rebase_pending_scroll(scroll_top);
         state.logical_scroll_top = Some(scroll_top);
     }
@@ -776,9 +768,8 @@ impl ListState {
     ///
     /// See `scrollbar_drag_started`.
     pub fn scrollbar_drag_ended(&self) {
-        let state = &mut *self.0.borrow_mut();
-        state.version.bump();
-        state.scrollbar_drag_start_height.take();
+        self.0.borrow().version.bump();
+        self.0.borrow_mut().scrollbar_drag_start_height.take();
     }
 
     /// Returns `true` if the scrollbar is currently being dragged.
@@ -793,9 +784,8 @@ impl ListState {
 
     /// Set the offset from the scrollbar
     pub fn set_offset_from_scrollbar(&self, point: Point<Pixels>) {
-        let state = &mut *self.0.borrow_mut();
-        state.version.bump();
-        state.set_offset_from_scrollbar(point);
+        self.0.borrow().version.bump();
+        self.0.borrow_mut().set_offset_from_scrollbar(point);
     }
 
     /// Returns the maximum scroll offset according to the items we have measured.
