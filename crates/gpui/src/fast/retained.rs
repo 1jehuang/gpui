@@ -1,6 +1,6 @@
 //! Subtrees drawn again from what they drew on the last frame.
 //!
-//! Views, cached views and memos are retained subtrees. Each one drawn in a
+//! Views and cached views are retained subtrees. Each one drawn in a
 //! frame leaves a record there: where its hitboxes, dispatch nodes, listeners
 //! and primitives went, what it read while it was built, the hovers it was
 //! painted by and the layout nodes it holds. On the next frame, a subtree
@@ -120,20 +120,20 @@ pub(crate) struct RetainedPaintRecording {
 /// A window's state for drawing retained subtrees again, besides the records
 /// its frames hold.
 pub(crate) struct RetainedState {
-    /// The reusable subtrees — memos and cached views — being built or
-    /// painted, innermost last. An interaction inside one, a hover or a
-    /// scroll, marks all of them to be built again. See [`crate::fast::memo::memo`].
-    memo_stack: Vec<GlobalElementId>,
+    /// The retained subtrees being built or painted, innermost last. An
+    /// interaction inside one, a hover or a scroll, marks all of them to be
+    /// built again.
+    subtree_stack: Vec<GlobalElementId>,
     /// Reusable subtrees that an interaction inside them changed since they
     /// were drawn.
-    dirty_memos: FxHashSet<GlobalElementId>,
+    dirty_subtrees: FxHashSet<GlobalElementId>,
     /// Reusable subtrees found out of date too late in a frame to build them
-    /// again, which become [`RetainedState::dirty_memos`] for the next one.
-    memos_dirty_next_frame: FxHashSet<GlobalElementId>,
-    /// Whether each hitbox whose hover a memo's subtree was painted by was
-    /// hovered then, in painting order. A memo keeps the stretch its subtree
+    /// again, which become [`RetainedState::dirty_subtrees`] for the next one.
+    subtrees_dirty_next_frame: FxHashSet<GlobalElementId>,
+    /// Whether each hitbox whose hover a retained subtree was painted by was
+    /// hovered then, in painting order. A subtree keeps the stretch it
     /// added and is built again once any of them is hovered differently.
-    memo_hover_dependencies: Vec<(HitboxId, bool)>,
+    hover_dependencies: Vec<(HitboxId, bool)>,
     /// Every entity notified since the last frame was drawn, views or not. A
     /// retained subtree that read any of them is built again.
     notified_entities: FxHashSet<EntityId>,
@@ -146,10 +146,10 @@ pub(crate) struct RetainedState {
 impl RetainedState {
     pub(crate) fn new() -> Self {
         RetainedState {
-            memo_stack: Vec::new(),
-            dirty_memos: FxHashSet::default(),
-            memos_dirty_next_frame: FxHashSet::default(),
-            memo_hover_dependencies: Vec::new(),
+            subtree_stack: Vec::new(),
+            dirty_subtrees: FxHashSet::default(),
+            subtrees_dirty_next_frame: FxHashSet::default(),
+            hover_dependencies: Vec::new(),
             notified_entities: FxHashSet::default(),
             view_retention: std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
         }
@@ -343,6 +343,7 @@ impl Window {
     /// Turning it off draws every view from scratch each frame, as upstream
     /// GPUI does. The `GPUI_VIEW_RETENTION=0` environment variable turns it
     /// off for every window.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_view_retention(&mut self, enabled: bool) {
         if self.retained_state.view_retention != enabled {
             self.retained_state.view_retention = enabled;
@@ -352,6 +353,7 @@ impl Window {
 
     /// Whether views are drawn again from what they drew on the last frame.
     /// See [`Window::set_view_retention`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn view_retention(&self) -> bool {
         self.retained_state.view_retention
     }
@@ -367,7 +369,7 @@ impl Window {
             || cx.has_active_drag()
             || self.a11y.is_active()
             || self.is_inspector_picking(cx)
-            || self.retained_state.dirty_memos.contains(id)
+            || self.retained_state.dirty_subtrees.contains(id)
             || self.next_frame.retained.by_id.contains_key(id)
         {
             return None;
@@ -596,15 +598,15 @@ impl Window {
         // frame, which is asked for.
         if !self.hovers_unchanged(&hovers) {
             self.retained_state
-                .memos_dirty_next_frame
-                .extend(self.retained_state.memo_stack.iter().cloned());
-            self.retained_state.memos_dirty_next_frame.insert(id);
+                .subtrees_dirty_next_frame
+                .extend(self.retained_state.subtree_stack.iter().cloned());
+            self.retained_state.subtrees_dirty_next_frame.insert(id);
             self.request_animation_frame();
         }
         // Subtrees around this one depend on these hovers too.
-        if !self.retained_state.memo_stack.is_empty() {
+        if !self.retained_state.subtree_stack.is_empty() {
             self.retained_state
-                .memo_hover_dependencies
+                .hover_dependencies
                 .extend_from_slice(&hovers);
         }
     }
@@ -640,7 +642,7 @@ impl Window {
             retained.open.push(index);
             index
         });
-        self.retained_state.memo_stack.push(id.clone());
+        self.retained_state.subtree_stack.push(id.clone());
         RetainedRecording {
             index,
             dependencies: cx.begin_recording_dependencies(),
@@ -662,7 +664,7 @@ impl Window {
     ) -> Option<usize> {
         let layout_keys = self.finish_recording_claimed_layout_keys(recording.layout_keys);
         let mut dependencies = cx.finish_recording_dependencies(recording.dependencies);
-        self.retained_state.memo_stack.pop();
+        self.retained_state.subtree_stack.pop();
         let index = recording.index?;
         if let Some(layout_dependencies) = layout_dependencies {
             dependencies = layout_dependencies.union(&dependencies);
@@ -696,11 +698,11 @@ impl Window {
         id: &GlobalElementId,
         cx: &mut App,
     ) -> RetainedPaintRecording {
-        self.retained_state.memo_stack.push(id.clone());
+        self.retained_state.subtree_stack.push(id.clone());
         RetainedPaintRecording {
             index,
             start: self.paint_index(),
-            hovers_start: self.retained_state.memo_hover_dependencies.len(),
+            hovers_start: self.retained_state.hover_dependencies.len(),
             dependencies: cx.begin_recording_dependencies(),
         }
     }
@@ -712,14 +714,14 @@ impl Window {
         recording: RetainedPaintRecording,
         cx: &mut App,
     ) {
-        self.retained_state.memo_stack.pop();
+        self.retained_state.subtree_stack.pop();
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
         let Some(index) = recording.index else {
             return;
         };
         let end = self.paint_index();
         let hovers: Rc<[(HitboxId, bool)]> =
-            self.retained_state.memo_hover_dependencies[recording.hovers_start..].into();
+            self.retained_state.hover_dependencies[recording.hovers_start..].into();
         let record = &mut self.next_frame.retained.records[index];
         record.paint_range = recording.start..end;
         record.paint = PaintStatus::Painted { source: None };
@@ -727,18 +729,18 @@ impl Window {
         record.dependencies = record.dependencies.union(&dependencies);
     }
 
-    /// The memos around the element being painted, for a listener to mark if
-    /// what it listens for changes the element's look. See [`crate::fast::memo::memo`].
-    pub(crate) fn enclosing_memos(&self) -> SmallVec<[GlobalElementId; 2]> {
-        self.retained_state.memo_stack.iter().cloned().collect()
+    /// The retained subtrees around the element being painted, for a listener
+    /// to mark if what it listens for changes the element's look.
+    pub(crate) fn enclosing_retained_subtrees(&self) -> SmallVec<[GlobalElementId; 2]> {
+        self.retained_state.subtree_stack.iter().cloned().collect()
     }
 
-    /// Notes that what is being painted inside a memo looks the way it does
-    /// because `hitbox` is, or is not, hovered. See [`crate::fast::memo::memo`].
-    pub(crate) fn note_memo_hover_dependency(&mut self, hitbox: HitboxId, hovered: bool) {
-        if !self.retained_state.memo_stack.is_empty() {
+    /// Notes that what is being painted inside a retained subtree looks the
+    /// way it does because `hitbox` is, or is not, hovered.
+    pub(crate) fn note_retained_hover_dependency(&mut self, hitbox: HitboxId, hovered: bool) {
+        if !self.retained_state.subtree_stack.is_empty() {
             self.retained_state
-                .memo_hover_dependencies
+                .hover_dependencies
                 .push((hitbox, hovered));
         }
     }
@@ -762,7 +764,7 @@ impl Window {
     }
 
     /// Whether every hover in `dependencies`, recorded while a reusable
-    /// subtree — a memo or a cached view — was painted, is still as it was.
+    /// subtree was painted, is still as it was.
     pub(crate) fn hovers_unchanged(&self, dependencies: &[(HitboxId, bool)]) -> bool {
         let touch = self.last_input_was_touch();
         dependencies
@@ -770,11 +772,12 @@ impl Window {
             .all(|(hitbox, hovered)| (!touch && hitbox.is_hovered(self)) == *hovered)
     }
 
-    /// Marks memos to be built again rather than reused on the next frame.
-    pub(crate) fn invalidate_memos(&mut self, memos: &[GlobalElementId]) {
+    /// Marks retained subtrees to be built again rather than reused on the
+    /// next frame.
+    pub(crate) fn invalidate_retained_subtrees(&mut self, subtrees: &[GlobalElementId]) {
         self.retained_state
-            .dirty_memos
-            .extend(memos.iter().cloned());
+            .dirty_subtrees
+            .extend(subtrees.iter().cloned());
     }
 
     /// Multiplies the opacity of what is painted from here on by `opacity`,
@@ -811,7 +814,7 @@ impl Window {
             return None;
         }
         let enclosing = enclosing.clone();
-        self.retained_state.memo_stack.extend(
+        self.retained_state.subtree_stack.extend(
             enclosing
                 .0
                 .iter()
@@ -835,7 +838,7 @@ impl Window {
         if enclosing.0.is_empty() {
             return None;
         }
-        self.retained_state.memo_stack.extend(
+        self.retained_state.subtree_stack.extend(
             enclosing
                 .0
                 .iter()
@@ -844,7 +847,7 @@ impl Window {
         Some(DeferredRetainedRecording {
             enclosing: enclosing.clone(),
             dependencies: cx.begin_recording_dependencies(),
-            hovers_start: Some(self.retained_state.memo_hover_dependencies.len()),
+            hovers_start: Some(self.retained_state.hover_dependencies.len()),
         })
     }
 
@@ -859,7 +862,7 @@ impl Window {
             return;
         };
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
-        self.retained_state.memo_stack.clear();
+        self.retained_state.subtree_stack.clear();
         let enclosing = &recording.enclosing.0;
         self.next_frame
             .retained
@@ -867,7 +870,7 @@ impl Window {
         if let Some(hovers_start) = recording.hovers_start {
             let hovers = self
                 .retained_state
-                .memo_hover_dependencies
+                .hover_dependencies
                 .split_off(hovers_start);
             self.next_frame
                 .retained
@@ -878,9 +881,9 @@ impl Window {
     /// Ends the retained bookkeeping of the frame being drawn, before it
     /// becomes the rendered frame.
     pub(crate) fn finish_retained_frame(&mut self) {
-        self.retained_state.dirty_memos =
-            mem::take(&mut self.retained_state.memos_dirty_next_frame);
-        self.retained_state.memo_hover_dependencies.clear();
+        self.retained_state.dirty_subtrees =
+            mem::take(&mut self.retained_state.subtrees_dirty_next_frame);
+        self.retained_state.hover_dependencies.clear();
         self.next_frame.retained.finish_frame();
         #[cfg(any(test, feature = "test-support"))]
         if self.next_frame.retained.reused_any() {
@@ -917,6 +920,10 @@ impl Window {
         self.layout_engine = Some(layout_engine);
     }
 }
+
+// These two are the associated types of `impl Element for ViewElement<V>`, so
+// Rust requires them to be `pub`; this module is private and they are not
+// exported, so nothing outside the crate can name them.
 
 /// How a view was laid out, for its prepaint to follow up on.
 #[doc(hidden)]
@@ -984,7 +991,7 @@ impl<V: View> ViewElement<V> {
                         let layout_id = window.request_layout(root_style, None, cx);
                         (layout_id, ViewLayout::Cached)
                     }
-                    _ if window.view_retention() => {
+                    _ if window.retained_state.view_retention => {
                         let global_id = global_id.expect("a view always has an id");
                         if !window.dirty_views.contains(&entity_id)
                             && let Some(previous) = window.reusable_retained(global_id, cx)

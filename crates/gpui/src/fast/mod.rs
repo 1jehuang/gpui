@@ -17,7 +17,6 @@
 pub(crate) mod dependencies;
 pub(crate) mod layout;
 pub(crate) mod layout_key;
-pub(crate) mod memo;
 pub(crate) mod retained;
 #[cfg(test)]
 pub(crate) mod scene;

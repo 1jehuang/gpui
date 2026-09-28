@@ -103,8 +103,7 @@ pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
-pub use fast::memo::{AnyMemoKey, ContentHash, Memo, MemoPrepaint, Version, memo};
-pub use fast::retained::{ViewLayoutState, ViewPrepaintState};
+#[cfg(any(test, feature = "test-support"))]
 pub use fast::stats::LayoutStats;
 pub use geometry::*;
 pub use gestures::*;

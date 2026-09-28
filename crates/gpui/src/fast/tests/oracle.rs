@@ -20,8 +20,8 @@ use crate::{
     GlyphId, Hsla, InputEvent as _, IntoElement, LineLayout, ListAlignment, ListOffset, ListState,
     MouseMoveEvent, NoopTextSystem, Pixels, PlatformTextSystem, Render, RenderGlyphParams, Result,
     SharedString, Size, StyleRefinement, TestAppContext, TextRenderingMode,
-    UniformListScrollHandle, Window, WindowHandle, anchored, deferred, div, hsla, list, memo,
-    point, prelude::*, px, size, uniform_list,
+    UniformListScrollHandle, Window, WindowHandle, anchored, deferred, div, hsla, list, point,
+    prelude::*, px, size, uniform_list,
 };
 
 const WORDS: [&str; 10] = [
@@ -231,11 +231,13 @@ impl Change {
 
 const PANELS: usize = 6;
 
-/// A small application: a grid of cells, wrapping paragraphs, a row of chips,
-/// a cached child view, child views that are neither cached nor memoized, one
-/// of them deferred, and the same rows in a uniform list and a list.
+/// A small application: a grid of cached cell views, wrapping paragraphs, a
+/// row of chips, a cached child view, child views that are not cached, one of
+/// them deferred, and the same rows in a uniform list and a list.
 struct OracleView {
     cells: Vec<CellState>,
+    /// A view per cell, showing the cell's state.
+    cell_views: Vec<Entity<GridCell>>,
     paragraph_words: usize,
     paragraph_width: Pixels,
     rows: Vec<u64>,
@@ -255,17 +257,22 @@ struct OracleView {
 impl OracleView {
     fn new(cx: &mut Context<Self>) -> Self {
         let shared = cx.new(|_| Shared { value: 0 });
+        let cells: Vec<CellState> = (0..GRID_CELLS)
+            .map(|ix| CellState {
+                word: ix % WORDS.len(),
+                color: ix % PALETTE.len(),
+                width: 40. + (ix % 5) as f32 * 30.,
+                background: ix.is_multiple_of(3),
+                truncate: ix.is_multiple_of(4),
+                ..CellState::default()
+            })
+            .collect();
         Self {
-            cells: (0..GRID_CELLS)
-                .map(|ix| CellState {
-                    word: ix % WORDS.len(),
-                    color: ix % PALETTE.len(),
-                    width: 40. + (ix % 5) as f32 * 30.,
-                    background: ix.is_multiple_of(3),
-                    truncate: ix.is_multiple_of(4),
-                    ..CellState::default()
-                })
+            cell_views: cells
+                .iter()
+                .map(|&cell| cx.new(|_| GridCell(cell)))
                 .collect(),
+            cells,
             paragraph_words: 12,
             paragraph_width: px(180.),
             rows: (0..INITIAL_ROWS).collect(),
@@ -296,19 +303,22 @@ impl OracleView {
 
     fn apply(&mut self, change: &Change, cx: &mut Context<Self>) {
         match *change {
-            Change::Word { cell, word } => self.cells[cell].word = word,
-            Change::Color { cell, color } => self.cells[cell].color = color,
-            Change::Width { cell, width } => self.cells[cell].width = width,
-            Change::Toggle { cell, flag } => {
-                let cell = &mut self.cells[cell];
-                let value = match flag {
-                    CellFlag::Background => &mut cell.background,
-                    CellFlag::Underline => &mut cell.underline,
-                    CellFlag::Truncate => &mut cell.truncate,
-                    CellFlag::Hover => &mut cell.hover,
-                };
-                *value = !*value;
-            }
+            Change::Word { cell, word } => self.update_cell(cell, |cell| cell.word = word, cx),
+            Change::Color { cell, color } => self.update_cell(cell, |cell| cell.color = color, cx),
+            Change::Width { cell, width } => self.update_cell(cell, |cell| cell.width = width, cx),
+            Change::Toggle { cell, flag } => self.update_cell(
+                cell,
+                |cell| {
+                    let value = match flag {
+                        CellFlag::Background => &mut cell.background,
+                        CellFlag::Underline => &mut cell.underline,
+                        CellFlag::Truncate => &mut cell.truncate,
+                        CellFlag::Hover => &mut cell.hover,
+                    };
+                    *value = !*value;
+                },
+                cx,
+            ),
             Change::Paragraph { words, width } => {
                 self.paragraph_words = words;
                 self.paragraph_width = px(width);
@@ -384,6 +394,31 @@ impl OracleView {
             | Change::Redraw => return,
         }
         cx.notify();
+    }
+
+    /// Changes a cell and notifies its view; the parent is notified too,
+    /// because it sizes the cell.
+    fn update_cell(
+        &mut self,
+        ix: usize,
+        change: impl FnOnce(&mut CellState),
+        cx: &mut Context<Self>,
+    ) {
+        change(&mut self.cells[ix]);
+        let cell = self.cells[ix];
+        self.cell_views[ix].update(cx, |view, cx| {
+            view.0 = cell;
+            cx.notify();
+        });
+    }
+}
+
+/// A cell of the grid, drawn as a cached view.
+struct GridCell(CellState);
+
+impl Render for GridCell {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        render_cell(self.0)
     }
 }
 
@@ -509,13 +544,13 @@ impl Render for OracleView {
                     .flex_wrap()
                     .w(px(420.))
                     .gap_1()
-                    // Every cell is a memo keyed by its state, so the window
-                    // drawing incrementally reuses the ones that did not change
-                    // while the one drawing from scratch builds them all.
-                    .children(self.cells.iter().copied().enumerate().map(|(ix, cell)| {
-                        memo(("cell", ix), cell, move |_, _| render_cell(cell))
-                            .w(px(cell.width))
-                            .h(px(18.))
+                    // Every cell is a cached view notified when it changes, so
+                    // the window drawing incrementally reuses the ones that did
+                    // not change while the one drawing from scratch builds them
+                    // all.
+                    .children(self.cells.iter().zip(&self.cell_views).map(|(cell, view)| {
+                        view.clone()
+                            .cached(StyleRefinement::default().w(px(cell.width)).h(px(18.)))
                     })),
             )
             .child(
@@ -575,7 +610,7 @@ struct Accent(usize);
 
 impl Global for Accent {}
 
-/// A child view drawn neither cached nor memoized, so the window keeps it
+/// A child view that is not cached, so the window keeps it
 /// from one frame to the next by itself. Some panels read the shared model
 /// and the global.
 struct Panel {
