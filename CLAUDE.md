@@ -11,6 +11,10 @@ keep merging upstream changes into. To keep those merges easy:
   `mod`/`use` lines, or a `#[path = "fast/<file>.rs"]` redirect to a rewrite.
   No new types, algorithms or tests in upstream files, and no reformatting of
   upstream code. Methods on upstream types can live in `impl` blocks in `fast/`.
+- **Name fast code by its full path**: `crate::fast::<topic>::Name` or
+  `use crate::fast::<topic>::{Name, ..}`, never a glob (`pub use fast::*`), so
+  it is obvious where code lives. Crate-root public API gets an explicit
+  `pub use fast::<topic>::{..};` line in `gpui.rs`.
 - **New files only inside `fast/` or in our own crates** (`crates/gpui_perf`).
 - **Run `script/check-upstream` before committing.** It fails when a change to an
   upstream file is more than a hook.
