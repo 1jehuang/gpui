@@ -30,7 +30,6 @@ use std::{
     hash::{Hash, Hasher},
     ops::{Deref, DerefMut, Range},
     sync::Arc,
-    time::Duration,
 };
 
 /// An opaque identifier for a specific font.
@@ -375,7 +374,7 @@ impl TextSystem {
 /// The GPUI text layout subsystem.
 #[derive(Deref)]
 pub struct WindowTextSystem {
-    line_layout_cache: LineLayoutCache,
+    pub(crate) line_layout_cache: LineLayoutCache,
     #[deref]
     text_system: Arc<TextSystem>,
 }
@@ -399,17 +398,6 @@ impl WindowTextSystem {
 
     pub(crate) fn truncate_layouts(&self, index: LineLayoutIndex) {
         self.line_layout_cache.truncate_layouts(index)
-    }
-
-    /// Lines shaped by the platform, and the time that took, since the last
-    /// [`Self::reset_shaping_stats`]. Lines answered from the cache do not count.
-    pub(crate) fn shaping_stats(&self) -> (u64, Duration) {
-        self.line_layout_cache.shaping_stats()
-    }
-
-    /// Zeroes the counters reported by [`Self::shaping_stats`].
-    pub(crate) fn reset_shaping_stats(&self) {
-        self.line_layout_cache.reset_shaping_stats()
     }
 
     /// Shape the given line, at the given font_size, for painting to the screen.
@@ -663,12 +651,6 @@ impl WindowTextSystem {
 
     pub(crate) fn finish_frame(&self) {
         self.line_layout_cache.finish_frame()
-    }
-
-    /// Forgets every line laid out so far. See [`LineLayoutCache::forget`].
-    #[cfg(test)]
-    pub(crate) fn forget_line_layouts(&self) {
-        self.line_layout_cache.forget()
     }
 
     /// Layout the given line of text, at the given font_size.
@@ -1235,68 +1217,5 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
-    }
-}
-
-/// Rewrites the decorations of lines that [`WindowTextSystem::shape_text`]
-/// already shaped, leaving the shaping itself untouched.
-///
-/// Shaping is the expensive half and the only half that decides how much space
-/// the text takes; decorations — colors, underlines, strikethroughs — only
-/// decide how it is painted. Recoloring text is therefore a matter of replacing
-/// these runs rather than shaping it all over again.
-///
-/// `runs` must still split `lines` exactly as they were split when shaped: the
-/// same lengths, the same fonts, and decoration changing in the same places.
-/// That last one matters as much as the others, because `shape_text` splits its
-/// font runs wherever decoration changes and shapes each separately. Callers
-/// establish it by comparing a key over those inputs before calling; see
-/// `shaping_key` in `elements::text`.
-pub(crate) fn update_decoration_runs(lines: &mut [WrappedLine], runs: &[TextRun]) {
-    let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
-
-    for line in lines.iter_mut() {
-        let line_len = line.text.len();
-        line.decoration_runs.clear();
-
-        let mut offset = 0;
-        while offset < line_len {
-            let Some(run) = runs.peek_mut() else {
-                log::warn!("`TextRun`s do not cover the entire shaped text");
-                break;
-            };
-            let len_within_line = cmp::min(line_len - offset, run.len);
-
-            if let Some(last_run) = line.decoration_runs.last_mut()
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-                && last_run.background_color == run.background_color
-            {
-                last_run.len += len_within_line as u32;
-            } else {
-                line.decoration_runs.push(DecorationRun {
-                    len: len_within_line as u32,
-                    color: run.color,
-                    background_color: run.background_color,
-                    underline: run.underline,
-                    strikethrough: run.strikethrough,
-                });
-            }
-
-            run.len -= len_within_line;
-            if run.len == 0 {
-                runs.next();
-            }
-            offset += len_within_line;
-        }
-
-        // Skip the `\n` that separated this line from the next.
-        if let Some(run) = runs.peek_mut() {
-            run.len -= 1;
-            if run.len == 0 {
-                runs.next();
-            }
-        }
     }
 }

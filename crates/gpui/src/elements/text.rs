@@ -1,20 +1,17 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
-    StrikethroughStyle, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, UnderlineStyle,
-    WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
+    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextRun,
+    TextStyle, TooltipId, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
     set_tooltip_on_window,
 };
 use anyhow::Context as _;
-use collections::FxHasher;
 use gpui_util::ResultExt;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    hash::{Hash, Hasher},
     mem,
     ops::{Deref, DerefMut, Range},
     rc::Rc,
@@ -614,330 +611,33 @@ impl IntoElement for StyledText {
 
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
-pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+pub struct TextLayout(pub(crate) Rc<RefCell<Option<TextLayoutInner>>>);
 
-struct TextLayoutInner {
-    len: usize,
-    lines: SmallVec<[WrappedLine; 1]>,
+pub(crate) struct TextLayoutInner {
+    pub(crate) len: usize,
+    pub(crate) lines: SmallVec<[WrappedLine; 1]>,
     /// What the decorations currently painted onto `lines` were built from, so
     /// a recolor can be recognised and applied without reshaping.
-    decoration_key: u64,
-    line_height: Pixels,
-    wrap_width: Option<Pixels>,
-    truncate_width: Option<Pixels>,
-    size: Option<Size<Pixels>>,
-    bounds: Option<Bounds<Pixels>>,
-}
-
-/// The decorations of a run, which are what shaping splits font runs on.
-fn decoration_of(
-    run: &TextRun,
-) -> (
-    Hsla,
-    Option<Hsla>,
-    Option<UnderlineStyle>,
-    Option<StrikethroughStyle>,
-) {
-    (
-        run.color,
-        run.background_color,
-        run.underline,
-        run.strikethrough,
-    )
-}
-
-/// Hashes everything the *shape* of the text depends on.
-///
-/// Decoration values are deliberately absent, but the places decoration
-/// *changes* are not. Shaping runs against font runs that are split wherever
-/// decoration changes, so whether a color boundary falls between two characters
-/// decides whether they are allowed to kern or ligate. Recoloring within the
-/// same boundaries leaves the geometry alone and can be applied to the shaped
-/// lines in place; moving a boundary cannot.
-///
-/// Wrap width is also absent: it comes from the space Taffy offers the node,
-/// which Taffy already keys its own cache on.
-fn shaping_key(
-    text: &SharedString,
-    runs: &[TextRun],
-    text_style: &TextStyle,
-    font_size: Pixels,
-    line_height: Pixels,
-) -> u64 {
-    let mut hasher = FxHasher::default();
-    text.hash(&mut hasher);
-    font_size.0.to_bits().hash(&mut hasher);
-    line_height.0.to_bits().hash(&mut hasher);
-    mem::discriminant(&text_style.white_space).hash(&mut hasher);
-    text_style.line_clamp.hash(&mut hasher);
-    match &text_style.text_overflow {
-        None => 0u8.hash(&mut hasher),
-        Some(TextOverflow::Truncate(affix)) => {
-            1u8.hash(&mut hasher);
-            affix.hash(&mut hasher);
-        }
-        Some(TextOverflow::TruncateStart(affix)) => {
-            2u8.hash(&mut hasher);
-            affix.hash(&mut hasher);
-        }
-        Some(TextOverflow::TruncateMiddle(affix)) => {
-            3u8.hash(&mut hasher);
-            affix.hash(&mut hasher);
-        }
-    }
-    let mut previous = None;
-    for run in runs.iter().filter(|run| run.len > 0) {
-        run.len.hash(&mut hasher);
-        run.font.hash(&mut hasher);
-        // Whether shaping may join this run to the one before it.
-        previous
-            .replace(decoration_of(run))
-            .is_some_and(|previous| previous == decoration_of(run))
-            .hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Hashes the decoration values, which decide only how shaped text is painted.
-fn decoration_key(runs: &[TextRun]) -> u64 {
-    let mut hasher = FxHasher::default();
-    for run in runs.iter().filter(|run| run.len > 0) {
-        run.len.hash(&mut hasher);
-        run.color.hash(&mut hasher);
-        run.background_color.hash(&mut hasher);
-        run.underline.hash(&mut hasher);
-        run.strikethrough.hash(&mut hasher);
-    }
-    hasher.finish()
+    pub(crate) decoration_key: u64,
+    pub(crate) line_height: Pixels,
+    pub(crate) wrap_width: Option<Pixels>,
+    pub(crate) truncate_width: Option<Pixels>,
+    pub(crate) size: Option<Size<Pixels>>,
+    pub(crate) bounds: Option<Bounds<Pixels>>,
 }
 
 impl TextLayout {
-    fn layout(
+    pub(crate) fn layout(
         &mut self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
-        let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = window.pixel_snap(
-            text_style
-                .line_height
-                .to_pixels(font_size.into(), window.rem_size()),
-        );
-
-        // Plain text is one run, which stays inline: most frames only hash it,
-        // and a measurement that has to keep it is the exception.
-        let runs: SmallVec<[TextRun; 1]> = if let Some(runs) = runs {
-            SmallVec::from_vec(runs)
-        } else {
-            SmallVec::from_buf([text_style.to_run(text.len())])
-        };
-        let shaping_key = shaping_key(&text, &runs, &text_style, font_size, line_height);
-        let decoration_key = decoration_key(&runs);
-        // Truncated text is shaped from a rewritten string whose runs no longer
-        // line up with these, so its decorations cannot be replaced in place.
-        let truncating = text_style.text_overflow.is_some();
-        // Everything the measurement below captures that the shaping key does
-        // not: the decorations it shapes with, and, when it truncates, the font
-        // it truncates with. Text that does not truncate never reads the font,
-        // so building one to hash it would be for nothing.
-        let closure_key = {
-            let mut hasher = FxHasher::default();
-            shaping_key.hash(&mut hasher);
-            decoration_key.hash(&mut hasher);
-            if truncating {
-                text_style.font().hash(&mut hasher);
-            }
-            hasher.finish()
-        };
-
-        let (layout_id, state) = window.request_measured_layout_cached(
-            Default::default(),
-            shaping_key,
-            closure_key,
-            self.0.clone(),
-            |state| {
-                // Lines are in here only when the shaping still stands, in
-                // which case recoloring is a matter of replacing what is
-                // painted over them. Doing it here rather than through a
-                // measurement is the point: a measurement would have had to
-                // dirty the node, and the whole tree above it, to run.
-                if !truncating
-                    && let Some(layout) = state.borrow_mut().as_mut()
-                    && layout.decoration_key != decoration_key
-                {
-                    crate::text_system::update_decoration_runs(&mut layout.lines, &runs);
-                    layout.decoration_key = decoration_key;
-                }
-
-                let element_state = TextLayout(state.clone());
-
-                move |known_dimensions, available_space, window, cx| {
-                    let wrap_width = if text_style.white_space == WhiteSpace::Normal {
-                        known_dimensions.width.or(match available_space.width {
-                            crate::AvailableSpace::Definite(x) => Some(x),
-                            _ => None,
-                        })
-                    } else {
-                        None
-                    };
-
-                    // Only the width is needed to decide whether the kept
-                    // result still answers. Which affix to truncate with, and
-                    // from which end, is needed only if we go on to shape, and
-                    // most calls here do not.
-                    let truncate_width = text_style.text_overflow.as_ref().and_then(|_| {
-                        known_dimensions.width.or(match available_space.width {
-                            crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
-                                Some(max_lines) => Some(x * max_lines),
-                                None => Some(x),
-                            },
-                            _ => None,
-                        })
-                    });
-
-                    // Only use cached layout if:
-                    // 1. We have a cached size
-                    // 2. the wrap width is one the cached layout already answers
-                    // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
-                    //    because the previous layout may have been computed without truncation)
-                    // 4. the cached layout was not truncated (a truncated layout answers an
-                    //    unconstrained probe with the truncated size, which poisons intrinsic
-                    //    sizing with whatever width some earlier measure pass happened to use)
-                    //
-                    // Taffy asks for a node's intrinsic size before it lays the
-                    // node out, so a wrapping leaf is measured unconstrained
-                    // and then again at the width it ends up with. Shaping it
-                    // twice is only necessary when the width actually bites:
-                    // text that already fits wraps nowhere, and the lines
-                    // shaped without a wrap width are the same lines.
-                    if let Some(text_layout) = element_state.0.borrow().as_ref()
-                        && let Some(size) = text_layout.size
-                        && (wrap_width.is_none()
-                            || wrap_width == text_layout.wrap_width
-                            || (text_layout.wrap_width.is_none()
-                                && wrap_width.is_some_and(|wrap_width| size.width <= wrap_width)))
-                        && truncate_width.is_none()
-                        && text_layout.truncate_width.is_none()
-                    {
-                        window.record_measure_reuse();
-                        return size;
-                    }
-
-                    let (text, runs) = if let Some(truncate_width) = truncate_width {
-                        // Only truncation needs a wrapper, whose font has to be
-                        // resolved and whose slot in the pool has to be taken
-                        // and handed back; text that is not truncated would
-                        // pay for that on every measurement for nothing.
-                        let (truncation_affix, truncate_from) =
-                            match text_style.text_overflow.clone() {
-                                Some(TextOverflow::Truncate(affix)) => (affix, TruncateFrom::End),
-                                Some(TextOverflow::TruncateStart(affix)) => {
-                                    (affix, TruncateFrom::Start)
-                                }
-                                Some(TextOverflow::TruncateMiddle(affix)) => {
-                                    (affix, TruncateFrom::Middle)
-                                }
-                                None => (SharedString::default(), TruncateFrom::End),
-                            };
-                        let mut line_wrapper =
-                            cx.text_system().line_wrapper(text_style.font(), font_size);
-                        if let Some(max_lines) = text_style.line_clamp
-                            && let Some(wrap_width) = wrap_width
-                        {
-                            line_wrapper.truncate_wrapped_line(
-                                text.clone(),
-                                wrap_width,
-                                max_lines,
-                                &truncation_affix,
-                                &runs,
-                                truncate_from,
-                            )
-                        } else if let Some(unclipped) = window
-                            .text_system()
-                            .shape_text(text.clone(), font_size, &runs, None, None)
-                            .log_err()
-                            && unclipped
-                                .iter()
-                                .all(|line| line.size(line_height).width <= truncate_width)
-                        {
-                            // The truncation decision below sums per-character advances,
-                            // which overestimates the shaped width (no kerning), truncating
-                            // text that fits exactly in its measured width. Skip truncation
-                            // whenever the honestly-shaped text fits; the shaping result
-                            // comes from the line layout cache when the same text was
-                            // already measured untruncated this frame.
-                            (text.clone(), Cow::Borrowed(&*runs))
-                        } else {
-                            line_wrapper.truncate_line(
-                                text.clone(),
-                                truncate_width,
-                                &truncation_affix,
-                                &runs,
-                                truncate_from,
-                            )
-                        }
-                    } else {
-                        (text.clone(), Cow::Borrowed(&*runs))
-                    };
-                    let len = text.len();
-
-                    let Some(lines) = window
-                        .text_system()
-                        .shape_text(
-                            text,
-                            font_size,
-                            &runs,
-                            wrap_width,            // Wrap if we know the width.
-                            text_style.line_clamp, // Limit the number of lines if line_clamp is set.
-                        )
-                        .log_err()
-                    else {
-                        element_state.0.borrow_mut().replace(TextLayoutInner {
-                            lines: Default::default(),
-                            len: 0,
-                            decoration_key,
-                            line_height,
-                            wrap_width,
-                            truncate_width,
-                            size: Some(Size::default()),
-                            bounds: None,
-                        });
-                        return Size::default();
-                    };
-
-                    let mut size: Size<Pixels> = Size::default();
-                    for line in &lines {
-                        let line_size = line.size(line_height);
-                        size.height += line_size.height;
-                        size.width = size.width.max(line_size.width).ceil();
-                    }
-
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
-                        lines,
-                        len,
-                        decoration_key,
-                        line_height,
-                        wrap_width,
-                        truncate_width,
-                        size: Some(size),
-                        bounds: None,
-                    });
-
-                    size
-                }
-            },
-        );
-        // Adopt the cell the measurement wrote into. When the key matched,
-        // Taffy may have answered this node's size from cache without measuring
-        // at all, and the lines to paint are the ones an earlier frame produced.
-        self.0 = state;
-        layout_id
+        self.layout_keyed(text, runs, window)
     }
 
-    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
+    pub(crate) fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
         let mut element_state = self.0.borrow_mut();
         let element_state = element_state
             .as_mut()
@@ -946,7 +646,7 @@ impl TextLayout {
         element_state.bounds = Some(bounds);
     }
 
-    fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
+    pub(crate) fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
         let element_state = self.0.borrow();
         let element_state = element_state
             .as_ref()
@@ -1452,101 +1152,6 @@ mod tests {
         let _ = div().child(SharedString::from("SharedString"));
     }
 
-    /// Replacing decorations in place has to land exactly where reshaping the
-    /// same text with the same runs would have. If it does not, recolored text
-    /// paints with the wrong colors on the wrong characters, and nothing in the
-    /// layout would give it away.
-    #[test]
-    fn replacing_decorations_in_place_lands_where_reshaping_would() {
-        use crate::{AppContext as _, Empty, TestAppContext, hsla, px};
-
-        let mut cx = TestAppContext::single();
-        let window = cx.add_window(|_, _| Empty);
-        cx.update_window(window.into(), |_, window, _| {
-            let text = SharedString::from("hello\nworld wide");
-            let font = window.text_style().font();
-            let run = |len, color| TextRun {
-                len,
-                font: font.clone(),
-                color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let red = hsla(0.0, 1.0, 0.5, 1.0);
-            let blue = hsla(0.6, 1.0, 0.5, 1.0);
-            let green = hsla(0.3, 1.0, 0.5, 1.0);
-
-            // Same lengths and same boundaries, different colors.
-            let before = [run(6, red), run(10, blue)];
-            let after = [run(6, green), run(10, red)];
-
-            let font_size = px(14.);
-            let system = window.text_system();
-            let mut recolored = system
-                .shape_text(text.clone(), font_size, &before, None, None)
-                .unwrap();
-            let reshaped = system
-                .shape_text(text.clone(), font_size, &after, None, None)
-                .unwrap();
-            crate::text_system::update_decoration_runs(&mut recolored, &after);
-
-            assert_eq!(recolored.len(), reshaped.len());
-            for (recolored, reshaped) in recolored.iter().zip(reshaped.iter()) {
-                assert_eq!(recolored.text, reshaped.text);
-                assert_eq!(recolored.decoration_runs, reshaped.decoration_runs);
-            }
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn recoloring_keeps_the_shaping_key_but_moving_a_boundary_does_not() {
-        use crate::{FontStyle, FontWeight, hsla, px};
-
-        let text = SharedString::from("abcd");
-        let font = crate::Font {
-            family: "Test".into(),
-            features: Default::default(),
-            fallbacks: None,
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-        };
-        let run = |len, color| TextRun {
-            len,
-            font: font.clone(),
-            color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let red = hsla(0.0, 1.0, 0.5, 1.0);
-        let blue = hsla(0.6, 1.0, 0.5, 1.0);
-        let green = hsla(0.3, 1.0, 0.5, 1.0);
-        let style = TextStyle::default();
-        let key = |runs: &[TextRun]| shaping_key(&text, runs, &style, px(14.), px(18.));
-
-        let two_colors = [run(2, red), run(2, blue)];
-        let two_other_colors = [run(2, green), run(2, red)];
-        let one_color = [run(2, red), run(2, red)];
-
-        assert_eq!(
-            key(&two_colors),
-            key(&two_other_colors),
-            "recoloring runs that still differ from each other cannot move a glyph"
-        );
-        assert_ne!(
-            key(&two_colors),
-            key(&one_color),
-            "runs that used to be shaped apart and now shape together can kern across the join"
-        );
-        assert_ne!(
-            decoration_key(&two_colors),
-            decoration_key(&two_other_colors),
-            "the colors themselves did change, and what is painted has to follow"
-        );
-    }
-
     #[test]
     fn text_macro_id() {
         // one call to `text!` = one id
@@ -1563,235 +1168,6 @@ mod tests {
         assert_ne!(
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
-        );
-    }
-
-    const PROBED_TEXT: &str = "hello world wide web";
-
-    /// Text in a single color that hands out the layout it ended up with,
-    /// which is the one it adopted from its node rather than the one it
-    /// started the frame with.
-    struct ProbedText {
-        color: Hsla,
-        probe: Rc<RefCell<Option<TextLayout>>>,
-    }
-
-    impl IntoElement for ProbedText {
-        type Element = Self;
-
-        fn into_element(self) -> Self::Element {
-            self
-        }
-    }
-
-    impl Element for ProbedText {
-        type RequestLayoutState = TextLayout;
-        type PrepaintState = ();
-
-        fn id(&self) -> Option<ElementId> {
-            None
-        }
-
-        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-            None
-        }
-
-        fn request_layout(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> (LayoutId, Self::RequestLayoutState) {
-            let run = TextRun {
-                color: self.color,
-                ..window.text_style().to_run(PROBED_TEXT.len())
-            };
-            let mut layout = TextLayout::default();
-            let layout_id = layout.layout(PROBED_TEXT.into(), Some(vec![run]), window, cx);
-            self.probe.replace(Some(layout.clone()));
-            (layout_id, layout)
-        }
-
-        fn prepaint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            bounds: Bounds<Pixels>,
-            layout: &mut Self::RequestLayoutState,
-            _window: &mut Window,
-            _cx: &mut App,
-        ) {
-            layout.prepaint(bounds, PROBED_TEXT)
-        }
-
-        fn paint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            _bounds: Bounds<Pixels>,
-            layout: &mut Self::RequestLayoutState,
-            _: &mut Self::PrepaintState,
-            window: &mut Window,
-            cx: &mut App,
-        ) {
-            layout.paint(PROBED_TEXT, window, cx)
-        }
-    }
-
-    struct ProbedTextView {
-        color: Hsla,
-        width: Pixels,
-        ellipsis: bool,
-        probe: Rc<RefCell<Option<TextLayout>>>,
-    }
-
-    impl crate::Render for ProbedTextView {
-        fn render(&mut self, _: &mut Window, _: &mut crate::Context<Self>) -> impl IntoElement {
-            use crate::{ParentElement as _, Styled as _, div, prelude::FluentBuilder as _};
-            div()
-                .w(self.width)
-                .when(self.ellipsis, |this| this.text_ellipsis())
-                .child(ProbedText {
-                    color: self.color,
-                    probe: self.probe.clone(),
-                })
-        }
-    }
-
-    /// The text a probed layout ended up showing, line by line.
-    fn probed_lines(probe: &Rc<RefCell<Option<TextLayout>>>) -> Vec<String> {
-        let layout = probe.borrow().clone().unwrap();
-        let inner = layout.0.borrow();
-        inner
-            .as_ref()
-            .unwrap()
-            .lines
-            .iter()
-            .map(|line| line.text.to_string())
-            .collect()
-    }
-
-    /// Only truncating text takes a line wrapper, so the one path that does has
-    /// to go on truncating: in a box too narrow for it, with an ellipsis, and
-    /// in full again once the box is wide enough, through the same retained
-    /// node and the measurement closure it kept.
-    #[test]
-    fn text_that_truncates_is_truncated_and_widening_it_shows_it_whole() {
-        use crate::{AppContext as _, TestAppContext, hsla, px};
-
-        let mut cx = TestAppContext::single();
-        let probe = Rc::new(RefCell::new(None));
-        let window = cx.add_window({
-            let probe = probe.clone();
-            move |_, _| ProbedTextView {
-                color: hsla(0., 0., 0., 1.),
-                width: px(30.),
-                ellipsis: true,
-                probe,
-            }
-        });
-        let draw = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
-                .unwrap()
-        };
-
-        draw(&mut cx);
-        let narrow = probed_lines(&probe);
-        assert_eq!(
-            narrow.len(),
-            1,
-            "truncated text stays on one line: {narrow:?}"
-        );
-        assert!(
-            narrow[0].ends_with('…') && narrow[0].len() < PROBED_TEXT.len(),
-            "text in a narrow box should be cut short with an ellipsis: {narrow:?}"
-        );
-
-        window
-            .update(&mut cx, |view, _, cx| {
-                view.width = px(1000.);
-                cx.notify();
-            })
-            .unwrap();
-        draw(&mut cx);
-        assert_eq!(
-            probed_lines(&probe),
-            vec![PROBED_TEXT.to_string()],
-            "text in a box wide enough for it should be shown whole"
-        );
-    }
-
-    /// A retained text node keeps the measurement closure it has while nothing
-    /// it was built from changes. A color is one of those things, though it
-    /// changes nothing about the measurement: text that is measured again
-    /// after being recolored, because it was offered a different width, has
-    /// to be shaped in the new color, not the one the kept closure knew.
-    #[test]
-    fn text_measured_again_after_a_recolor_is_shaped_in_the_new_color() {
-        use crate::{AppContext as _, TestAppContext, hsla, px};
-
-        let red = hsla(0., 1., 0.5, 1.);
-        let blue = hsla(0.66, 1., 0.5, 1.);
-        let mut cx = TestAppContext::single();
-        let probe = Rc::new(RefCell::new(None));
-        let window = cx.add_window({
-            let probe = probe.clone();
-            move |_, _| ProbedTextView {
-                color: red,
-                width: px(1000.),
-                ellipsis: false,
-                probe,
-            }
-        });
-        let draw = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
-                .unwrap()
-        };
-        let lines = |probe: &Rc<RefCell<Option<TextLayout>>>| {
-            let layout = probe.borrow().clone().unwrap();
-            let inner = layout.0.borrow();
-            let inner = inner.as_ref().unwrap();
-            let wraps = inner
-                .lines
-                .iter()
-                .map(|line| line.wrap_boundaries.len())
-                .sum::<usize>();
-            let colors = inner
-                .lines
-                .iter()
-                .flat_map(|line| line.decoration_runs.iter().map(|run| run.color))
-                .collect::<Vec<_>>();
-            (wraps, colors)
-        };
-        let change = |cx: &mut TestAppContext, change: &dyn Fn(&mut ProbedTextView)| {
-            window
-                .update(cx, |view, _, cx| {
-                    change(view);
-                    cx.notify();
-                })
-                .unwrap();
-            draw(cx);
-        };
-
-        draw(&mut cx);
-        change(&mut cx, &|view| view.color = blue);
-        change(&mut cx, &|view| view.width = px(30.));
-        let (wraps, colors) = lines(&probe);
-        assert!(wraps > 0, "the narrow box should have made the text wrap");
-        assert!(
-            colors.iter().all(|color| *color == blue),
-            "text shaped after the recolor should be blue, got {colors:?}"
-        );
-
-        // Measured once more with nothing but the width changed, the text
-        // keeps the closure it has, which must still know the new color.
-        change(&mut cx, &|view| view.width = px(1000.));
-        let (wraps, colors) = lines(&probe);
-        assert_eq!(wraps, 0, "the wide box should have unwrapped the text");
-        assert!(
-            colors.iter().all(|color| *color == blue),
-            "text shaped with a kept closure should still be blue, got {colors:?}"
         );
     }
 }
