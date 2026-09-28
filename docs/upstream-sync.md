@@ -35,10 +35,13 @@ only hold the hooks that call into it.
 4. **Name fast code by its full path.** No glob imports or re-exports of
    `fast` (`pub use fast::*`, `use crate::fast::layout::*`): write
    `crate::fast::<topic>::Name`, or `use crate::fast::<topic>::{..}` with the
-   names listed, so every use shows where the code lives. Public API that has
-   to stay at the crate root gets an explicit line in `gpui.rs`, such as
-   `pub use fast::stats::LayoutStats;`.
-5. **New files only inside `fast/`, or in our own crates** such as
+   names listed, so every use shows where the code lives.
+5. **No new public API.** gpui-fast changes how GPUI draws, not what it offers:
+   its public API is upstream's. What tests and `gpui_perf` need to measure or
+   switch retained mode is compiled only under `test-support`, and exported
+   from `gpui.rs` one item at a time:
+   `#[cfg(any(test, feature = "test-support"))] pub use fast::stats::LayoutStats;`.
+6. **New files only inside `fast/`, or in our own crates** such as
    `crates/gpui_perf` (benchmarks, examples and the frame-measuring app).
    Documentation goes in `docs/`.
 

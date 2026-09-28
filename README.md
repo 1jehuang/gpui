@@ -1,33 +1,36 @@
 # GPUI Fast
 
-**An experimental attempt to add Retained Mode to GPUI — to prove it out
-here first, then propose it to GPUI upstream.**
+**An experimental project exploring Retained Mode and window composition for
+GPUI.**
 
-Retained Mode reaches into the core of GPUI — how views render, how layout
-nodes are kept, how a frame is painted — which makes it too large a change to
-propose before it has been shown to work. gpui-fast is where it is built,
-tested and measured first, and once the approach holds up, the aim is to
-propose it to [Zed's GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
+- **Retained Mode**: redraw only what changed since the last frame.
+- **Window composition** (coming next): native views such as a WebView drawn
+  inside a GPUI window, with GPUI's popovers, menus and dialogs still above
+  them. This will merge [zed#62379](https://github.com/zed-industries/zed/pull/62379),
+  proposed to GPUI upstream and still under review there.
+
+Both take deep changes to GPUI, so they are tried out here first. Once they
+work, we plan to propose them to [Zed's GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
+
+Every change here keeps to two rules:
+
+- **GPUI's existing API stays unchanged.** Code written for upstream GPUI
+  compiles and runs here as is. New capabilities are added beside the
+  existing API, and applications opt into them.
+- **GPUI's own code is changed as little as possible.** gpui-fast's code lives
+  in `fast/` directories beside upstream's, upstream files get only small
+  hooks into it, and upstream's changes are merged in as Zed makes them. Each
+  change reads as a diff against current GPUI and can be handed upstream piece
+  by piece.
+
+## Retained Mode
 
 [GPUI](https://gpui.rs), the UI framework of the [Zed](https://github.com/zed-industries/zed)
 editor, draws in immediate mode: every frame renders every view, builds a
 fresh layout tree, lays it out, shapes its text, and paints the whole window
 again, even when almost nothing changed. gpui-fast keeps what the last frame
-worked out and redoes only what changed since.
-
-**GPUI's existing API stays unchanged — a standing goal of the whole
-effort.** Applications are written exactly as for upstream GPUI; they
-just draw less. Retained Mode has to fit behind the API GPUI already has, so
-that adopting it upstream asks nothing of Zed or of any application built on
-GPUI.
-
-To stay proposable, gpui-fast is kept in step with upstream: upstream's source
-is kept as upstream has it, gpui-fast's code lives beside it in `fast/`
-directories, and upstream's changes are merged in as Zed makes them. The work
-reads as a diff against current GPUI, and can be handed upstream piece by
-piece.
-
-## Retained Mode
+worked out and redoes only what changed since. Applications are written
+exactly as for upstream GPUI; they just draw less.
 
 A frame walks the element tree three times: **build** renders views and asks
 for layout, **prepaint** computes layout and places elements, **paint** turns
@@ -89,7 +92,8 @@ Several projects build on GPUI outside Zed:
   not part of it.
 - **gpui-ce** is a community-maintained GPUI.
 
-gpui-fast has a narrower focus: Retained Mode for GPUI. Work that makes it
+gpui-fast has a narrower focus: Retained Mode and window composition for
+GPUI. Work that makes it
 into upstream GPUI reaches all of these projects, and Zed itself.
 
 ## Following upstream
