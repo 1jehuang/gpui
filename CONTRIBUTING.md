@@ -11,7 +11,7 @@ To keep merging upstream cheap, gpui-fast's changes never spread through
 upstream's files:
 
 - **All of gpui-fast's logic lives in `crates/<crate>/src/fast/`**, one file per
-  topic — `fast/retained.rs`, `fast/layout.rs`, `fast/text.rs`, … — and is
+  topic — `fast/retained.rs`, `fast/dependencies.rs`, `fast/layout.rs`, … — and is
   always referred to by its path, `crate::fast::retained::…`, so it is obvious
   where code comes from. A new topic gets a new `fast/<topic>.rs`.
 - **Upstream files hold only hooks**: a field holding a `fast` struct, a
@@ -42,18 +42,13 @@ script/check-upstream
 ```sh
 # Simulated forms, lists, tables and settings screens, retained and not
 cargo run -p gpui_perf --release
-# 2500 labels in a real window, 25% of them changing every frame
-cargo run -p gpui_perf --example grid_frames --release -- 50 50 25
-# A list scrolled back and forth
-cargo run -p gpui_perf --example scroll_frames --release -- uniform oscillate 12 index
+# A dashboard of panel views in a real window, 2 of 60 panels changing every frame
+cargo run -p gpui_perf --example views_frames --release -- 60 64 2
+GPUI_VIEW_RETENTION=0 cargo run -p gpui_perf --example views_frames --release -- 60 64 2
 ```
 
-`Window::layout_stats()` reports where a frame's time went — build, prepaint,
-layout, paint, text shaping — and how many layout nodes were reused.
-[`docs/performance-guide.md`](docs/performance-guide.md) describes what
-gpui-fast changes about a frame, and
-[`docs/frame-budget.html`](docs/frame-budget.html) is the measurement behind
-the figures in the README, step by step.
+[`docs/retained-mode.md`](docs/retained-mode.md) describes how retained mode
+works, and how it is verified and measured.
 
 A retained frame has to be the frame that drawing from scratch would have
 produced. An oracle test (`crates/gpui/src/fast/tests/oracle.rs`) drives two

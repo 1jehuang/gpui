@@ -18,34 +18,31 @@ Zed makes them.
 A frame walks the element tree three times: **build** renders views and asks
 for layout, **prepaint** computes layout and places elements, **paint** turns
 them into the scene handed to the GPU. Upstream does all three from scratch.
-gpui-fast retains each level:
+gpui-fast retains two things:
 
-| What is retained                    | Drawn again from the last frame while                                                                                                                                                                                                                                                 |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Views**                           | nothing the view read while rendering changed — the entities it accessed, the globals it read, the list and scroll state it depends on — and it is drawn at the same place. It is then neither rendered, laid out, prepainted nor painted: its last frame's output is replayed.       |
-| **`memo(id, key, build)` subtrees** | the key is unchanged. Any `PartialEq` value that stands for what the subtree depends on will do; `Version`, `ContentHash` and `AnyMemoKey` are ready-made ones.                                                                                                                       |
-| **Layout nodes**                    | the element asks for the same style, children and measurement. Taffy's per-node cache survives, so unchanged parts of the tree are not laid out again. Elements keep their nodes by their path from the root, or by their `ElementId` wherever they move among their siblings.        |
-| **Shaped text**                     | its text, font and runs are unchanged. Recoloured text keeps its shaping; text already fitting the width it is offered is not shaped again.                                                                                                                                           |
-| **Primitive ordering**              | the bounds painted before it are unchanged; only what meets a changed bound is ordered afresh.                                                                                                                                                                                        |
-| **Element identity**                | the element's path is the one it had last frame.                                                                                                                                                                                                                                      |
+| What is retained | Drawn again from the last frame while                                                                                                                                                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Views**        | nothing the view read while rendering changed — the entities it accessed, the globals it read, the list and scroll state it depends on — and it is drawn at the same place. It is then neither rendered, laid out, prepainted nor painted: its last frame's output is replayed. |
+| **Layout nodes** | the element asks for the same style, children and measurement. Taffy's per-node cache survives, so unchanged parts of the tree are not laid out again. Elements keep their nodes by their path from the root, or by their `ElementId` wherever they move among their siblings.  |
 
 Hover, scrolling, bounds, content masks and window refreshes invalidate
 exactly what they affect, without the application doing anything. Retention
-can be turned off, for comparison or debugging, with
-`Window::set_view_retention(false)` or `GPUI_VIEW_RETENTION=0`.
+can be turned off, for comparison or debugging, with `GPUI_VIEW_RETENTION=0`.
+[`docs/retained-mode.md`](docs/retained-mode.md) describes how it works.
 
-What it is worth, in main-thread CPU per frame on an Apple M4, median of five
-runs, against GPUI as extracted:
+What it is worth, in headless CPU time per frame for a window of 60 panel
+views with 64 labels each, in release builds on Linux:
 
-| Workload                                 | Upstream | gpui-fast      |
-| ---------------------------------------- | -------- | -------------- |
-| 2500 live labels in a real window, still | 8.20 ms  | 3.64 ms (−56%) |
-| 2500 live labels, every cell changing    | 8.25 ms  | 5.18 ms (−37%) |
-| A wide table scrolled back and forth     | 7.89 ms  | 4.07 ms (−48%) |
+| Panels notified per frame | Upstream | gpui-fast       |
+| ------------------------- | -------- | --------------- |
+| None, still               | 10.43 ms | 0.25 ms (−98%)  |
+| One                       | 11.58 ms | 1.35 ms (−88%)  |
+| Six                       | 13.06 ms | 3.86 ms (−70%)  |
+| All sixty                 | 18.25 ms | 14.57 ms (−20%) |
 
-The gain follows how little of the window changes. In gpui-kit's DataTable,
-a table taking new values 30 times a second, drawing costs 37% less than
-before, and 48% less once the table memoizes its rows.
+"Upstream" is the same build drawing every view from scratch, as with
+`GPUI_VIEW_RETENTION=0`; the figures come from the `retained_bench` test. The
+gain follows how little of the window changes.
 
 A retained frame is checked against the frame drawing from scratch would
 have produced: a test drives two windows through the same random history, one
@@ -53,13 +50,10 @@ drawing incrementally and one from scratch, and requires every frame to match.
 
 ## Using it
 
-The public API is upstream's. Two things differ, and code using neither
-compiles here untouched:
-
-- `GlobalElementId` does not implement `DerefMut`: it keeps its path's hash, so
-  a path changed in place would no longer match it.
-- `Window::with_inspector_state` returns `Option<R>` and calls its closure only
-  for the element being inspected, as upstream's does since.
+The public API is upstream's, and code written for upstream GPUI compiles here
+untouched. One thing to know: state a view's render reads outside entities and
+globals — an `Rc<RefCell<..>>`, the time, `window.modifiers()` — needs a
+`cx.notify()` when it changes, as it already does for a cached view.
 
 Point a project at it in place of upstream GPUI:
 

@@ -12,10 +12,10 @@ only hold the hooks that call into it.
 ## The rules
 
 1. **gpui-fast's logic lives in `crates/<crate>/src/fast/`.** One file per
-   topic: `crates/gpui/src/fast/retained.rs`, `fast/layout.rs`, `fast/text.rs`,
-   and so on. A new topic gets a new `fast/<topic>.rs`, or `fast/<topic>/` when
-   it needs more than one file. Other upstream crates get their own `src/fast/`
-   (for example `crates/gpui_macos/src/fast/`). Tests of what we add go in
+   topic: `crates/gpui/src/fast/retained.rs`, `fast/dependencies.rs`,
+   `fast/layout.rs`, and so on. A new topic gets a new `fast/<topic>.rs`, or
+   `fast/<topic>/` when it needs more than one file. Other upstream crates get
+   their own `src/fast/` when they need one. Tests of what we add go in
    `crates/gpui/src/fast/tests/<topic>.rs` or at the bottom of the topic's file.
 2. **Upstream files only hold small hooks:**
    - one field holding the topic's state, typed as a struct defined in `fast/`
@@ -37,7 +37,7 @@ only hold the hooks that call into it.
    `crate::fast::<topic>::Name`, or `use crate::fast::<topic>::{..}` with the
    names listed, so every use shows where the code lives. Public API that has
    to stay at the crate root gets an explicit line in `gpui.rs`, such as
-   `pub use fast::memo::{Memo, memo};`.
+   `pub use fast::stats::LayoutStats;`.
 5. **New files only inside `fast/`, or in our own crates** such as
    `crates/gpui_perf` (benchmarks, examples and the frame-measuring app).
    Documentation goes in `docs/`.
