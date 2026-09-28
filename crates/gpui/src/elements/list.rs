@@ -1206,9 +1206,8 @@ impl StateInner {
                 let size = if let ListItem::Measured { size, .. } = item {
                     *size
                 } else {
-                    let item_index = cursor.start().0;
-                    let mut element = render_item(item_index, window, cx);
-                    element.layout_as_list_item(item_index, available_item_space, window, cx)
+                    let mut element = render_item(cursor.start().0, window, cx);
+                    element.layout_as_list_item(cursor.start().0, available_item_space, window, cx)
                 };
 
                 leading_overdraw += size.height;
@@ -1252,7 +1251,7 @@ impl StateInner {
             while let Some(item) = cursor.item() {
                 if item.contains_focused(window, cx) {
                     let item_index = cursor.start().0;
-                    let mut element = render_item(item_index, window, cx);
+                    let mut element = render_item(cursor.start().0, window, cx);
                     let size =
                         element.layout_as_list_item(item_index, available_item_space, window, cx);
                     item_layouts.push_back(ItemLayout {
@@ -1332,14 +1331,13 @@ impl StateInner {
                                         break;
                                     };
                                     let size = prev_item.size().unwrap_or_else(|| {
-                                        let item_index = cursor.start().0;
-                                        let mut element = render_item(item_index, window, cx);
+                                        let mut element = render_item(cursor.start().0, window, cx);
                                         let item_available_size = size(
                                             bounds.size.width.into(),
                                             AvailableSpace::MinContent,
                                         );
                                         element.layout_as_list_item(
-                                            item_index,
+                                            cursor.start().0,
                                             item_available_size,
                                             window,
                                             cx,
@@ -1368,12 +1366,11 @@ impl StateInner {
                                 let Some(item) = cursor.item() else { break };
 
                                 let size = item.size().unwrap_or_else(|| {
-                                    let item_index = cursor.start().0;
-                                    let mut item = render_item(item_index, window, cx);
+                                    let mut item = render_item(cursor.start().0, window, cx);
                                     let item_available_size =
                                         size(bounds.size.width.into(), AvailableSpace::MinContent);
                                     item.layout_as_list_item(
-                                        item_index,
+                                        cursor.start().0,
                                         item_available_size,
                                         window,
                                         cx,

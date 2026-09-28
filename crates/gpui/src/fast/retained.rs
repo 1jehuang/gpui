@@ -17,7 +17,7 @@
 //! on its own later, when what is around it has to be built.
 
 use crate::fast::dependencies::{DependencyRecording, RenderDependencies};
-use crate::window::{LayoutKeyFrame, PaintIndex, PrepaintStateIndex};
+use crate::window::{PaintIndex, PrepaintStateIndex};
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, ElementId, EntityId, GlobalElementId,
     HitboxId, IntoElement, LayoutId, Pixels, Size, Style, TextStyle, View, ViewElement, Window,
@@ -886,23 +886,6 @@ impl Window {
 // These reach into the window's layout state, for views drawn again at the
 // layout they kept.
 impl Window {
-    // Duplicate of fast::layout_key's; dropped at merge.
-    /// Runs `f` as though the element being prepainted were requesting its
-    /// layout, so that what `f` lays out is keyed as that element's children
-    /// were, and finds the nodes they had.
-    pub(crate) fn with_layout_key_of_prepainting_element<R>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        self.layout_key_stack.push(LayoutKeyFrame {
-            key: self.layout_prepaint_scope,
-            next_unidentified_child: 0,
-        });
-        let result = f(self);
-        self.layout_key_stack.pop();
-        result
-    }
-
     /// How many writes that change a layout the engine has made. See
     /// [`crate::TaffyLayoutEngine::layout_changes`].
     pub(crate) fn layout_changes(&self) -> u64 {
