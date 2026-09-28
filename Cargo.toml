@@ -8,6 +8,7 @@ members = [
     "crates/gpui_linux",
     "crates/gpui_macos",
     "crates/gpui_macros",
+    "crates/gpui_perf",
     "crates/gpui_platform",
     "crates/gpui_shared_string",
     "crates/gpui_util",

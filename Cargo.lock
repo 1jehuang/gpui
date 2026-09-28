@@ -2723,6 +2723,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_perf"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui_wgpu",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gpui_platform"
 version = "0.1.0"
 dependencies = [
