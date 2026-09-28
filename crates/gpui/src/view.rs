@@ -401,6 +401,7 @@ impl<V: View> Element for ViewElement<V> {
                             && !window.dirty_memos.contains(global_id)
                             && !cx.has_active_drag()
                             && window.hovers_unchanged(&element_state.hover_dependencies)
+                            && window.deferred_hovers_unchanged(global_id)
                         {
                             window.keep_retained_layout(&element_state.layout_keys);
                             let prepaint_start = window.prepaint_index();

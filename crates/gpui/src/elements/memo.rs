@@ -202,6 +202,7 @@ impl<K: PartialEq + 'static> Element for Memo<K> {
                 && !window.is_inspector_picking(cx)
                 && !cx.has_active_drag()
                 && state.hovers_unchanged(window)
+                && window.deferred_hovers_unchanged(global_id)
             {
                 window.keep_retained_layout(&state.layout_keys);
                 let prepaint_start = window.prepaint_index();
@@ -575,6 +576,81 @@ mod tests {
         assert_eq!(builds.get(), builds_before + 1);
         assert!(asked_for_a_frame, "a frame should be asked for to build it");
         assert_ne!(Some(hovered), look);
+    }
+
+    struct Popover {
+        builds: Rc<Cell<usize>>,
+    }
+
+    impl Render for Popover {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let builds = self.builds.clone();
+            div().child(
+                memo("with-popover", (), move |_, _| {
+                    builds.set(builds.get() + 1);
+                    div().size_full().child(crate::deferred(
+                        div()
+                            .id("popover")
+                            .w(px(50.))
+                            .h(px(20.))
+                            .bg(crate::black())
+                            .hover(|style| style.bg(crate::white())),
+                    ))
+                })
+                .w(px(100.))
+                .h(px(20.)),
+            )
+        }
+    }
+
+    /// Something a memo draws deferred, such as a popover, is prepainted and
+    /// painted after the memo, but is part of what the memo drew: the pointer
+    /// moving over it changes how the memo looks.
+    #[test]
+    fn a_memo_is_built_again_when_the_pointer_moves_over_what_it_deferred() {
+        let mut cx = TestAppContext::single();
+        let builds = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let builds = builds.clone();
+            move |_, _| Popover { builds }
+        });
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.describe_rendered_frame()
+            })
+            .unwrap()
+        };
+        let move_to = |cx: &mut TestAppContext, x: f32, y: f32| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.simulate_mouse_move(crate::point(px(x), px(y)), cx);
+            })
+            .unwrap();
+        };
+
+        // The pointer starts out at the origin, over the popover.
+        draw(&mut cx);
+        assert_eq!(builds.get(), 1);
+        move_to(&mut cx, 500., 500.);
+        let away = draw(&mut cx);
+        assert_eq!(
+            builds.get(),
+            2,
+            "the pointer leaving the popover changes its look"
+        );
+        window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        draw(&mut cx);
+        assert_eq!(builds.get(), 2, "and nothing else does");
+
+        move_to(&mut cx, 10., 10.);
+        let over = draw(&mut cx);
+        assert_eq!(builds.get(), 3, "the pointer coming back changes it again");
+        assert_ne!(away, over);
+
+        move_to(&mut cx, 500., 500.);
+        let away_again = draw(&mut cx);
+        assert_eq!(builds.get(), 4);
+        assert_eq!(away, away_again);
     }
 
     /// Keys of any type are equal only when they are of the same type and

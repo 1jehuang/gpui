@@ -973,6 +973,13 @@ pub(crate) struct DeferredDraw {
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// The memos and cached views the element was deferred from. It is drawn
+    /// after they are, but is part of what they drew, so it is drawn inside
+    /// them again: what changes its look marks them.
+    memo_stack: Vec<GlobalElementId>,
+    /// The hovers the element was painted by, while inside a memo or cached
+    /// view; see [`Window::hovers_unchanged`].
+    hover_dependencies: Vec<(HitboxId, bool)>,
 }
 
 pub(crate) struct Frame {
@@ -986,6 +993,9 @@ pub(crate) struct Frame {
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
+    /// The hovers what memos and cached views deferred was painted by, by
+    /// memo, so each can check them before it is reused.
+    deferred_hover_dependencies: FxHashMap<GlobalElementId, Vec<(HitboxId, bool)>>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
@@ -1063,6 +1073,7 @@ impl Frame {
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
+            deferred_hover_dependencies: FxHashMap::default(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
@@ -1091,6 +1102,7 @@ impl Frame {
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
+        self.deferred_hover_dependencies.clear();
         self.tab_stops.clear();
         self.focus = None;
 
@@ -3711,6 +3723,8 @@ impl Window {
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
+                    self.memo_stack
+                        .clone_from(&self.next_frame.deferred_draws[deferred_draw_ix].memo_stack);
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
@@ -3718,6 +3732,7 @@ impl Window {
                             });
                         });
                     });
+                    self.memo_stack.clear();
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
@@ -3755,15 +3770,39 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
+                self.memo_stack.clone_from(&deferred_draw.memo_stack);
+                let dependencies_start = self.memo_hover_dependencies.len();
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     window.with_content_mask(content_mask, |window| {
                         window.with_rem_size(Some(deferred_draw.rem_size), |window| {
                             element.paint(window, cx);
                         });
                     })
-                })
+                });
+                deferred_draw.hover_dependencies =
+                    self.memo_hover_dependencies[dependencies_start..].to_vec();
+                self.memo_stack.clear();
             } else {
+                // Reused with the memos it was deferred from, which checked
+                // their own hovers but not these; one that changed has them
+                // built on the next frame, which is asked for.
+                if !self.hovers_unchanged(&deferred_draw.hover_dependencies) {
+                    self.memos_dirty_next_frame
+                        .extend(deferred_draw.memo_stack.iter().cloned());
+                    self.with_rendered_view(deferred_draw.current_view, |window| {
+                        window.request_animation_frame()
+                    });
+                }
                 self.reuse_paint(deferred_draw.paint_range.clone());
+            }
+            if !deferred_draw.hover_dependencies.is_empty() {
+                for memo in &deferred_draw.memo_stack {
+                    self.next_frame
+                        .deferred_hover_dependencies
+                        .entry(memo.clone())
+                        .or_default()
+                        .extend_from_slice(&deferred_draw.hover_dependencies);
+                }
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
@@ -3837,6 +3876,8 @@ impl Window {
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
+                    memo_stack: deferred_draw.memo_stack.clone(),
+                    hover_dependencies: deferred_draw.hover_dependencies.clone(),
                 }),
         );
     }
@@ -4317,6 +4358,8 @@ impl Window {
             absolute_offset,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
+            memo_stack: self.memo_stack.clone(),
+            hover_dependencies: Vec::new(),
         });
     }
 
@@ -7205,6 +7248,16 @@ impl Window {
         dependencies
             .iter()
             .all(|(hitbox, hovered)| (!touch && hitbox.is_hovered(self)) == *hovered)
+    }
+
+    /// Whether every hover that what `memo` deferred was painted by last frame
+    /// is still as it was. It is painted after the memo, so its hovers are not
+    /// among the memo's own.
+    pub(crate) fn deferred_hovers_unchanged(&self, memo: &GlobalElementId) -> bool {
+        self.rendered_frame
+            .deferred_hover_dependencies
+            .get(memo)
+            .is_none_or(|dependencies| self.hovers_unchanged(dependencies))
     }
 
     /// Marks memos to be built again rather than reused on the next frame.
