@@ -1,3 +1,4 @@
+use crate::fast::dependencies::RenderDependencies;
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, Context, Element, ElementId, Entity,
     EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Render,
