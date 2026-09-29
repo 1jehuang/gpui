@@ -3211,7 +3211,8 @@ impl Window {
             .rev()
             .find_map(|h| h.take())
         {
-            let accepts_text_input = input_handler.accepts_text_input(self, cx);
+            let accepts_text_input =
+                cx.querying_input_handler(|cx| input_handler.accepts_text_input(self, cx));
             self.platform_window.set_input_handler(input_handler);
             accepts_text_input
         } else {
@@ -5107,7 +5108,9 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.rendered_entity_stack.push(id);
+        crate::fast::dependencies::enter_drawing_view(self, id);
         let result = f(self);
+        crate::fast::dependencies::leave_drawing_view(self);
         self.rendered_entity_stack.pop();
         result
     }
@@ -5158,7 +5161,8 @@ impl Window {
     fn apply_text_input_configuration(&mut self, cx: &mut App) {
         let configuration = match self.platform_window.take_input_handler() {
             Some(mut input_handler) => {
-                let configuration = input_handler.text_input_configuration(self, cx);
+                let configuration = cx
+                    .querying_input_handler(|cx| input_handler.text_input_configuration(self, cx));
                 self.platform_window.set_input_handler(input_handler);
                 configuration
             }

@@ -1149,3 +1149,118 @@ fn debug_bounds_follow_what_was_painted_while_a_sibling_view_is_reused() {
         "the reused badge keeps last frame's bounds"
     );
 }
+
+/// A text input focused in a view is asked how it is configured after every
+/// frame; that question does not change it, so the views that read it stay
+/// drawn from the last frame.
+struct FocusedInput {
+    focus: crate::FocusHandle,
+    builds: Rc<Cell<usize>>,
+}
+
+impl crate::EntityInputHandler for FocusedInput {
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<crate::UTF16Selection> {
+        None
+    }
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: crate::Bounds<crate::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<crate::Bounds<crate::Pixels>> {
+        None
+    }
+    fn character_index_for_point(
+        &mut self,
+        _: crate::Point<crate::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl Render for FocusedInput {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        let entity = cx.entity();
+        let focus = self.focus.clone();
+        div()
+            .size(px(100.))
+            .track_focus(&self.focus)
+            .child(crate::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, cx| {
+                    window.handle_input(
+                        &focus,
+                        crate::ElementInputHandler::new(bounds, entity.clone()),
+                        cx,
+                    );
+                },
+            ))
+    }
+}
+
+#[test]
+fn asking_a_focused_input_how_it_is_configured_does_not_change_it() {
+    let mut cx = TestAppContext::single();
+    let builds = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let builds = builds.clone();
+        move |window, cx| {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            FocusedInput { focus, builds }
+        }
+    });
+    backgrounds(&mut cx, window.into());
+    backgrounds(&mut cx, window.into());
+    let settled = builds.get();
+    backgrounds(&mut cx, window.into());
+    backgrounds(&mut cx, window.into());
+    assert_eq!(
+        builds.get(),
+        settled,
+        "the input is drawn from the last frame"
+    );
+}

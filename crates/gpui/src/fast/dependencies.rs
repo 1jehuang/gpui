@@ -71,6 +71,9 @@ pub(crate) mod ambient {
 pub(crate) struct AmbientReads {
     globals: Rc<RefCell<Vec<TypeId>>>,
     recordings: Rc<Cell<usize>>,
+    /// The views being drawn, shared with the entity map. See
+    /// [`EntityAccessLog::drawing_views`].
+    drawing_views: Rc<RefCell<Vec<EntityId>>>,
 }
 
 impl AmbientReads {
@@ -82,6 +85,28 @@ impl AmbientReads {
             self.globals.borrow_mut().push(TypeId::of::<T>());
         }
     }
+}
+
+/// Notes that `view` is being drawn, until [`leave_drawing_view`].
+#[inline]
+pub(crate) fn enter_drawing_view(window: &crate::Window, view: EntityId) {
+    window
+        .retained_state
+        .ambient_reads
+        .drawing_views
+        .borrow_mut()
+        .push(view);
+}
+
+/// Ends what [`enter_drawing_view`] began.
+#[inline]
+pub(crate) fn leave_drawing_view(window: &crate::Window) {
+    window
+        .retained_state
+        .ambient_reads
+        .drawing_views
+        .borrow_mut()
+        .pop();
 }
 
 /// Notes, for any recording that is open, that `window`'s pointer position
@@ -131,11 +156,23 @@ impl AmbientInput {
 }
 
 impl App {
+    /// Runs `f`, the window asking the focused input handler what it accepts
+    /// once a frame is drawn. The handler leases its view to answer, which
+    /// does not change it: counting that as an update would build every view
+    /// that read the input again on the next frame.
+    pub(crate) fn querying_input_handler<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = std::mem::replace(&mut self.entities.access_log.querying, true);
+        let result = f(self);
+        self.entities.access_log.querying = previous;
+        result
+    }
+
     /// A handle for a window to record reads of its own state with.
     pub(crate) fn ambient_reads(&self) -> AmbientReads {
         AmbientReads {
             globals: self.dependencies.global_read_log.clone(),
             recordings: self.entities.access_log.recordings.clone(),
+            drawing_views: self.entities.access_log.drawing_views.clone(),
         }
     }
 
@@ -335,6 +372,14 @@ pub(crate) struct EntityAccessLog {
     /// The entity the framework is about to lease to render it, which is
     /// drawing it rather than writing to it. See [`EntityMap::render_next`].
     rendering: Option<EntityId>,
+    /// The views being drawn, innermost last. A view that updates itself
+    /// while it is drawn, as a list row built from its view's state does,
+    /// is drawing, not writing: what it holds is what it is drawing.
+    pub(crate) drawing_views: Rc<RefCell<Vec<EntityId>>>,
+    /// While set, updates are the window asking the focused input handler
+    /// how it is configured at the end of a frame, which reads rather than
+    /// changes it. See [`App::querying_input_handler`].
+    querying: bool,
 }
 
 impl EntityAccessLog {
@@ -427,6 +472,9 @@ impl EntityMap {
     pub(crate) fn note_update(&mut self, entity_id: EntityId) {
         self.note_access(entity_id);
         let log = &mut self.access_log;
+        if log.querying {
+            return;
+        }
         if log.rendering == Some(entity_id) {
             log.rendering = None;
             if log.recordings.get() > 0 {
@@ -436,6 +484,8 @@ impl EntityMap {
         if log.recordings.get() == 0 {
             log.update_generation += 1;
             log.updated_at.insert(entity_id, log.update_generation);
+        } else if log.drawing_views.borrow().contains(&entity_id) {
+            // A view updating itself while it is drawn: part of drawing it.
         } else {
             log.write_generation += 1;
             log.written_at.insert(entity_id, log.write_generation);
