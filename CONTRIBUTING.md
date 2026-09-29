@@ -112,9 +112,10 @@ repository's GPUI. `--headless` runs on gpui-fast only.
 
 ### Headless scenarios
 
-`--headless` measures simulated screens — forms, lists, tables, settings —
-without a window, with real text shaping, retained and not, and `--verify`
-checks that both paint the same quads on every frame:
+`--headless` measures simulated screens — forms, lists, tables, settings, a
+docked trading workspace — without a window, with real text shaping,
+retained and not, and `--verify` checks that both paint the same quads,
+text, icons and images on every frame:
 
 ```sh
 cargo run -p gpui_perf --release -- --headless

@@ -1,7 +1,7 @@
 //! The pages the showcase scrolls: a page of component sections inside the
 //! container that owns the scrolled area, as GPUI Kit's `StoryContainer` does;
-//! a data table refreshed by a timer; and a list of messages of different
-//! heights.
+//! a data table refreshed by a timer; a list of messages of different
+//! heights; and the trading workspace, in `workspace.rs`.
 
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use super::{
     app_state::app_state,
     controls::Tooltip,
     theme::{Theme, theme},
+    workspace::Workspace,
 };
 
 pub const TABLE_ROWS: usize = 5_000;
@@ -26,6 +27,7 @@ pub enum PageKind {
     Components,
     Table,
     List,
+    Workspace,
 }
 
 /// The scrolled area around the page being shown. Scrolling it notifies this
@@ -36,8 +38,11 @@ pub struct Container {
     table_page: Option<Entity<TablePage>>,
     pub table: Option<Entity<Table>>,
     pub messages: Option<Entity<MessageList>>,
+    pub workspace: Option<Entity<Workspace>>,
     showing: PageKind,
     pub refreshing: bool,
+    /// Whether the workspace's quotes are streaming.
+    pub streaming: bool,
     /// The page's name, which the root view reads for its header, as GPUI
     /// Kit's gallery reads its stories'.
     pub title: SharedString,
@@ -51,8 +56,10 @@ impl Container {
             table_page: None,
             table: None,
             messages: None,
+            workspace: None,
             showing: PageKind::Components,
             refreshing: false,
+            streaming: false,
             title: SharedString::default(),
         }
     }
@@ -80,6 +87,9 @@ impl Container {
             PageKind::List if self.messages.is_none() => {
                 self.messages = Some(cx.new(|_| MessageList::new()));
             }
+            PageKind::Workspace if self.workspace.is_none() => {
+                self.workspace = Some(cx.new(Workspace::new));
+            }
             PageKind::Components => self.page.update(cx, |page, cx| {
                 page.seed = seed;
                 cx.notify();
@@ -95,10 +105,21 @@ impl Container {
             self.refreshing = page.update(cx, |page, cx| page.toggle_refresh(window, cx));
         }
     }
+
+    /// Starts or stops streaming the workspace's quotes.
+    pub fn toggle_streaming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(workspace) = &self.workspace {
+            self.streaming =
+                workspace.update(cx, |workspace, cx| workspace.toggle_stream(window, cx));
+        }
+    }
 }
 
 impl Render for Container {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        if let (PageKind::Workspace, Some(workspace)) = (self.showing, &self.workspace) {
+            return div().flex_1().min_h_0().child(workspace.clone());
+        }
         let content: AnyElement = match (self.showing, &self.table_page, &self.messages) {
             (PageKind::Table, Some(table_page), _) => div()
                 .size_full()

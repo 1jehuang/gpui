@@ -28,6 +28,13 @@ use refineable::Refineable;
 use smallvec::SmallVec;
 use std::{any::TypeId, cell::RefCell, mem, ops::Range, rc::Rc};
 
+/// Starts drawing a window's roots: its phase timing, and the views marked
+/// dirty for what they read. See [`Window::mark_changed_retained_views_dirty`].
+pub(crate) fn begin_frame(window: &mut Window, cx: &App) {
+    window.fast_layout.phase_times.begin();
+    window.mark_changed_retained_views_dirty(cx);
+}
+
 /// The retained subtrees drawn in one frame, in the order they began
 /// prepainting, which puts a subtree's nested subtrees right after it.
 #[derive(Default)]
@@ -428,7 +435,7 @@ impl Window {
         }
         let index = self.rendered_frame.retained.find(id)?;
         let record = &self.rendered_frame.retained.records[index];
-        if cx.dependencies_changed(&record.dependencies)
+        if cx.dependencies_changed(&record.dependencies, self.inside_notified_view())
             || !self.hovers_unchanged(&record.hover_dependencies)
         {
             return None;
@@ -913,12 +920,15 @@ impl Window {
             .all(|(hitbox, hovered)| hitbox.hovered_now(self) == *hovered)
     }
 
-    /// Marks retained subtrees to be built again rather than reused on the
-    /// next frame.
+    /// Marks the innermost of the retained subtrees an interaction happened
+    /// in to be built again rather than reused on the next frame. Its
+    /// listener notifies the view it is in, which marks the views around it
+    /// dirty, so they are drawn from last frame around it where they can be
+    /// rather than built again.
     pub(crate) fn invalidate_retained_subtrees(&mut self, subtrees: &[GlobalElementId]) {
         self.retained_state
             .dirty_subtrees
-            .extend(subtrees.iter().cloned());
+            .extend(subtrees.last().cloned());
     }
 
     /// Multiplies the opacity of what is painted from here on by `opacity`,
@@ -1021,6 +1031,54 @@ impl Window {
         }
     }
 
+    /// Marks dirty, as if notified, every view that last frame read something
+    /// itself, outside the views nested in it, that has changed since: an
+    /// entity changed (see [`App::dependencies_changed`]), a global written,
+    /// a scroll or list state moved. Such a view is built again anyway; marking it dirty
+    /// lets the views around it be drawn from last frame around it (see
+    /// [`crate::fast::splice`]) instead of being built again because
+    /// something nested in them changed.
+    pub(crate) fn mark_changed_retained_views_dirty(&mut self, cx: &App) {
+        if !self.retained_state.view_retention || self.refreshing {
+            return;
+        }
+        let notified = &self.retained_state.notified_entities;
+        let mut changed = SmallVec::<[EntityId; 8]>::new();
+        for record in &self.rendered_frame.retained.records {
+            let Some(entity) = crate::fast::splice::view_entity(&record.id) else {
+                continue;
+            };
+            let inside_notified = !notified.is_empty()
+                && self
+                    .rendered_frame
+                    .dispatch_tree
+                    .view_path_reversed(entity)
+                    .any(|view| notified.contains(&view));
+            if cx.dependencies_changed(&record.own_dependencies, inside_notified) {
+                changed.push(entity);
+            }
+        }
+        // As a notification marks a view and the views around it.
+        for entity in changed {
+            for view in self.rendered_frame.dispatch_tree.view_path_reversed(entity) {
+                if !self.dirty_views.insert(view) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Whether the view being drawn, or one around it, was notified since
+    /// the last frame. See [`App::dependencies_changed`].
+    pub(crate) fn inside_notified_view(&self) -> bool {
+        let notified = &self.retained_state.notified_entities;
+        !notified.is_empty()
+            && self
+                .rendered_entity_stack
+                .iter()
+                .any(|entity| notified.contains(entity))
+    }
+
     /// Ends the retained bookkeeping of the frame being drawn, before it
     /// becomes the rendered frame.
     pub(crate) fn finish_retained_frame(&mut self) {
@@ -1086,7 +1144,11 @@ pub struct ViewPrepaintState(ViewPrepaint);
 
 enum ViewLayout {
     /// Laid out by the style it is cached with; built at prepaint if at all.
-    Cached,
+    /// Its node is kept as a view's layout is, for it to be built again on
+    /// its own inside a view drawn around it from last frame.
+    Cached {
+        retained: (Option<Rc<RetainedLayout>>, RecordedDependencies),
+    },
     /// Built, and laid out by its content.
     Built {
         element: AnyElement,
@@ -1149,8 +1211,10 @@ impl<V: View> ViewElement<V> {
                     Some(style) if !caching_disabled => {
                         let mut root_style = Style::default();
                         root_style.refine(style);
+                        let recording = window.begin_retained_layout(cx);
                         let layout_id = window.request_layout(root_style, None, cx);
-                        (layout_id, ViewLayout::Cached)
+                        let retained = window.finish_retained_layout(recording, layout_id, cx);
+                        (layout_id, ViewLayout::Cached { retained })
                     }
                     _ if window.retained_state.view_retention => {
                         let global_id = global_id.expect("a view always has an id");
@@ -1287,6 +1351,7 @@ impl<V: View> ViewElement<V> {
                 } => {
                     let rebuild = window.rebuild_here(
                         &self.rebuild,
+                        None,
                         layout.as_ref().and_then(|layout| layout.parent_layout_key),
                     );
                     let recording = window.begin_retained(global_id, cx);
@@ -1321,7 +1386,9 @@ impl<V: View> ViewElement<V> {
                     window.abandon_splice(splice);
                     self.build_at_retained_layout(previous, global_id, bounds, window, cx)
                 }
-                ViewLayout::Cached => {
+                ViewLayout::Cached {
+                    retained: (layout, layout_dependencies),
+                } => {
                     if !window.dirty_views.contains(&entity_id)
                         && let Some(previous) = window.reusable_retained(global_id, cx)
                         && window.retained_context_matches(previous, bounds)
@@ -1339,8 +1406,22 @@ impl<V: View> ViewElement<V> {
                         .into_any_element();
                     element.layout_as_root(bounds.size.into(), window, cx);
                     element.prepaint_at(bounds.origin, window, cx);
-                    let record =
-                        window.finish_retained_prepaint(recording, bounds, None, None, None, cx);
+                    // Kept so that the view can be built again on its own
+                    // at the node it is laid out at, inside a view drawn
+                    // around it from last frame.
+                    let rebuild = window.rebuild_here(
+                        &self.rebuild,
+                        self.cached_style.as_ref(),
+                        layout.as_ref().and_then(|layout| layout.parent_layout_key),
+                    );
+                    let record = window.finish_retained_prepaint(
+                        recording,
+                        bounds,
+                        layout,
+                        Some(layout_dependencies),
+                        rebuild,
+                        cx,
+                    );
                     ViewPrepaint::Built { element, record }
                 }
                 ViewLayout::Taken => unreachable!("a view is prepainted once"),
@@ -1400,7 +1481,7 @@ impl<V: View> ViewElement<V> {
             .rebuild
             .as_ref()
             .map(|rebuild| rebuild.parent_layout_key());
-        let rebuild = window.rebuild_here(&self.rebuild, parent_layout_key);
+        let rebuild = window.rebuild_here(&self.rebuild, None, parent_layout_key);
         let record = window.finish_retained_prepaint(
             recording,
             bounds,

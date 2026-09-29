@@ -34,7 +34,7 @@ impl AnyView {
     /// [Context::notify] was called on the backing entity since it was rendered
     /// (or [Window::refresh] is called, which ignores caching).
     pub fn cached(self, style: StyleRefinement) -> ViewElement<AnyView> {
-        ViewElement::new(self).cached(style)
+        crate::fast::splice::cached(self.clone(), self, style)
     }
 
     /// Convert this to a weak handle.
@@ -229,7 +229,7 @@ impl<T: Render> Entity<T> {
     /// uncached case.
     #[track_caller]
     pub fn cached(self, style: StyleRefinement) -> ViewElement<Entity<T>> {
-        ViewElement::new(self).cached(style)
+        crate::fast::splice::cached(self.clone(), self.into(), style)
     }
 }
 

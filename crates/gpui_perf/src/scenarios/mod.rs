@@ -6,3 +6,4 @@ pub mod layout;
 pub mod list;
 pub mod settings;
 pub mod table;
+pub mod workspace;

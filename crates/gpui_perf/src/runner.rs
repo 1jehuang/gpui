@@ -515,9 +515,13 @@ fn describe_quad(quad: &Quad) -> String {
     )
 }
 
+/// What the window painted last: its quads, then its text, icons, images
+/// and underlines.
 fn painted_quads(cx: &mut HeadlessAppContext, window: AnyWindowHandle) -> Vec<String> {
     cx.update_window(window, |_, window, _| {
-        window.painted_quads().iter().map(describe_quad).collect()
+        let mut painted: Vec<String> = window.painted_quads().iter().map(describe_quad).collect();
+        painted.extend(window.painted_sprites());
+        painted
     })
     .unwrap()
 }
@@ -528,7 +532,7 @@ fn compare_quads(off: &[String], on: &[String]) -> Option<String> {
     }
     if off.len() != on.len() {
         return Some(format!(
-            "{} quads painted without retention, {} with",
+            "{} primitives painted without retention, {} with",
             off.len(),
             on.len()
         ));
@@ -543,22 +547,22 @@ fn compare_quads(off: &[String], on: &[String]) -> Option<String> {
     let first = off.iter().zip(on).position(|(a, b)| a != b).unwrap();
     if counts.values().all(|&count| count == 0) {
         Some(format!(
-            "the same {} quads, in a different order (first at {first}: {} vs {})",
+            "the same {} primitives, in a different order (first at {first}: {} vs {})",
             off.len(),
             off[first],
             on[first]
         ))
     } else {
         Some(format!(
-            "quad {first} differs: without retention {}, with {}",
+            "primitive {first} differs: without retention {}, with {}",
             off[first], on[first]
         ))
     }
 }
 
 /// Runs scenario `index` with and without retention in lockstep, in one app,
-/// and compares the quads each frame painted. Text and other primitives are
-/// not compared: quads are what the public API exposes of a painted frame.
+/// and compares what each frame painted: quads, and text, icons, images and
+/// underlines, each with its bounds, clip and colour.
 fn verify(index: usize, options: &Options) -> VerifyReport {
     let off_scenario = fresh_scenario(index);
     let on_scenario = fresh_scenario(index);
@@ -686,7 +690,7 @@ pub fn format_reports(reports: &[ScenarioReport]) -> String {
                 None => {
                     let _ = writeln!(
                         out,
-                        "  verify: painted quads identical over {} frames",
+                        "  verify: painted frames identical over {} frames",
                         verify.frames_compared
                     );
                 }

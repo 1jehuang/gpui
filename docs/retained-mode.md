@@ -26,16 +26,25 @@ nodes and primitives are copied from the last frame. A view depends on:
   without observing them, the views nested in it — and the `ListState`s and
   `ScrollHandle`s its elements track. Those two bump a version whenever their
   state changes, so a view is drawn again when one it read moved, notified or
-  not.
+  not. A view that only asked whether a global is set (`cx.has_global::<G>()`)
+  depends on that alone: setting the global where it was not, or removing
+  it, changes it; writing to it does not.
 - **What it was updated with.** An entity updated (`entity.update(..)`) while
-  no view is being drawn — by a task, a listener, an action — counts as
-  changed even if nobody notified it, since upstream would have rendered the
-  view reading it again anyway when the view around it was notified.
+  no view is being drawn — by a task, a listener, an action — and notified
+  counts as changed for every view that read it. So does an entity notified
+  while a view is being drawn. An entity updated without being notified — as
+  every `cx.subscribe` or `cx.observe` handler updates its subscriber, whether
+  it cares about the event or not — counts as changed only for views drawn
+  inside a view notified since the last frame. Upstream builds those again
+  with everything under them, and a view often changes a model it renders and
+  notifies only itself.
 - **Where it is drawn.** Its bounds, content mask, text style and opacity. A
   view that moved is built again, at the layout nodes it kept, and laid out at
   the size its parent gave it.
 - **The hovers it was painted by**, and interactions inside it: a hover,
-  scroll or press that changes how it looks draws it again.
+  scroll or press that changes how it looks draws it again. Only the
+  innermost view it happened in is built again; the views around it are
+  drawn from the last frame around it, as around a notified view.
 
 Nothing is drawn from the last frame while the window is being refreshed
 (`window.refresh()`, and what refreshes it: a resize, a focus change), while
@@ -49,20 +58,31 @@ built again: it is drawn from the last frame stretch by stretch, with the
 nested views that changed built again in the gaps where they were, at their
 own layout nodes and with what they inherited there. If a nested view asks for
 another layout, the view around it is built after all, taking over the nested
-view already built rather than building it twice. The more of a window is
-split into views, the less a change costs. The code is in
+view already built rather than building it twice. A view whose own reads
+changed — an entity updated without being notified, a global written, a
+scroll or list state moved — is marked dirty as if notified, so the views
+around it are drawn from the last frame around it rather than built again
+because something nested in them changed. The more of a window is split into
+views, the less a change costs. The code is in
 `crates/gpui/src/fast/splice.rs`.
 
 A view counts as having read itself, so an application that changes a view
-outside drawing (`entity.update(..)`) without notifying it gets it built again
-on the next frame. Conversely, an entity notified without being updated — as a
-scroll wheel, a dragged scrollbar or an animation notifies a view to draw it
-again — is built again itself, but a view that read it is not: nothing it
-holds has changed. An application that changes what an entity holds through
-interior mutability (`entity.read(cx).cell.borrow_mut()`) has to change it
-with `update` instead for the views reading it to see it. A frame driver or timer that only needs to notify another
-view should notify it by id (`cx.notify(entity_id)`) rather than updating the
-view that owns the driver.
+outside drawing (`entity.update(..)`) and notifies it gets it built again on
+the next frame, with every view that read it. Changed without being notified,
+it is built again only when a view around it was notified. Conversely, an
+entity notified without being updated — as a scroll wheel, a dragged
+scrollbar or an animation notifies a view to draw it again — is built again
+itself, but a view that read it is not: nothing it holds has changed. An
+application that changes what an entity holds through interior mutability
+(`entity.read(cx).cell.borrow_mut()`) has to change it with `update` instead
+for the views reading it to see it. A frame driver or timer that only needs
+to notify another view should notify it by id (`cx.notify(entity_id)`) rather
+than updating the view that owns the driver.
+
+The window asks the focused text input things every frame — whether it
+accepts text, its selection, the bounds of a range — through
+`ElementInputHandler`. Those calls update the input's entity, but do not
+count as changing it unless it notifies while it is asked.
 
 ### Records per retained subtree
 
@@ -80,7 +100,9 @@ therefore does not build everything nested in it.
 `Entity::cached(style)` and `AnyView::cached(style)` are upstream's API and
 work as upstream documents them. They are retained subtrees like any other
 view, so they are also built again when an entity or global they read changed,
-and keep their layout nodes while they are reused.
+and keep their layout nodes while they are reused. A notified cached view is
+built again on its own, at the layout node it kept, inside the views around
+it drawn from the last frame, as any nested view is.
 
 ### Layout nodes
 
@@ -113,6 +135,14 @@ outside entities, the time, `window.modifiers()` — it has to be notified of
 (`cx.notify()`), as a cached view already has to be in upstream GPUI. Otherwise
 it keeps showing what it showed when it was last built.
 
+What still costs a rebuild every frame is a change made every frame. An
+entity notified, or a global written (`cx.global_mut`, `cx.update_global`),
+while the window draws — in prepaint or paint — or on every frame, counts as
+changed even when the value is the same, and every view that read it is
+built again on the next frame, which makes it write again. A resizable panel
+that notifies its state on every prepaint keeps every view reading that state
+from being retained. Notify or write only when the value changes.
+
 To rule retention in or out when something looks stale, run with
 `GPUI_VIEW_RETENTION=0`: every view is then drawn from scratch each frame, as
 upstream does.
@@ -128,8 +158,9 @@ A retained frame has to be the frame drawing from scratch would have produced.
   global, and asserts that views really were reused.
 - `crates/gpui/src/fast/tests/retained.rs` covers reuse, rebuilding when a
   dependency or a hover changes, moved views and retention turned off.
-- `cargo run -p gpui_perf --release -- --headless --verify` compares the quads
-  painted with retention on and off on every frame of every simulated screen.
+- `cargo run -p gpui_perf --release -- --headless --verify` compares the quads,
+  text, icons and images painted with retention on and off on every frame of
+  every simulated screen.
 
 ```sh
 cargo test -p gpui --features test-support

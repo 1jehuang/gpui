@@ -42,7 +42,7 @@
 //! - `--retention on|off|both`: which modes to run (default both).
 //! - `--json PATH`: also write every result as JSON.
 //! - `--verify`: also run both modes in lockstep and check they paint the
-//!   same quads every frame.
+//!   same quads, text, icons and images every frame.
 //! - `--list`: print the scenarios and exit.
 
 // The GPUI the showcase runs on, named `gpui` and `gpui_platform` either way:

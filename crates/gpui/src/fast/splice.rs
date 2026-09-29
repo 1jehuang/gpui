@@ -30,7 +30,7 @@ use crate::window::DeferredDraw;
 use crate::window::{PaintIndex, PrepaintStateIndex};
 use crate::{
     AnyView, App, ContentMask, ElementId, EntityId, FocusId, GlobalElementId, HitboxId, LayoutId,
-    Pixels, Point, TextStyleRefinement, View, ViewElement, Window,
+    Pixels, Point, StyleRefinement, TextStyleRefinement, View, ViewElement, Window,
 };
 use collections::FxHashSet;
 use smallvec::SmallVec;
@@ -40,6 +40,14 @@ use std::{mem, ops::Range};
 /// its own. Empty for a view that is not an entity or an [`AnyView`].
 #[derive(Default)]
 pub(crate) struct RebuildHandle(Option<AnyView>);
+
+/// `view` drawn as a cached view laid out at `style`, as
+/// [`AnyView::cached`](crate::AnyView::cached) and
+/// [`Entity::cached`](crate::Entity::cached) draw it, kept as `any` so that it
+/// can be built again on its own.
+pub(crate) fn cached<V: View>(view: V, any: AnyView, style: StyleRefinement) -> ViewElement<V> {
+    ViewElement::new(view).rebuildable(any).cached(style)
+}
 
 impl<V: View> ViewElement<V> {
     /// Keeps `view`, which renders what this element does, to build it again
@@ -59,6 +67,8 @@ pub(crate) struct Rebuild {
     text_style_stack: Vec<TextStyleRefinement>,
     element_offset: Point<Pixels>,
     rem_size: Pixels,
+    /// The style it is laid out at, when it is a cached view.
+    cached_style: Option<StyleRefinement>,
 }
 
 impl Rebuild {
@@ -75,6 +85,7 @@ impl Window {
     pub(crate) fn rebuild_here(
         &self,
         handle: &RebuildHandle,
+        cached_style: Option<&StyleRefinement>,
         parent_layout_key: Option<u64>,
     ) -> Option<Rebuild> {
         if !self.image_cache_stack.is_empty() {
@@ -86,6 +97,7 @@ impl Window {
             text_style_stack: self.text_style_stack.clone(),
             element_offset: self.element_offset(),
             rem_size: self.rem_size(),
+            cached_style: cached_style.cloned(),
         })
     }
 }
@@ -258,7 +270,7 @@ impl Window {
         let layout = record.layout.as_ref()?;
         if layout.rem_size != self.rem_size()
             || layout.text_style != self.text_style()
-            || cx.dependencies_changed(&record.own_dependencies)
+            || cx.dependencies_changed(&record.own_dependencies, self.inside_notified_view())
             || !self.hovers_unchanged(&record.own_hovers)
         {
             return None;
@@ -352,6 +364,7 @@ impl Window {
         let dependency_recording = cx.begin_recording_dependencies();
         let inherited = self.enter_gap(&global_id, &rebuild, context.content_mask, context.opacity);
         let mut view = ViewElement::new(rebuild.view.clone()).rebuildable(rebuild.view.clone());
+        view.cached_style = rebuild.cached_style.clone();
         // What its element's request for layout does, inside the view around
         // it.
         let (layout_id, layout, layout_key) =
@@ -792,7 +805,7 @@ fn copy_record(
 }
 
 /// The entity of the view whose element has the id `id`.
-fn view_entity(id: &GlobalElementId) -> Option<EntityId> {
+pub(crate) fn view_entity(id: &GlobalElementId) -> Option<EntityId> {
     match id.0.last()? {
         ElementId::View(entity) => Some(*entity),
         _ => None,

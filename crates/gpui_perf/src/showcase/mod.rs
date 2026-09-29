@@ -10,18 +10,24 @@
 //! moves the page view, and the data table's timer changes the table without
 //! notifying it, notifying the page around it instead.
 //!
+//! Its last page is a trading workspace, built the way Longbridge Pro builds
+//! its main window on GPUI Kit: docked panels in cached tab groups, a focused
+//! search box, a text selection layer, and a market feed every panel
+//! subscribes to, which a timer streams quotes into; see `workspace.rs`.
+//!
 //! The toolbar picks what scrolls itself, and switches the data refresh and
-//! retained views. Every command has a key: `1`–`4` for what scrolls, `R` for
-//! the refresh, `V` for retained views, and the arrow keys to move through
-//! the sidebar. The status bar shows, every half second, the frame rate, the
-//! process's CPU and the main thread's, its resident memory, what build,
-//! prepaint, layout and paint
-//! took per frame, and how many views were built and reused per frame.
+//! retained views. Every command has a key: `1`–`6` for what scrolls, `R` for
+//! the refresh, `Q` for the workspace's quote stream, `V` for retained views,
+//! and the arrow keys to move through the sidebar. The status bar shows,
+//! every half second, the frame rate, the process's CPU and the main
+//! thread's, its resident memory, what build, prepaint, layout and paint took
+//! per frame, and how many views were built and reused per frame.
 //!
 //! With `--auto`, it runs every scenario with retained views on and then off,
 //! prints what each cost per frame, and quits. `--only <scenario>`,
-//! `--retention on|off` and `--frames <n>` narrow it down. On macOS it holds
-//! the CPU's clock up while it measures; see `clock.rs`.
+//! `--retention on|off` and `--frames <n>` narrow it down, and `--list` prints
+//! the scenarios instead. On macOS it holds the CPU's clock up while it
+//! measures; see `clock.rs`.
 //!
 //! Built with the `upstream` feature it runs on upstream GPUI, the
 //! `gpui-pre` snapshot GPUI Kit pins, for comparison; see `backend.rs`.
@@ -34,6 +40,7 @@ mod controls;
 mod metrics;
 mod pages;
 mod theme;
+mod workspace;
 
 #[path = "../../../gpui/examples/example_support/fonts.rs"]
 mod example_support;
@@ -66,7 +73,9 @@ actions!(
         ScrollPage,
         ScrollTable,
         ScrollList,
+        ScrollWatchlist,
         ToggleRefresh,
+        ToggleStreaming,
         ToggleRetention,
         SelectNext,
         SelectPrevious,
@@ -149,6 +158,8 @@ fn groups() -> &'static [(&'static str, Vec<&'static str>)] {
                 .collect();
             groups.push((group, pages));
         }
+        // Last, so that the pages before it keep their places.
+        groups.push(("Applications", vec!["Trading workspace"]));
         groups
     })
 }
@@ -176,8 +187,17 @@ fn list_page() -> usize {
     pages().position(|name| name == "List").unwrap_or(0)
 }
 
+/// The page showing the trading workspace.
+fn workspace_page() -> usize {
+    pages()
+        .position(|name| name == "Trading workspace")
+        .unwrap_or(0)
+}
+
 fn page_kind(page: usize) -> PageKind {
-    if page == table_page() {
+    if page == workspace_page() {
+        PageKind::Workspace
+    } else if page == table_page() {
         PageKind::Table
     } else if page == list_page() {
         PageKind::List
@@ -202,6 +222,8 @@ pub enum Scroll {
     Page,
     Table,
     List,
+    /// The trading workspace's watchlist.
+    Watchlist,
 }
 
 /// Opens the showcase, running every scenario and quitting if `auto`.
@@ -213,6 +235,10 @@ const DEMO_STEP: Duration = Duration::from_secs(6);
 /// for as long as it is open, for recording or watching two GPUIs side by
 /// side.
 pub fn run(auto: bool, demo: bool) {
+    if auto && std::env::args().any(|arg| arg == "--list") {
+        auto::list();
+        return;
+    }
     application().run(move |cx: &mut App| {
         if !example_support::load_fonts(cx) {
             return;
@@ -223,7 +249,9 @@ pub fn run(auto: bool, demo: bool) {
             KeyBinding::new("3", ScrollPage, Some(KEY_CONTEXT)),
             KeyBinding::new("4", ScrollTable, Some(KEY_CONTEXT)),
             KeyBinding::new("5", ScrollList, Some(KEY_CONTEXT)),
+            KeyBinding::new("6", ScrollWatchlist, Some(KEY_CONTEXT)),
             KeyBinding::new("r", ToggleRefresh, Some(KEY_CONTEXT)),
+            KeyBinding::new("q", ToggleStreaming, Some(KEY_CONTEXT)),
             KeyBinding::new("v", ToggleRetention, Some(KEY_CONTEXT)),
             KeyBinding::new("down", SelectNext, Some(KEY_CONTEXT)),
             KeyBinding::new("up", SelectPrevious, Some(KEY_CONTEXT)),
@@ -394,6 +422,15 @@ fn step(
             state.scroll_by(speed);
             cx.notify(messages.entity_id());
         }
+        Scroll::Watchlist => {
+            let Some(workspace) = handles.container.read(cx).workspace.clone() else {
+                return true;
+            };
+            let watchlist = workspace.read(cx).watchlist.clone();
+            let handle = watchlist.read(cx).scroll.0.borrow().base_handle.clone();
+            bounce(&handle);
+            cx.notify(watchlist.entity_id());
+        }
     }
     true
 }
@@ -495,6 +532,7 @@ impl Showcase {
     fn set_scroll(&mut self, scroll: Scroll, window: &mut Window, cx: &mut Context<Self>) {
         self.driver.borrow_mut().scroll = scroll;
         self.show_scroll(scroll, cx);
+        self.focus_page(window, cx);
         if scroll != Scroll::Off {
             self.start_frames(window, cx);
         }
@@ -506,6 +544,9 @@ impl Showcase {
         match scroll {
             Scroll::Table if self.active != table_page() => self.select(table_page(), cx),
             Scroll::List if self.active != list_page() => self.select(list_page(), cx),
+            Scroll::Watchlist if self.active != workspace_page() => {
+                self.select(workspace_page(), cx)
+            }
             Scroll::Page if page_kind(self.active) != PageKind::Components => {
                 self.select(BUTTON_PAGE, cx)
             }
@@ -521,6 +562,31 @@ impl Showcase {
         self.container
             .update(cx, |container, cx| container.toggle_refresh(window, cx));
         cx.notify();
+    }
+
+    /// Starts or stops the workspace's quote stream, showing the workspace.
+    fn toggle_streaming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active != workspace_page() {
+            self.select(workspace_page(), cx);
+        }
+        self.container
+            .update(cx, |container, cx| container.toggle_streaming(window, cx));
+        self.focus_page(window, cx);
+        cx.notify();
+    }
+
+    /// Focuses the workspace's search box while the workspace is shown, as a
+    /// trading window keeps its symbol search focused, and the showcase
+    /// otherwise.
+    fn focus_page(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let search = (self.active == workspace_page())
+            .then(|| self.container.read(cx).workspace.clone())
+            .flatten()
+            .map(|workspace| workspace.read(cx).search.read(cx).focus.clone());
+        search
+            .as_ref()
+            .unwrap_or(&self.focus_handle)
+            .focus(window, cx);
     }
 
     fn toggle_retention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -558,6 +624,7 @@ impl Showcase {
             (theme.border, build, theme.build_foreground)
         };
         let refreshing = self.container.read(cx).refreshing;
+        let streaming = self.container.read(cx).streaming;
         let retention = backend::view_retention(window);
         let scroll_option = |scroll: Scroll,
                              label: &'static str,
@@ -625,6 +692,13 @@ impl Showcase {
                             "Scroll a list of messages",
                             "5",
                             cx,
+                        ))
+                        .child(scroll_option(
+                            Scroll::Watchlist,
+                            "Watchlist",
+                            "Scroll the trading workspace's watchlist",
+                            "6",
+                            cx,
                         )),
                 ),
             )
@@ -633,6 +707,14 @@ impl Showcase {
                 switch("refresh", "Refresh data", refreshing, cx)
                     .tooltip(Tooltip::text("Update table rows every 33 ms", Some("R")))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_refresh(window, cx))),
+            )
+            .child(
+                switch("streaming", "Stream quotes", streaming, cx)
+                    .tooltip(Tooltip::text(
+                        "Stream 8 quotes into the trading workspace 60 times a second",
+                        Some("Q"),
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_streaming(window, cx))),
             )
             // Upstream GPUI has no retained views to switch.
             .when_some(retention, |this, retention| {
@@ -673,7 +755,10 @@ impl Showcase {
                         this.hover(|this| this.bg(theme.sidebar_accent.opacity(0.6)))
                     })
                     .child(self.stories[page].read(cx).name.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(page, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select(page, cx);
+                        this.focus_page(window, cx);
+                    }))
             });
             div()
                 .flex()
@@ -733,7 +818,10 @@ impl Showcase {
                     .child(name.clone()),
             )
             .child(div().text_sm().text_color(theme.muted_foreground).child(
-                if self.active == table_page() {
+                if self.active == workspace_page() {
+                    "Docked market panels, every one subscribed to a feed of streaming quotes."
+                        .to_string()
+                } else if self.active == table_page() {
                     "A virtualized table of quotes that a timer keeps updating.".to_string()
                 } else if self.active == list_page() {
                     "A conversation of messages of different heights, in a gpui::list.".to_string()
@@ -795,17 +883,25 @@ impl Render for Showcase {
             .on_action(cx.listener(|this, _: &ScrollList, window, cx| {
                 this.set_scroll(Scroll::List, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ScrollWatchlist, window, cx| {
+                this.set_scroll(Scroll::Watchlist, window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &ToggleRefresh, window, cx| this.toggle_refresh(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleStreaming, window, cx| {
+                this.toggle_streaming(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleRetention, window, cx| {
                 this.toggle_retention(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
-                this.select((this.active + 1).min(page_count() - 1), cx)
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                this.select((this.active + 1).min(page_count() - 1), cx);
+                this.focus_page(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
-                this.select(this.active.saturating_sub(1), cx)
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
+                this.select(this.active.saturating_sub(1), cx);
+                this.focus_page(window, cx);
             }))
             .size_full()
             .flex()

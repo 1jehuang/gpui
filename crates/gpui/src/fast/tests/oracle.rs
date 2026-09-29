@@ -708,7 +708,16 @@ impl Render for Panel {
                 this.hover(|style| style.bg(PALETTE[4]))
             })
             .child(WORDS[(self.value + shared) % WORDS.len()])
-            .child(self.leaf.clone())
+            // Some leaves are cached, so a panel is drawn around a cached
+            // view built again in it, as around one that is not.
+            .when(self.ix >= PANELS / 2, |this| {
+                this.child(
+                    self.leaf
+                        .clone()
+                        .cached(StyleRefinement::default().w(px(30.)).h(px(8.))),
+                )
+            })
+            .when(self.ix < PANELS / 2, |this| this.child(self.leaf.clone()))
     }
 }
 

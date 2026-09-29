@@ -1089,3 +1089,747 @@ fn a_view_that_read_the_pointer_or_modifiers_is_rendered_again_when_they_change(
     );
     assert_ne!(moved, shifted, "and which modifiers are held");
 }
+
+/// A text field that hands the platform its own input handler, and can
+/// notify itself once while the window asks it whether it accepts text.
+struct TextField {
+    focus: crate::FocusHandle,
+    notify_when_asked: Cell<bool>,
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for TextField {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        let (focus, field) = (self.focus.clone(), cx.entity());
+        crate::canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                window.handle_input(&focus, crate::ElementInputHandler::new(bounds, field), cx)
+            },
+        )
+        .w(px(100.))
+        .h(px(20.))
+    }
+}
+
+impl crate::EntityInputHandler for TextField {
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<crate::UTF16Selection> {
+        None
+    }
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: crate::Bounds<crate::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<crate::Bounds<crate::Pixels>> {
+        None
+    }
+    fn character_index_for_point(
+        &mut self,
+        _: crate::Point<crate::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+    fn accepts_text_input(&self, _: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.notify_when_asked.take() {
+            cx.notify();
+        }
+        true
+    }
+}
+
+/// A view that reads the text field it shows, as a form reads whether its
+/// field is empty.
+struct Form {
+    field: Entity<TextField>,
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for Form {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        let asks = self.field.read(cx).notify_when_asked.get();
+        div()
+            .flex()
+            .flex_col()
+            .child(format!("form {asks}"))
+            .child(self.field.clone())
+    }
+}
+
+/// A view around another, counting its builds.
+struct Shell {
+    child: crate::AnyView,
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for Shell {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        div()
+            .flex()
+            .flex_col()
+            .child("shell")
+            .child(self.child.clone())
+    }
+}
+
+/// The window asks the focused text field whether it accepts text, and how
+/// it is configured, on every frame. That is not a change to the field: a
+/// view that read it is not built again, even inside a notified view. A
+/// field that notifies while it is asked has changed, and the view that read
+/// it is built again.
+#[test]
+fn asking_the_focused_text_field_is_not_a_change_unless_it_notifies() {
+    let mut cx = TestAppContext::single();
+    let (form_builds, field_builds) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let window = cx.add_window({
+        let (form_builds, field_builds) = (form_builds.clone(), field_builds.clone());
+        move |_, cx| {
+            let field = cx.new(|cx| TextField {
+                focus: cx.focus_handle(),
+                notify_when_asked: Cell::new(false),
+                builds: field_builds,
+            });
+            Shell {
+                child: cx
+                    .new(|_| Form {
+                        field,
+                        builds: form_builds,
+                    })
+                    .into(),
+                builds: Rc::new(Cell::new(0)),
+            }
+        }
+    });
+    let field = cx.update(|cx| {
+        window
+            .read(cx)
+            .unwrap()
+            .child
+            .clone()
+            .downcast::<Form>()
+            .unwrap()
+            .read(cx)
+            .field
+            .clone()
+    });
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.describe_rendered_frame()
+        })
+        .unwrap()
+    };
+    let focus = field.read_with(&cx, |field, _| field.focus.clone());
+    cx.update_window(window.into(), |_, window, cx| window.focus(&focus, cx))
+        .unwrap();
+    draw(&mut cx);
+    draw(&mut cx);
+    let before = (form_builds.get(), field_builds.get());
+
+    for _ in 0..3 {
+        window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        draw(&mut cx);
+    }
+    assert_eq!(
+        (form_builds.get(), field_builds.get()),
+        before,
+        "being asked every frame changes nothing the form read"
+    );
+
+    field.read_with(&cx, |field, _| field.notify_when_asked.set(true));
+    draw(&mut cx);
+    let asked = (form_builds.get(), field_builds.get());
+    let notified = draw(&mut cx);
+    assert_eq!(
+        (form_builds.get(), field_builds.get()),
+        (asked.0 + 1, asked.1 + 1),
+        "a field that notified while asked is built again, with the form that read it"
+    );
+    cx.update_window(window.into(), |_, window, _| window.forget_retained_state())
+        .unwrap();
+    assert_eq!(notified, draw(&mut cx));
+}
+
+struct Ping;
+
+impl crate::EventEmitter<Ping> for Model {}
+
+/// A view that subscribes to a model it shows and ignores what it emits.
+struct Subscriber {
+    model: Entity<Model>,
+    builds: Rc<Cell<usize>>,
+    _subscription: crate::Subscription,
+}
+
+impl Render for Subscriber {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        div().child(format!("model {}", self.model.read(cx).0))
+    }
+}
+
+struct Subscribers {
+    first: Entity<Subscriber>,
+    second: Entity<Subscriber>,
+    bystander: Entity<Counted>,
+}
+
+impl Render for Subscribers {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .child(self.first.clone())
+            .child(self.second.clone())
+            .child(self.bystander.clone())
+    }
+}
+
+/// Every subscriber of a model is updated for each event it emits, whether
+/// it cares or not. A view updated that way, and not notified, is not built
+/// again, nor is a view that read a model emitting without being notified,
+/// unless it is inside a view notified since. A model updated and notified
+/// is a change wherever it was read.
+#[test]
+fn a_view_updated_without_a_notify_is_built_again_only_inside_a_notified_view() {
+    let mut cx = TestAppContext::single();
+    let builds = Rc::new(Cell::new(0));
+    let model = cx.new(|_| Model(0));
+    let window = cx.add_window({
+        let (builds, model) = (builds.clone(), model.clone());
+        move |_, cx| {
+            let mut subscriber = || {
+                cx.new(|cx| Subscriber {
+                    _subscription: cx.subscribe(&model, |_, _, _: &Ping, _| {}),
+                    model: model.clone(),
+                    builds: builds.clone(),
+                })
+            };
+            Subscribers {
+                first: subscriber(),
+                second: subscriber(),
+                bystander: cx.new(|_| Counted {
+                    label: 0,
+                    model: None,
+                    builds: Rc::new(Cell::new(0)),
+                }),
+            }
+        }
+    });
+    let bystander = window
+        .read_with(&cx, |view, _| view.bystander.clone())
+        .unwrap();
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.describe_rendered_frame()
+        })
+        .unwrap()
+    };
+    let emit = |cx: &mut TestAppContext| model.update(cx, |_, cx| cx.emit(Ping));
+    draw(&mut cx);
+    assert_eq!(builds.get(), 2);
+
+    emit(&mut cx);
+    draw(&mut cx);
+    assert_eq!(builds.get(), 2, "an ignored event changes nothing drawn");
+
+    emit(&mut cx);
+    bystander.update(&mut cx, |bystander, cx| {
+        bystander.label += 1;
+        cx.notify();
+    });
+    draw(&mut cx);
+    assert_eq!(
+        builds.get(),
+        2,
+        "nor does it when a sibling is notified and the parent is drawn around it"
+    );
+
+    emit(&mut cx);
+    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    draw(&mut cx);
+    assert_eq!(
+        builds.get(),
+        4,
+        "inside a notified view, what was updated since is built again"
+    );
+
+    model.update(&mut cx, |model, cx| {
+        model.0 = 3;
+        cx.emit(Ping);
+        cx.notify();
+    });
+    let changed = draw(&mut cx);
+    assert_eq!(builds.get(), 6, "a model updated and notified has changed");
+    cx.update_window(window.into(), |_, window, _| window.forget_retained_state())
+        .unwrap();
+    assert_eq!(changed, draw(&mut cx));
+}
+
+struct Theme(usize);
+
+impl crate::Global for Theme {}
+
+/// A view that only asks whether the theme is set.
+struct AsksForTheme(Rc<Cell<usize>>);
+
+impl Render for AsksForTheme {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.0.set(self.0.get() + 1);
+        div().child(format!("themed {}", cx.has_global::<Theme>()))
+    }
+}
+
+/// A view that reads the theme.
+struct ReadsTheme(Rc<Cell<usize>>);
+
+impl Render for ReadsTheme {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.0.set(self.0.get() + 1);
+        let theme = cx.try_global::<Theme>().map_or(0, |theme| theme.0);
+        div().child(format!("theme {theme}"))
+    }
+}
+
+struct Themed {
+    asks: Entity<AsksForTheme>,
+    reads: Entity<ReadsTheme>,
+}
+
+impl Render for Themed {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .child(self.asks.clone())
+            .child(self.reads.clone())
+    }
+}
+
+/// A view that only asked whether a global is set depends on that, not on
+/// the global: writing to the global builds again the views that read it,
+/// but not that one, which is built again when the global is set where it
+/// was not or removed.
+#[test]
+fn a_view_that_asked_whether_a_global_is_set_is_built_again_only_when_that_changes() {
+    let mut cx = TestAppContext::single();
+    let (asks, reads) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    cx.update(|cx| cx.set_global(Theme(0)));
+    let window = cx.add_window({
+        let (asks, reads) = (asks.clone(), reads.clone());
+        move |_, cx| Themed {
+            asks: cx.new(|_| AsksForTheme(asks)),
+            reads: cx.new(|_| ReadsTheme(reads)),
+        }
+    });
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.describe_rendered_frame()
+        })
+        .unwrap()
+    };
+    let builds = || (asks.get(), reads.get());
+    draw(&mut cx);
+    assert_eq!(builds(), (1, 1));
+
+    cx.update(|cx| cx.global_mut::<Theme>().0 = 1);
+    draw(&mut cx);
+    assert_eq!(builds(), (1, 2), "global_mut writes the theme");
+
+    cx.update_global::<Theme, _>(|theme, _| theme.0 = 2);
+    draw(&mut cx);
+    assert_eq!(builds(), (1, 3), "update_global writes the theme");
+
+    cx.update(|cx| cx.set_global(Theme(3)));
+    draw(&mut cx);
+    assert_eq!(builds(), (1, 4), "setting a theme that was set writes it");
+
+    cx.update(|cx| cx.remove_global::<Theme>());
+    draw(&mut cx);
+    assert_eq!(builds(), (2, 5), "removing it changes whether it is set");
+
+    cx.update(|cx| cx.set_global(Theme(4)));
+    let set = draw(&mut cx);
+    assert_eq!(builds(), (3, 6), "setting it again changes that back");
+    cx.update_window(window.into(), |_, window, _| window.forget_retained_state())
+        .unwrap();
+    assert_eq!(set, draw(&mut cx));
+}
+
+/// Makes a window whose root is a counted [`Shell`] around `child`, and
+/// returns it with the shell's build count.
+fn shell(
+    cx: &mut TestAppContext,
+    child: impl FnOnce(&mut crate::App) -> crate::AnyView + 'static,
+) -> (WindowHandle<Shell>, Rc<Cell<usize>>) {
+    let builds = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let builds = builds.clone();
+        move |_, cx| Shell {
+            child: child(cx),
+            builds,
+        }
+    });
+    (window, builds)
+}
+
+fn draw_shell(cx: &mut TestAppContext, window: WindowHandle<Shell>) -> Vec<String> {
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.describe_rendered_frame()
+    })
+    .unwrap()
+}
+
+/// A view of a fixed size whose colour comes from its tint and a model, so
+/// a change to either repaints it without laying it out again.
+struct Tinted {
+    tint: usize,
+    model: Option<Entity<Model>>,
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for Tinted {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        let model = self.model.as_ref().map_or(0, |model| model.read(cx).0);
+        let color = if (self.tint + model).is_multiple_of(2) {
+            crate::black()
+        } else {
+            crate::white()
+        };
+        div().w(px(50.)).h(px(20.)).bg(color)
+    }
+}
+
+/// A nested view that read a model changed since, with nothing notified
+/// but the model, is built again on its own: the view around it, which read
+/// the model only through it, is drawn around it from last frame.
+#[test]
+fn a_view_around_one_whose_model_changed_is_drawn_around_it() {
+    let mut cx = TestAppContext::single();
+    let inner_builds = Rc::new(Cell::new(0));
+    let model = cx.new(|_| Model(0));
+    let (window, outer_builds) = shell(&mut cx, {
+        let (inner_builds, model) = (inner_builds.clone(), model.clone());
+        move |cx| {
+            cx.new(|_| Tinted {
+                tint: 0,
+                model: Some(model),
+                builds: inner_builds,
+            })
+            .into()
+        }
+    });
+    let before = draw_shell(&mut cx, window);
+    assert_eq!((outer_builds.get(), inner_builds.get()), (1, 1));
+
+    // The window draws as the update is flushed.
+    model.update(&mut cx, |model, cx| {
+        model.0 = 1;
+        cx.notify();
+    });
+    assert_eq!((outer_builds.get(), inner_builds.get()), (1, 2));
+    let changed = describe_shell(&mut cx, window);
+    assert_ne!(before, changed);
+    cx.update_window(window.into(), |_, window, _| window.forget_retained_state())
+        .unwrap();
+    assert_eq!(changed, draw_shell(&mut cx, window));
+}
+
+fn describe_shell(cx: &mut TestAppContext, window: WindowHandle<Shell>) -> Vec<String> {
+    cx.update_window(window.into(), |_, window, _| {
+        window.describe_rendered_frame()
+    })
+    .unwrap()
+}
+
+/// Two views side by side.
+struct Pair {
+    left: crate::AnyView,
+    right: crate::AnyView,
+}
+
+impl Render for Pair {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .child(self.left.clone())
+            .child(self.right.clone())
+    }
+}
+
+/// A view drawn around a nested view built again has read what that view
+/// read as of that frame: on a later frame, with nothing it read changed
+/// since, it is drawn from last frame rather than built again, as when a
+/// view beside it is notified.
+#[test]
+fn a_view_drawn_around_a_nested_view_is_reused_on_a_later_frame() {
+    let mut cx = TestAppContext::single();
+    let (outer_builds, inner_builds) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let model = cx.new(|_| Model(0));
+    let tinted = |cx: &mut crate::App, model: Option<Entity<Model>>, builds| {
+        cx.new(|_| Tinted {
+            tint: 0,
+            model,
+            builds,
+        })
+    };
+    let window = cx.add_window({
+        let (outer_builds, inner_builds, model) =
+            (outer_builds.clone(), inner_builds.clone(), model.clone());
+        move |_, cx| {
+            let inner = tinted(cx, Some(model), inner_builds);
+            Pair {
+                left: cx
+                    .new(|_| Shell {
+                        child: inner.into(),
+                        builds: outer_builds,
+                    })
+                    .into(),
+                right: tinted(cx, None, Rc::new(Cell::new(0))).into(),
+            }
+        }
+    });
+    let right = window
+        .read_with(&cx, |pair, _| {
+            pair.right.clone().downcast::<Tinted>().unwrap()
+        })
+        .unwrap();
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.describe_rendered_frame()
+        })
+        .unwrap()
+    };
+    draw(&mut cx);
+    // The window draws as each update is flushed.
+    model.update(&mut cx, |model, cx| {
+        model.0 = 1;
+        cx.notify();
+    });
+    let builds_then = (outer_builds.get(), inner_builds.get());
+    assert_eq!(builds_then, (1, 2), "the shell is drawn around the view");
+
+    right.update(&mut cx, |right, cx| {
+        right.tint = 1;
+        cx.notify();
+    });
+    let later = cx
+        .update_window(window.into(), |_, window, _| {
+            window.describe_rendered_frame()
+        })
+        .unwrap();
+    assert_eq!(
+        (outer_builds.get(), inner_builds.get()),
+        builds_then,
+        "nothing the shell read changed since the frame it was drawn around the view"
+    );
+    cx.update_window(window.into(), |_, window, _| window.forget_retained_state())
+        .unwrap();
+    assert_eq!(later, draw(&mut cx));
+}
+
+/// A view with something in it that has a hover style.
+struct Hoverable(Rc<Cell<usize>>);
+
+impl Render for Hoverable {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.0.set(self.0.get() + 1);
+        div().child(
+            div()
+                .id("hoverable")
+                .w(px(50.))
+                .h(px(20.))
+                .bg(crate::black())
+                .hover(|style| style.bg(crate::white())),
+        )
+    }
+}
+
+/// The pointer moving onto or off something with a hover style builds again
+/// the view it is in, and only that one: the views around it are drawn
+/// around it from last frame.
+#[test]
+fn a_hover_inside_a_nested_view_builds_only_that_view_again() {
+    let mut cx = TestAppContext::single();
+    let inner_builds = Rc::new(Cell::new(0));
+    let (window, outer_builds) = shell(&mut cx, {
+        let inner_builds = inner_builds.clone();
+        move |cx| cx.new(|_| Hoverable(inner_builds)).into()
+    });
+    let move_to = |cx: &mut TestAppContext, x: f32, y: f32| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_mouse_move(crate::point(px(x), px(y)), cx);
+        })
+        .unwrap();
+    };
+    move_to(&mut cx, 500., 500.);
+    let away = draw_shell(&mut cx, window);
+    let before = (outer_builds.get(), inner_builds.get());
+
+    // The shell draws a line of text above the hoverable view.
+    let hoverable = cx
+        .update_window(window.into(), |_, window, _| {
+            window
+                .rendered_frame
+                .hitboxes
+                .last()
+                .map(|hitbox| hitbox.bounds.center())
+        })
+        .unwrap()
+        .expect("the hoverable element has a hitbox");
+    move_to(&mut cx, hoverable.x.into(), hoverable.y.into());
+    let over = draw_shell(&mut cx, window);
+    assert_eq!(
+        (outer_builds.get(), inner_builds.get()),
+        (before.0, before.1 + 1)
+    );
+    assert_ne!(away, over);
+    cx.update_window(window.into(), |_, window, _| window.forget_retained_state())
+        .unwrap();
+    assert_eq!(over, draw_shell(&mut cx, window));
+
+    move_to(&mut cx, 500., 500.);
+    let away_again = draw_shell(&mut cx, window);
+    assert_eq!(
+        outer_builds.get(),
+        before.0 + 1,
+        "only the forgetting built it"
+    );
+    assert_eq!(away, away_again);
+}
+
+/// A view around a nested view, cached by the style it is cached with or
+/// not.
+struct AroundNested {
+    child: Entity<Tinted>,
+    cached: bool,
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for AroundNested {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        let child = if self.cached {
+            self.child
+                .clone()
+                .cached(StyleRefinement::default().w(px(50.)).h(px(20.)))
+                .into_any_element()
+        } else {
+            self.child.clone().into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child("around")
+            .child(child)
+            .child("after")
+    }
+}
+
+/// A nested view notified on its own, cached or not, is built again in the
+/// gap where it was, a cached one at the style it is cached with: the view
+/// around it is drawn around it from last frame, frame after frame, and the
+/// frame is what one drawn from scratch is.
+#[test]
+fn a_view_around_a_notified_nested_view_is_drawn_around_it() {
+    for cached in [false, true] {
+        let mut cx = TestAppContext::single();
+        let (outer_builds, child_builds) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let window = cx.add_window({
+            let (outer_builds, child_builds) = (outer_builds.clone(), child_builds.clone());
+            move |_, cx| AroundNested {
+                child: cx.new(|_| Tinted {
+                    tint: 0,
+                    model: None,
+                    builds: child_builds,
+                }),
+                cached,
+                builds: outer_builds,
+            }
+        });
+        let child = window.read_with(&cx, |view, _| view.child.clone()).unwrap();
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.describe_rendered_frame()
+            })
+            .unwrap()
+        };
+        let mut last = draw(&mut cx);
+        assert_eq!((outer_builds.get(), child_builds.get()), (1, 1));
+
+        for tint in 1..4 {
+            // The window draws as the update is flushed.
+            child.update(&mut cx, |child, cx| {
+                child.tint = tint;
+                cx.notify();
+            });
+            let changed = cx
+                .update_window(window.into(), |_, window, _| {
+                    window.describe_rendered_frame()
+                })
+                .unwrap();
+            assert_eq!(
+                (outer_builds.get(), child_builds.get()),
+                (1, tint + 1),
+                "cached: {cached}, notified {tint} times"
+            );
+            assert_ne!(last, changed);
+            last = changed;
+        }
+        cx.update_window(window.into(), |_, window, _| window.forget_retained_state())
+            .unwrap();
+        assert_eq!(last, draw(&mut cx), "cached: {cached}");
+    }
+}
