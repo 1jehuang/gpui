@@ -231,7 +231,9 @@ impl App {
             globals: self.dependencies.global_read_log.borrow_mut().len()..0,
             states: self.dependencies.state_read_log.get_mut().len()..0,
         };
+        self.entities.mark_access_boundary();
         self.entities.extend_accessed(dependencies.entities.iter());
+        self.entities.mark_access_boundary();
         if self.entities.is_recording() {
             self.dependencies
                 .global_read_log
@@ -312,6 +314,10 @@ pub(crate) struct EntityAccessLog {
     /// repeats, for a retained subtree to learn what it was built from. See
     /// [`App::begin_recording_dependencies`].
     access_log: RefCell<Vec<EntityId>>,
+    /// Where in `access_log` the last recording, or replay, began or ended.
+    /// An access repeating the one just before it is left out, but only
+    /// after this: the stretches recordings take up must each keep theirs.
+    boundary: Cell<usize>,
     /// How many recordings are open.
     recordings: Rc<Cell<usize>>,
     /// Counts the entities updated while no recording is open, each of which
@@ -371,8 +377,20 @@ impl EntityMap {
     #[inline]
     pub(crate) fn note_access(&self, entity_id: EntityId) {
         if self.access_log.recordings.get() > 0 {
-            self.access_log.access_log.borrow_mut().push(entity_id);
+            let mut log = self.access_log.access_log.borrow_mut();
+            // A view reads the same entity many times in a row as it renders;
+            // one mention is all its dependencies need.
+            if log.len() > self.access_log.boundary.get() && log.last() == Some(&entity_id) {
+                return;
+            }
+            log.push(entity_id);
         }
+    }
+
+    /// Marks where the access log stands as a boundary between stretches.
+    fn mark_access_boundary(&mut self) {
+        let log = &mut self.access_log;
+        log.boundary.set(log.access_log.get_mut().len());
     }
 
     /// Records that `entity_id` is notified. A notification while a subtree
@@ -455,6 +473,7 @@ impl EntityMap {
 
     /// Opens a recording, returning where in the access log it starts.
     pub(crate) fn begin_recording(&mut self) -> usize {
+        self.mark_access_boundary();
         let log = &mut self.access_log;
         log.recordings.set(log.recordings.get() + 1);
         log.access_log.get_mut().len()
@@ -475,6 +494,7 @@ impl EntityMap {
         if open == 0 {
             log.clear();
         }
+        self.mark_access_boundary();
         entities.sort_unstable();
         entities.dedup();
         entities
@@ -634,6 +654,50 @@ impl ListOffset {
 
 /// `states` once each, at the earliest version read, so that a change in
 /// between still counts.
+/// The union of two sorted lists without repeats, itself sorted and without
+/// repeats. When one holds all of the other, which is the usual case — a
+/// view's paint reads what its prepaint read — it is shared, not copied.
+pub(crate) fn merge_sorted<T: Ord + Copy>(a: &Rc<[T]>, b: &Rc<[T]>) -> Rc<[T]> {
+    fn contains_all<T: Ord>(all: &[T], some: &[T]) -> bool {
+        let mut rest = all;
+        some.iter().all(|item| match rest.binary_search(item) {
+            Ok(index) => {
+                rest = &rest[index + 1..];
+                true
+            }
+            Err(_) => false,
+        })
+    }
+    if b.is_empty() || Rc::ptr_eq(a, b) || contains_all(a, b) {
+        return a.clone();
+    }
+    if a.is_empty() || contains_all(b, a) {
+        return b.clone();
+    }
+    let mut merged = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                merged.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&a[i..]);
+    merged.extend_from_slice(&b[j..]);
+    merged.into()
+}
+
 fn dedup_states(states: &[(StateVersion, u64)]) -> Rc<[(StateVersion, u64)]> {
     if states.is_empty() {
         return Rc::new([]);
@@ -688,20 +752,17 @@ impl RenderDependencies {
         if other.entities.is_empty() && other.globals.is_empty() && other.states.is_empty() {
             return self.clone();
         }
-        let mut entities = self.entities.to_vec();
-        entities.extend_from_slice(&other.entities);
-        entities.sort_unstable();
-        entities.dedup();
-        let mut globals = self.globals.to_vec();
-        globals.extend_from_slice(&other.globals);
-        globals.sort_unstable();
-        globals.dedup();
-        let mut states = self.states.to_vec();
-        states.extend_from_slice(&other.states);
+        let states = if other.states.is_empty() {
+            self.states.clone()
+        } else {
+            let mut states = self.states.to_vec();
+            states.extend_from_slice(&other.states);
+            dedup_states(&states)
+        };
         Self {
-            entities: entities.into(),
-            globals: globals.into(),
-            states: dedup_states(&states),
+            entities: merge_sorted(&self.entities, &other.entities),
+            globals: merge_sorted(&self.globals, &other.globals),
+            states,
             generation: self.generation.min(other.generation),
             updates: self.updates.min(other.updates),
             writes: self.writes.union(&other.writes),
