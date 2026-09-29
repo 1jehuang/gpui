@@ -562,6 +562,9 @@ impl Window {
         // is what it was copied from, entry for entry.
         let copied_whole = end == prepaint_range.end.shifted(&prepaint_range.start, &start);
         debug_assert!(copied_whole, "a reused prepaint range changed length");
+        // Nothing written since the records were built changed what they
+        // read, or they would not be reused: they are up to date as of now.
+        let writes_now = cx.entities.write_generation();
         let source = &self.rendered_frame.retained;
         let target = &mut self.next_frame.retained;
         target.reused_any = true;
@@ -600,8 +603,8 @@ impl Window {
                     record.nested
                 },
                 context: record.context.clone(),
-                dependencies: record.dependencies.clone(),
-                own_dependencies: record.own_dependencies.clone(),
+                dependencies: record.dependencies.written_up_to(writes_now),
+                own_dependencies: record.own_dependencies.written_up_to(writes_now),
                 hover_dependencies: record.hover_dependencies.clone(),
                 own_hovers: record.own_hovers.clone(),
                 layout_keys: record.layout_keys.clone(),

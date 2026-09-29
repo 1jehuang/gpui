@@ -8,6 +8,7 @@ use std::{
 };
 
 use collections::{FxHashMap, FxHashSet, TypeIdHashMap};
+use smallvec::SmallVec;
 
 use crate::{App, EntityId, EntityMap, ListOffset};
 
@@ -64,6 +65,7 @@ impl App {
             states: self.dependencies.state_read_log.get_mut().len(),
             generation: self.dependencies.global_generation,
             updates: self.entities.access_log.update_generation,
+            writes: self.entities.access_log.write_generation,
         }
     }
 
@@ -114,8 +116,15 @@ impl App {
                 // while it was open, after being read, counts as changed.
                 generation: recording.generation,
                 updates: recording.updates,
+                writes: writes_while_open(&recording, &self.entities.access_log),
             },
-            own: RenderDependencies::from_reads(own_entities, own_globals, &own_states, &recording),
+            own: RenderDependencies::from_reads(
+                own_entities,
+                own_globals,
+                &own_states,
+                &recording,
+                &self.entities.access_log,
+            ),
         }
     }
 
@@ -131,7 +140,7 @@ impl App {
         if self.entities.is_recording() {
             self.dependencies
                 .global_read_log
-                .get_mut()
+                .borrow_mut()
                 .extend(dependencies.globals.iter().copied());
             self.dependencies
                 .state_read_log
@@ -175,6 +184,10 @@ impl App {
         self.entities
             .access_log
             .updated_since(&dependencies.entities, dependencies.updates)
+            || self
+                .entities
+                .access_log
+                .written_since(&dependencies.entities, &dependencies.writes)
             || dependencies.globals.iter().any(|global| {
                 self.dependencies
                     .global_changed_at
@@ -212,6 +225,15 @@ pub(crate) struct EntityAccessLog {
     /// When each entity was last updated while no recording was open. See
     /// [`EntityMap::note_update`].
     updated_at: FxHashMap<EntityId, u64>,
+    /// Counts the entities updated while a recording is open — written while
+    /// the window draws — each of which is stamped into `written_at`.
+    write_generation: u64,
+    /// When each entity was last written while the window drew. See
+    /// [`EntityMap::note_update`].
+    written_at: FxHashMap<EntityId, u64>,
+    /// The entity the framework is about to lease to render it, which is
+    /// drawing it rather than writing to it. See [`EntityMap::render_next`].
+    rendering: Option<EntityId>,
 }
 
 impl EntityAccessLog {
@@ -230,9 +252,21 @@ impl EntityAccessLog {
             })
     }
 
+    /// Whether any of `entities` was written while the window drew, after
+    /// `writes` began and other than by the subtree `writes` belongs to.
+    fn written_since(&self, entities: &[EntityId], writes: &Writes) -> bool {
+        self.write_generation != writes.to
+            && entities.iter().any(|entity| {
+                self.written_at
+                    .get(entity)
+                    .is_some_and(|written_at| writes.is_foreign(*written_at))
+            })
+    }
+
     /// Forgets when a released entity was updated.
     pub(crate) fn forget(&mut self, entity_id: EntityId) {
         self.updated_at.remove(&entity_id);
+        self.written_at.remove(&entity_id);
     }
 }
 
@@ -269,14 +303,42 @@ impl EntityMap {
     /// that read it is built again, as upstream builds every view under a
     /// notified one again. Updates while a subtree is being built, a view
     /// rendering itself for one, are part of drawing it and are not stamped.
+    ///
+    /// An entity updated while the window draws — a component writing what
+    /// it was given into the state of a view it renders, as `Tree` writes
+    /// its item renderer — is written, and a retained subtree that read it is
+    /// built again, unless the subtree wrote it itself while it was being
+    /// built: what a subtree writes as it is built is part of building it.
+    /// The update that renders a view is neither.
     #[inline]
     pub(crate) fn note_update(&mut self, entity_id: EntityId) {
         self.note_access(entity_id);
         let log = &mut self.access_log;
+        if log.rendering == Some(entity_id) {
+            log.rendering = None;
+            if log.recordings.get() > 0 {
+                return;
+            }
+        }
         if log.recordings.get() == 0 {
             log.update_generation += 1;
             log.updated_at.insert(entity_id, log.update_generation);
+        } else {
+            log.write_generation += 1;
+            log.written_at.insert(entity_id, log.write_generation);
         }
+    }
+
+    /// How many writes were made while the window drew so far.
+    pub(crate) fn write_generation(&self) -> u64 {
+        self.access_log.write_generation
+    }
+
+    /// Marks the next lease of `entity_id` as the framework rendering it, not
+    /// a write to it. See [`Self::note_update`].
+    #[inline]
+    pub(crate) fn render_next(&mut self, entity_id: EntityId) {
+        self.access_log.rendering = Some(entity_id);
     }
 
     pub fn extend_accessed<'a>(&mut self, entities: impl IntoIterator<Item = &'a EntityId>) {
@@ -332,6 +394,53 @@ pub(crate) struct DependencyRecording {
     states: usize,
     generation: u64,
     updates: u64,
+    writes: u64,
+}
+
+/// The writes a recording made itself, from when it began to when it
+/// finished: `(began, finished]` in the write generation.
+fn writes_while_open(recording: &DependencyRecording, log: &EntityAccessLog) -> Writes {
+    let mut own = SmallVec::new();
+    if log.write_generation > recording.writes {
+        own.push((recording.writes, log.write_generation));
+    }
+    Writes {
+        from: recording.writes,
+        to: log.write_generation,
+        own,
+    }
+}
+
+/// Where in the write generation a retained subtree was built: writes after
+/// `from` change what it read, except those made while it was being built,
+/// within one of the `own` stretches.
+#[derive(Clone, Default)]
+pub(crate) struct Writes {
+    from: u64,
+    to: u64,
+    own: SmallVec<[(u64, u64); 2]>,
+}
+
+impl Writes {
+    /// Whether a write at `written_at` came from outside the subtree after
+    /// it began.
+    fn is_foreign(&self, written_at: u64) -> bool {
+        written_at > self.from
+            && !self
+                .own
+                .iter()
+                .any(|(began, finished)| written_at > *began && written_at <= *finished)
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        let mut own = self.own.clone();
+        own.extend_from_slice(&other.own);
+        Writes {
+            from: self.from.min(other.from),
+            to: self.to.max(other.to),
+            own,
+        }
+    }
 }
 
 /// What a recording saw: everything read while it was open, and what was read
@@ -376,6 +485,8 @@ pub(crate) struct RenderDependencies {
     /// The entity update generation the recording began at. See
     /// [`EntityMap::note_update`].
     pub(crate) updates: u64,
+    /// Where in the write generation it was built. See [`Writes`].
+    pub(crate) writes: Writes,
 }
 
 /// A counter that state shared outside of entities — a scroll handle, a list
@@ -447,6 +558,7 @@ impl RenderDependencies {
         mut globals: Vec<TypeId>,
         states: &[(StateVersion, u64)],
         recording: &DependencyRecording,
+        log: &EntityAccessLog,
     ) -> Self {
         entities.sort_unstable();
         entities.dedup();
@@ -458,6 +570,20 @@ impl RenderDependencies {
             states: dedup_states(states),
             generation: recording.generation,
             updates: recording.updates,
+            writes: writes_while_open(recording, log),
+        }
+    }
+
+    /// The same dependencies, known to be up to date with every write up to
+    /// `writes`: a reused subtree's, checked when it was reused.
+    pub(crate) fn written_up_to(&self, writes: u64) -> Self {
+        Self {
+            writes: Writes {
+                from: writes,
+                to: writes,
+                own: SmallVec::new(),
+            },
+            ..self.clone()
         }
     }
 
@@ -483,6 +609,7 @@ impl RenderDependencies {
             states: dedup_states(&states),
             generation: self.generation.min(other.generation),
             updates: self.updates.min(other.updates),
+            writes: self.writes.union(&other.writes),
         }
     }
 }

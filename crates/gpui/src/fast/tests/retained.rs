@@ -897,3 +897,100 @@ fn a_view_that_read_a_notified_view_is_built_again_only_if_it_was_updated() {
         .unwrap();
     assert_eq!(updated, draw(&mut cx));
 }
+
+/// The state of a view a component renders, written by the component as it
+/// is rendered, the way a list or tree component hands its item renderer to
+/// the view that draws the items.
+struct Painter {
+    color: crate::Hsla,
+}
+
+impl Render for Painter {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(40.)).bg(self.color)
+    }
+}
+
+/// A component that writes what it was given into its view's state, without
+/// notifying it, and renders the view.
+#[derive(IntoElement)]
+struct Paint {
+    painter: Entity<Painter>,
+    color: crate::Hsla,
+}
+
+impl crate::RenderOnce for Paint {
+    fn render(self, _: &mut Window, cx: &mut crate::App) -> impl IntoElement {
+        let color = self.color;
+        self.painter.update(cx, |painter, _| painter.color = color);
+        self.painter
+    }
+}
+
+struct PaintHost {
+    painter: Entity<Painter>,
+    red: bool,
+}
+
+impl Render for PaintHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(300.)).child(Paint {
+            painter: self.painter.clone(),
+            color: if self.red {
+                crate::red()
+            } else {
+                crate::blue()
+            },
+        })
+    }
+}
+
+fn backgrounds(cx: &mut TestAppContext, window: crate::AnyWindowHandle) -> Vec<String> {
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window
+            .painted_quads()
+            .iter()
+            .map(|quad| format!("{:?} {:?}", quad.bounds, quad.background))
+            .collect()
+    })
+    .unwrap()
+}
+
+/// A view whose state a component wrote while the window drew, as it was
+/// rendered, is drawn with what was written: the write changed what the view
+/// reads, notified or not.
+#[test]
+fn a_view_written_while_the_window_draws_is_rendered_again() {
+    let mut cx = TestAppContext::single();
+    let window = cx.add_window(|_, cx| PaintHost {
+        painter: cx.new(|_| Painter {
+            color: crate::blue(),
+        }),
+        red: false,
+    });
+    let blue = backgrounds(&mut cx, window.into());
+    assert_eq!(blue, backgrounds(&mut cx, window.into()));
+
+    window
+        .update(&mut cx, |host, _, cx| {
+            host.red = true;
+            cx.notify();
+        })
+        .unwrap();
+    let red = backgrounds(&mut cx, window.into());
+    assert_ne!(blue, red, "the painter was drawn with the color written");
+    let again = backgrounds(&mut cx, window.into());
+    assert_eq!(red, again, "and nothing wrote it since");
+
+    // The host writing its painter as it is built is part of building it:
+    // it does not make the host itself out of date.
+    let reused = cx
+        .update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            window.next_frame.retained.reused_any() || window.rendered_frame.retained.reused_any()
+        })
+        .unwrap();
+    assert!(reused, "a frame where nothing changed reuses the views");
+}
