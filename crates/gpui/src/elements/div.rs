@@ -3449,10 +3449,7 @@ impl Interactivity {
             if let Some(group_hover) = self.group_hover_style.as_ref() {
                 let is_group_hovered =
                     if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
-                        let hovered =
-                            !window.last_input_was_touch() && group_hitbox_id.is_hovered(window);
-                        window.note_retained_hover_dependency(group_hitbox_id, hovered);
-                        hovered
+                        !window.last_input_was_touch() && group_hitbox_id.is_hovered(window)
                     } else if let Some(element_state) = element_state.as_ref() {
                         !window.last_input_was_touch()
                             && element_state
@@ -3471,9 +3468,7 @@ impl Interactivity {
 
             if let Some(hover_style) = self.hover_style.as_ref() {
                 let is_hovered = if let Some(hitbox) = hitbox {
-                    let hovered = !window.last_input_was_touch() && hitbox.is_hovered(window);
-                    window.note_retained_hover_dependency(hitbox.id, hovered);
-                    hovered
+                    !window.last_input_was_touch() && hitbox.is_hovered(window)
                 } else if let Some(element_state) = element_state.as_ref() {
                     !window.last_input_was_touch()
                         && element_state

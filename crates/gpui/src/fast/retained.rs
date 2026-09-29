@@ -26,7 +26,7 @@ use crate::{
 use collections::{FxHashMap, FxHashSet};
 use refineable::Refineable;
 use smallvec::SmallVec;
-use std::{any::TypeId, mem, ops::Range, rc::Rc};
+use std::{any::TypeId, cell::RefCell, mem, ops::Range, rc::Rc};
 
 /// The retained subtrees drawn in one frame, in the order they began
 /// prepainting, which puts a subtree's nested subtrees right after it.
@@ -156,6 +156,10 @@ pub(crate) struct RetainedState {
     /// hovered then, in painting order. A subtree keeps the stretch it
     /// added and is built again once any of them is hovered differently.
     pub(crate) hover_dependencies: Vec<(HitboxId, bool)>,
+    /// Hovers read through [`HitboxId::is_hovered`], which only has the window
+    /// to read, since `hover_dependencies` last took them in. See
+    /// [`Window::note_hover_read`].
+    pub(crate) hover_reads: RefCell<Vec<(HitboxId, bool)>>,
     /// For each retained subtree being painted, innermost last, the stretches
     /// of `hover_dependencies` its nested subtrees added.
     pub(crate) open_paints: Vec<OpenPaint>,
@@ -169,15 +173,19 @@ pub(crate) struct RetainedState {
     /// nothing that was, is drawn again from what it drew then. See
     /// [`Window::set_view_retention`].
     pub(crate) view_retention: bool,
+    /// Records reads of the pointer and modifier keys while views are drawn.
+    pub(crate) ambient_reads: crate::fast::dependencies::AmbientReads,
 }
 
 impl RetainedState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(cx: &App) -> Self {
         RetainedState {
+            ambient_reads: cx.ambient_reads(),
             subtree_stack: Vec::new(),
             dirty_subtrees: FxHashSet::default(),
             subtrees_dirty_next_frame: FxHashSet::default(),
             hover_dependencies: Vec::new(),
+            hover_reads: RefCell::new(Vec::new()),
             open_paints: Vec::new(),
             prebuilt: FxHashMap::default(),
             notified_entities: FxHashSet::default(),
@@ -671,6 +679,7 @@ impl Window {
         if self.retained_state.subtree_stack.is_empty() {
             return;
         }
+        self.take_hover_reads();
         let state = &mut self.retained_state;
         let start = state.hover_dependencies.len();
         state.hover_dependencies.extend_from_slice(hovers);
@@ -783,6 +792,7 @@ impl Window {
         cx: &mut App,
     ) -> RetainedPaintRecording {
         self.retained_state.subtree_stack.push(id.clone());
+        self.take_hover_reads();
         self.retained_state
             .open_paints
             .push(OpenPaint { nested: Vec::new() });
@@ -801,6 +811,7 @@ impl Window {
         recording: RetainedPaintRecording,
         cx: &mut App,
     ) {
+        self.take_hover_reads();
         self.retained_state.subtree_stack.pop();
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
         let nested = self
@@ -848,12 +859,31 @@ impl Window {
     }
 
     /// Notes that what is being painted inside a retained subtree looks the
-    /// way it does because `hitbox` is, or is not, hovered.
-    pub(crate) fn note_retained_hover_dependency(&mut self, hitbox: HitboxId, hovered: bool) {
-        if !self.retained_state.subtree_stack.is_empty() {
-            self.retained_state
-                .hover_dependencies
-                .push((hitbox, hovered));
+    /// way it does because `hitbox` is, or is not, hovered: anything painted
+    /// that asked whether it is, a hover style or an element of its own.
+    ///
+    /// Returns the answer when it is noted, having worked it out to note it,
+    /// and `None` when nothing is being drawn to note it for.
+    #[inline]
+    pub(crate) fn note_hover_read(&self, hitbox: HitboxId) -> Option<bool> {
+        if self.retained_state.subtree_stack.is_empty() {
+            return None;
+        }
+        let hovered = hitbox.hovered_now(self);
+        self.retained_state
+            .hover_reads
+            .borrow_mut()
+            .push((hitbox, hovered));
+        Some(hovered)
+    }
+
+    /// Takes the hovers read since the last call into `hover_dependencies`,
+    /// in the order they were read, before anything measures it.
+    pub(crate) fn take_hover_reads(&mut self) {
+        let state = &mut self.retained_state;
+        let reads = state.hover_reads.get_mut();
+        if !reads.is_empty() {
+            state.hover_dependencies.append(reads);
         }
     }
 
@@ -878,10 +908,9 @@ impl Window {
     /// Whether every hover in `dependencies`, recorded while a reusable
     /// subtree was painted, is still as it was.
     pub(crate) fn hovers_unchanged(&self, dependencies: &[(HitboxId, bool)]) -> bool {
-        let touch = self.last_input_was_touch();
         dependencies
             .iter()
-            .all(|(hitbox, hovered)| (!touch && hitbox.is_hovered(self)) == *hovered)
+            .all(|(hitbox, hovered)| hitbox.hovered_now(self) == *hovered)
     }
 
     /// Marks retained subtrees to be built again rather than reused on the
@@ -956,6 +985,7 @@ impl Window {
                 .iter()
                 .map(|&index| self.next_frame.retained.id(index).clone()),
         );
+        self.take_hover_reads();
         Some(DeferredRetainedRecording {
             enclosing: enclosing.clone(),
             dependencies: cx.begin_recording_dependencies(),
@@ -973,6 +1003,7 @@ impl Window {
         let Some(recording) = recording else {
             return;
         };
+        self.take_hover_reads();
         let dependencies = cx.finish_recording_dependencies(recording.dependencies);
         self.retained_state.subtree_stack.clear();
         let enclosing = &recording.enclosing.0;
@@ -997,6 +1028,7 @@ impl Window {
         self.retained_state.dirty_subtrees =
             mem::take(&mut self.retained_state.subtrees_dirty_next_frame);
         self.retained_state.hover_dependencies.clear();
+        self.retained_state.hover_reads.get_mut().clear();
         self.next_frame.retained.finish_frame();
         #[cfg(any(test, feature = "test-support"))]
         if self.next_frame.retained.reused_any() {
@@ -1445,4 +1477,13 @@ fn paint_component(
     window.with_id(ElementId::Name(name.into()), |window| {
         element.paint(window, cx);
     });
+}
+
+impl HitboxId {
+    /// Whether the hitbox is hovered, as [`HitboxId::is_hovered`] answers,
+    /// without noting that it was asked.
+    pub(crate) fn hovered_now(self, window: &Window) -> bool {
+        window.captured_hitbox == Some(self)
+            || (!window.last_input_was_keyboard() && self.hit_test(window))
+    }
 }

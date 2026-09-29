@@ -994,3 +994,98 @@ fn a_view_written_while_the_window_draws_is_rendered_again() {
         .unwrap();
     assert!(reused, "a frame where nothing changed reuses the views");
 }
+
+/// An element of its own that asks whether its hitbox is hovered while it is
+/// painted — not a hover style — makes the view it is in depend on the answer.
+struct HoverProbe;
+
+impl Render for HoverProbe {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(300.)).child(
+            crate::canvas(
+                |bounds, window, _| window.insert_hitbox(bounds, crate::HitboxBehavior::Normal),
+                |bounds, hitbox, window, _| {
+                    let color = if hitbox.is_hovered(window) {
+                        crate::red()
+                    } else {
+                        crate::blue()
+                    };
+                    window.paint_quad(crate::fill(bounds, color));
+                },
+            )
+            .size(px(100.)),
+        )
+    }
+}
+
+#[test]
+fn a_view_is_rendered_again_when_a_hover_an_element_asked_about_changes() {
+    let mut cx = TestAppContext::single();
+    let window = cx.add_window(|_, _| HoverProbe);
+    let move_to = |cx: &mut TestAppContext, x: f32, y: f32| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_mouse_move(crate::point(px(x), px(y)), cx);
+        })
+        .unwrap();
+    };
+    move_to(&mut cx, 250., 250.);
+    backgrounds(&mut cx, window.into());
+    let away = backgrounds(&mut cx, window.into());
+    move_to(&mut cx, 10., 10.);
+    let over = backgrounds(&mut cx, window.into());
+    assert_ne!(
+        away, over,
+        "the pointer over the element changes how it looks"
+    );
+    move_to(&mut cx, 250., 250.);
+    assert_eq!(away, backgrounds(&mut cx, window.into()));
+}
+
+/// A view that reads where the pointer is, or which modifiers are held, as it
+/// renders depends on it.
+struct PointerProbe;
+
+impl Render for PointerProbe {
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let x = window.mouse_position().x;
+        let wide = window.modifiers().shift;
+        div().size(px(300.)).child(
+            div()
+                .w(if wide { px(80.) } else { x })
+                .h(px(10.))
+                .bg(crate::red()),
+        )
+    }
+}
+
+#[test]
+fn a_view_that_read_the_pointer_or_modifiers_is_rendered_again_when_they_change() {
+    let mut cx = TestAppContext::single();
+    let window = cx.add_window(|_, _| PointerProbe);
+    let at = |cx: &mut TestAppContext, x: f32, modifiers: crate::Modifiers| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::MouseMove(crate::MouseMoveEvent {
+                    position: crate::point(px(x), px(5.)),
+                    pressed_button: None,
+                    modifiers,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        backgrounds(cx, window.into())
+    };
+    let first = at(&mut cx, 20., crate::Modifiers::default());
+    let moved = at(&mut cx, 60., crate::Modifiers::default());
+    assert_ne!(first, moved, "the view reads where the pointer is");
+    let shifted = at(
+        &mut cx,
+        60.,
+        crate::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    assert_ne!(moved, shifted, "and which modifiers are held");
+}

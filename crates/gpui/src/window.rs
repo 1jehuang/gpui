@@ -773,6 +773,9 @@ impl HitboxId {
     ///
     /// See [`Hitbox::is_hovered`] for details.
     pub fn is_hovered(self, window: &Window) -> bool {
+        if let Some(hovered) = window.note_hover_read(self) {
+            return hovered;
+        }
         // If this hitbox has captured the pointer, it's always considered hovered
         if window.captured_hitbox == Some(self) {
             return true;
@@ -795,7 +798,7 @@ impl HitboxId {
         self.hit_test(window)
     }
 
-    fn hit_test(self, window: &Window) -> bool {
+    pub(crate) fn hit_test(self, window: &Window) -> bool {
         let hit_test = &window.mouse_hit_test;
         for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
             if self == *id {
@@ -1234,7 +1237,7 @@ pub struct Window {
     pub(crate) client_inset: Option<Pixels>,
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
-    captured_hitbox: Option<HitboxId>,
+    pub(crate) captured_hitbox: Option<HitboxId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
@@ -2039,7 +2042,7 @@ impl Window {
             root: None,
             element_id_stack: SmallVec::default(),
             global_ids: Default::default(),
-            retained_state: RetainedState::new(),
+            retained_state: RetainedState::new(cx),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
@@ -3093,6 +3096,7 @@ impl Window {
 
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
+        crate::fast::dependencies::read_pointer(self);
         self.mouse_position
     }
 
@@ -3132,6 +3136,7 @@ impl Window {
 
     /// The current state of the keyboard's modifiers
     pub fn modifiers(&self) -> Modifiers {
+        crate::fast::dependencies::read_keys(self);
         self.modifiers
     }
 
@@ -3147,6 +3152,7 @@ impl Window {
 
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
+        crate::fast::dependencies::read_keys(self);
         self.capslock
     }
 
@@ -5360,6 +5366,7 @@ impl Window {
             self.refresh();
         }
 
+        let ambient = crate::fast::dependencies::AmbientInput::of(self);
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
@@ -5475,6 +5482,7 @@ impl Window {
             }
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
+        ambient.stamp_changes(self, cx);
 
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);

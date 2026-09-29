@@ -23,7 +23,7 @@ pub(crate) struct AppDependencies {
     global_changed_at: TypeIdHashMap<u64>,
     /// Every global read while a recording is open. See
     /// [`App::begin_recording_dependencies`].
-    global_read_log: RefCell<Vec<TypeId>>,
+    global_read_log: Rc<RefCell<Vec<TypeId>>>,
     /// Every [`StateVersion`] read while a recording is open, with the
     /// version it was at.
     state_read_log: RefCell<Vec<(StateVersion, u64)>>,
@@ -52,7 +52,98 @@ impl AppDependencies {
     }
 }
 
+/// Parts of a window's state a view can read while it is drawn without
+/// reading an entity or a global: each is recorded as a global of its own
+/// type, and marked changed when the window's input changes it. See
+/// [`AmbientReads`].
+pub(crate) mod ambient {
+    /// Where the pointer is: [`crate::Window::mouse_position`].
+    pub(crate) struct Pointer;
+    /// The modifier keys and caps lock: [`crate::Window::modifiers`] and
+    /// [`crate::Window::capslock`].
+    pub(crate) struct Keys;
+}
+
+/// A window's handle on the app's dependency recording, so that reading the
+/// window's own state while a view is drawn is recorded as a dependency of
+/// the view, as reading a global is.
+#[derive(Clone)]
+pub(crate) struct AmbientReads {
+    globals: Rc<RefCell<Vec<TypeId>>>,
+    recordings: Rc<Cell<usize>>,
+}
+
+impl AmbientReads {
+    /// Records, for any recording that is open, that the ambient state `T`
+    /// was read.
+    #[inline]
+    pub(crate) fn note<T: 'static>(&self) {
+        if self.recordings.get() > 0 {
+            self.globals.borrow_mut().push(TypeId::of::<T>());
+        }
+    }
+}
+
+/// Notes, for any recording that is open, that `window`'s pointer position
+/// was read.
+#[inline]
+pub(crate) fn read_pointer(window: &crate::Window) {
+    window
+        .retained_state
+        .ambient_reads
+        .note::<ambient::Pointer>();
+}
+
+/// Notes, for any recording that is open, that `window`'s modifier keys or
+/// caps lock were read.
+#[inline]
+pub(crate) fn read_keys(window: &crate::Window) {
+    window.retained_state.ambient_reads.note::<ambient::Keys>();
+}
+
+/// The pointer and modifier keys before a window handled an input event, to
+/// tell afterwards which of them the event changed.
+pub(crate) struct AmbientInput {
+    position: crate::Point<crate::Pixels>,
+    modifiers: crate::Modifiers,
+    capslock: crate::Capslock,
+}
+
+impl AmbientInput {
+    pub(crate) fn of(window: &crate::Window) -> Self {
+        AmbientInput {
+            position: window.mouse_position(),
+            modifiers: window.modifiers(),
+            capslock: window.capslock(),
+        }
+    }
+
+    /// Marks what the event changed as changed, for the views that read it
+    /// while they were drawn.
+    pub(crate) fn stamp_changes(self, window: &crate::Window, cx: &mut App) {
+        if window.mouse_position() != self.position {
+            cx.ambient_changed::<ambient::Pointer>();
+        }
+        if window.modifiers() != self.modifiers || window.capslock() != self.capslock {
+            cx.ambient_changed::<ambient::Keys>();
+        }
+    }
+}
+
 impl App {
+    /// A handle for a window to record reads of its own state with.
+    pub(crate) fn ambient_reads(&self) -> AmbientReads {
+        AmbientReads {
+            globals: self.dependencies.global_read_log.clone(),
+            recordings: self.entities.access_log.recordings.clone(),
+        }
+    }
+
+    /// Stamps a change to the ambient state `T`, as a write to a global.
+    pub(crate) fn ambient_changed<T: 'static>(&mut self) {
+        self.dependencies.global_changed(TypeId::of::<T>());
+    }
+
     /// Starts recording what is read from here on — the entities accessed and
     /// the globals read — for a subtree that is drawn again from what it drew
     /// while none of it changes. Recordings nest; each sees everything read
@@ -61,7 +152,7 @@ impl App {
         self.dependencies.nested.push(Vec::new());
         DependencyRecording {
             entities: self.entities.begin_recording(),
-            globals: self.dependencies.global_read_log.get_mut().len(),
+            globals: self.dependencies.global_read_log.borrow_mut().len(),
             states: self.dependencies.state_read_log.get_mut().len(),
             generation: self.dependencies.global_generation,
             updates: self.entities.access_log.update_generation,
@@ -79,18 +170,22 @@ impl App {
         let nested = log.nested.pop().unwrap_or_default();
         let ranges = LogRanges {
             entities: recording.entities..self.entities.access_log.len(),
-            globals: recording.globals..log.global_read_log.get_mut().len(),
+            globals: recording.globals..log.global_read_log.borrow_mut().len(),
             states: recording.states..log.state_read_log.get_mut().len(),
         };
-        let globals_log = log.global_read_log.get_mut();
+        let (own_globals, mut globals) = {
+            let globals_log = log.global_read_log.borrow();
+            (
+                outside(
+                    &globals_log,
+                    &ranges.globals,
+                    nested.iter().map(|n| &n.globals),
+                ),
+                globals_log[recording.globals..].to_vec(),
+            )
+        };
         let states_log = log.state_read_log.get_mut();
-        let own_globals = outside(
-            globals_log,
-            &ranges.globals,
-            nested.iter().map(|n| &n.globals),
-        );
         let own_states = outside(states_log, &ranges.states, nested.iter().map(|n| &n.states));
-        let mut globals = globals_log[recording.globals..].to_vec();
         let states = dedup_states(&states_log[recording.states..]);
         let own_entities = outside(
             &self.entities.access_log.access_log.borrow(),
@@ -102,7 +197,7 @@ impl App {
             parent.push(ranges);
         }
         if !self.entities.is_recording() {
-            self.dependencies.global_read_log.get_mut().clear();
+            self.dependencies.global_read_log.borrow_mut().clear();
             self.dependencies.state_read_log.get_mut().clear();
         }
         globals.sort_unstable();
@@ -133,7 +228,7 @@ impl App {
     pub(crate) fn replay_dependencies(&mut self, dependencies: &RenderDependencies) {
         let start = LogRanges {
             entities: self.entities.access_log.len()..0,
-            globals: self.dependencies.global_read_log.get_mut().len()..0,
+            globals: self.dependencies.global_read_log.borrow_mut().len()..0,
             states: self.dependencies.state_read_log.get_mut().len()..0,
         };
         self.entities.extend_accessed(dependencies.entities.iter());
@@ -150,7 +245,7 @@ impl App {
             // it is reused in.
             let ranges = LogRanges {
                 entities: start.entities.start..self.entities.access_log.len(),
-                globals: start.globals.start..self.dependencies.global_read_log.get_mut().len(),
+                globals: start.globals.start..self.dependencies.global_read_log.borrow_mut().len(),
                 states: start.states.start..self.dependencies.state_read_log.get_mut().len(),
             };
             if let Some(open) = self.dependencies.nested.last_mut() {
@@ -218,7 +313,7 @@ pub(crate) struct EntityAccessLog {
     /// [`App::begin_recording_dependencies`].
     access_log: RefCell<Vec<EntityId>>,
     /// How many recordings are open.
-    recordings: Cell<usize>,
+    recordings: Rc<Cell<usize>>,
     /// Counts the entities updated while no recording is open, each of which
     /// is stamped into `updated_at`.
     update_generation: u64,
