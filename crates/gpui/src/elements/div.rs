@@ -15,6 +15,7 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
+use crate::fast::interactivity::{Aria, LazyVec};
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
@@ -2153,27 +2154,27 @@ pub struct Interactivity {
     pub(crate) group_hover_style: Option<GroupStyle>,
     pub(crate) active_style: Option<Box<StyleRefinement>>,
     pub(crate) group_active_style: Option<GroupStyle>,
-    pub(crate) drag_over_styles: Vec<(
+    pub(crate) drag_over_styles: LazyVec<(
         TypeId,
         Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement>,
     )>,
-    pub(crate) group_drag_over_styles: Vec<(TypeId, GroupStyle)>,
-    pub(crate) mouse_down_listeners: Vec<MouseDownListener>,
-    pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
-    pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
-    pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
-    pub(crate) mouse_exit_listeners: Vec<MouseExitListener>,
-    pub(crate) file_drop_exit_listeners: Vec<FileDropExitListener>,
-    pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
-    pub(crate) pinch_listeners: Vec<PinchListener>,
-    pub(crate) key_down_listeners: Vec<KeyDownListener>,
-    pub(crate) key_up_listeners: Vec<KeyUpListener>,
-    pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
-    pub(crate) action_listeners: Vec<(TypeId, ActionListener)>,
-    pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
+    pub(crate) group_drag_over_styles: LazyVec<(TypeId, GroupStyle)>,
+    pub(crate) mouse_down_listeners: LazyVec<MouseDownListener>,
+    pub(crate) mouse_up_listeners: LazyVec<MouseUpListener>,
+    pub(crate) mouse_pressure_listeners: LazyVec<MousePressureListener>,
+    pub(crate) mouse_move_listeners: LazyVec<MouseMoveListener>,
+    pub(crate) mouse_exit_listeners: LazyVec<MouseExitListener>,
+    pub(crate) file_drop_exit_listeners: LazyVec<FileDropExitListener>,
+    pub(crate) scroll_wheel_listeners: LazyVec<ScrollWheelListener>,
+    pub(crate) pinch_listeners: LazyVec<PinchListener>,
+    pub(crate) key_down_listeners: LazyVec<KeyDownListener>,
+    pub(crate) key_up_listeners: LazyVec<KeyUpListener>,
+    pub(crate) modifiers_changed_listeners: LazyVec<ModifiersChangedListener>,
+    pub(crate) action_listeners: LazyVec<(TypeId, ActionListener)>,
+    pub(crate) drop_listeners: LazyVec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
-    pub(crate) click_listeners: Vec<ClickListener>,
-    pub(crate) aux_click_listeners: Vec<ClickListener>,
+    pub(crate) click_listeners: LazyVec<ClickListener>,
+    pub(crate) aux_click_listeners: LazyVec<ClickListener>,
     pub(crate) drag_listener: Option<DragListener>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) hover_listener_mode: HoverListenerMode,
@@ -2186,11 +2187,11 @@ pub struct Interactivity {
     pub(crate) tab_stop: bool,
 
     pub(crate) a11y_action_listeners:
-        Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
+        LazyVec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
     pub(crate) a11y_synthetic_children: Option<Box<dyn FnOnce(&mut crate::A11ySubtreeBuilder)>>,
     pub(crate) report_active_descendant_focus: bool,
     pub(crate) override_role: Option<accesskit::Role>,
-    pub(crate) aria: AriaProperties,
+    pub(crate) aria: Aria,
 
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,

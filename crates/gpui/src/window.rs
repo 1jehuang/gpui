@@ -1170,6 +1170,7 @@ pub struct Window {
     pub(crate) fast_layout: crate::fast::layout_key::WindowLayout,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
+    pub(crate) global_ids: crate::fast::global_id::GlobalIdCache,
     pub(crate) retained_state: RetainedState,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
@@ -1235,7 +1236,7 @@ pub struct Window {
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
-    inspector: Option<Entity<Inspector>>,
+    pub(crate) inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
@@ -2037,6 +2038,7 @@ impl Window {
             fast_layout: Default::default(),
             root: None,
             element_id_stack: SmallVec::default(),
+            global_ids: Default::default(),
             retained_state: RetainedState::new(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
@@ -2945,7 +2947,7 @@ impl Window {
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
         self.with_id(element_id, |this| {
-            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
+            let global_id = this.global_ids.get(&this.element_id_stack);
 
             f(&global_id, this)
         })
@@ -3237,6 +3239,7 @@ impl Window {
         self.layout_engine.as_mut().unwrap().end_frame();
         self.fast_layout.end_frame();
         self.text_system().finish_frame();
+        self.global_ids.finish_frame();
         self.finish_retained_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
@@ -6798,6 +6801,7 @@ impl Window {
             None => Some(cx.new(|_| Inspector::new())),
             Some(_) => None,
         };
+        self.release_closed_inspector_ids();
         self.refresh();
     }
 
@@ -6819,19 +6823,8 @@ impl Window {
         _inspector_id: Option<&crate::InspectorElementId>,
         cx: &mut App,
         f: impl FnOnce(&mut Option<T>, &mut Self) -> R,
-    ) -> R {
-        if let Some(inspector_id) = _inspector_id
-            && let Some(inspector) = &self.inspector
-        {
-            let inspector = inspector.clone();
-            let active_element_id = inspector.read(cx).active_element_id();
-            if Some(inspector_id) == active_element_id {
-                return inspector.update(cx, |inspector, _cx| {
-                    inspector.with_active_element_state(self, f)
-                });
-            }
-        }
-        f(&mut None, self)
+    ) -> Option<R> {
+        self.with_active_inspector_state(_inspector_id, cx, f)
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]
