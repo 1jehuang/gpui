@@ -131,6 +131,8 @@ pub struct PhaseAverages {
     pub compute_layout_calls: f64,
     /// Draws per frame (`LayoutStats::frames` per measured frame).
     pub draws: f64,
+    pub views_built: f64,
+    pub views_reused: f64,
 }
 
 impl PhaseAverages {
@@ -151,6 +153,8 @@ impl PhaseAverages {
             measure_rebinds: stats.measure_rebinds as f64 / n,
             compute_layout_calls: stats.compute_layout_calls as f64 / n,
             draws: stats.frames as f64 / n,
+            views_built: stats.views_built as f64 / n,
+            views_reused: stats.views_reused as f64 / n,
         }
     }
 }
