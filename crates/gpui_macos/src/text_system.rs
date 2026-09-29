@@ -71,6 +71,7 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    sized_fonts: crate::fast::text_system::SizedFonts,
 }
 
 impl MacTextSystem {
@@ -84,6 +85,7 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            sized_fonts: Default::default(),
         }))
     }
 }
@@ -565,7 +567,7 @@ impl MacTextSystemState {
                     string.set_attribute(
                         cf_range,
                         kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
+                        &self.sized_fonts.get(run.font_id, font, font_size),
                     );
                 }
                 break_ligature = !break_ligature;
@@ -585,6 +587,7 @@ impl MacTextSystemState {
                     .unwrap()
             };
             let font_id = self.id_for_native_font(font);
+            let is_emoji = self.is_emoji(font_id);
 
             let glyphs = match runs.last_mut() {
                 Some(run) if run.font_id == font_id => &mut run.glyphs,
@@ -612,7 +615,7 @@ impl MacTextSystemState {
                     id: GlyphId(glyph_id as u32),
                     position: point(position.x as f32, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
-                    is_emoji: self.is_emoji(font_id),
+                    is_emoji,
                 });
             }
         }

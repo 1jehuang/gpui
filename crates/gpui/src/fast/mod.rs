@@ -16,6 +16,7 @@
 
 pub(crate) mod dependencies;
 pub(crate) mod global_id;
+pub(crate) mod glyphs;
 pub(crate) mod interactivity;
 pub(crate) mod layout;
 pub(crate) mod layout_key;
