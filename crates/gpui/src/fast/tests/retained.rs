@@ -1089,3 +1089,63 @@ fn a_view_that_read_the_pointer_or_modifiers_is_rendered_again_when_they_change(
     );
     assert_ne!(moved, shifted, "and which modifiers are held");
 }
+
+struct Badge;
+
+impl Render for Badge {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(20.)).debug_selector(|| "badge".into())
+    }
+}
+
+struct BadgeHost {
+    badge: Entity<Badge>,
+    chip: bool,
+}
+
+impl Render for BadgeHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size(px(300.))
+            .child(
+                self.badge
+                    .clone()
+                    .cached(StyleRefinement::default().w(px(20.)).h(px(20.))),
+            )
+            .when(self.chip, |this| {
+                this.child(div().size(px(10.)).debug_selector(|| "chip".into()))
+            })
+    }
+}
+
+/// Debug bounds a reused view recorded last frame stay findable, but those of
+/// an element the rebuilt view around it no longer paints are gone, as they
+/// are when every view is drawn from scratch.
+#[test]
+fn debug_bounds_follow_what_was_painted_while_a_sibling_view_is_reused() {
+    let mut cx = TestAppContext::single();
+    let window = cx.add_window(|_, cx| BadgeHost {
+        badge: cx.new(|_| Badge),
+        chip: true,
+    });
+    let mut vcx = crate::VisualTestContext::from_window(window.into(), &cx);
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("chip").is_some());
+    assert!(vcx.debug_bounds("badge").is_some());
+
+    window
+        .update(&mut vcx, |host, _, cx| {
+            host.chip = false;
+            cx.notify();
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("chip").is_none(),
+        "the chip is no longer painted"
+    );
+    assert!(
+        vcx.debug_bounds("badge").is_some(),
+        "the reused badge keeps last frame's bounds"
+    );
+}

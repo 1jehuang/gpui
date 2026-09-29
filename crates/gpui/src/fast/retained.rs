@@ -37,6 +37,13 @@ pub(crate) struct RetainedSubtrees {
     /// The records whose prepaint is under way, innermost last.
     pub(crate) open: Vec<usize>,
     pub(crate) reused_any: bool,
+    /// The innermost retained subtree each debug selector was painted in.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) debug_owners: FxHashMap<String, GlobalElementId>,
+    /// The subtrees drawn from last frame rather than built, whose debug
+    /// selectors are carried over since they were not painted again.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) reused_ids: FxHashSet<GlobalElementId>,
 }
 
 pub(crate) struct RetainedSubtree {
@@ -268,6 +275,11 @@ impl RetainedSubtrees {
         self.by_id.clear();
         self.open.clear();
         self.reused_any = false;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.debug_owners.clear();
+            self.reused_ids.clear();
+        }
     }
 
     /// Whether any subtree was drawn from last frame.
@@ -584,6 +596,8 @@ impl Window {
         };
         for index in previous..=previous + nested {
             let record = &source.records[index];
+            #[cfg(any(test, feature = "test-support"))]
+            target.reused_ids.insert(record.id.clone());
             let paint = match record.paint {
                 PaintStatus::Painted { .. } => PaintStatus::Pending { anchor },
                 _ => PaintStatus::Unpainted,
@@ -1033,12 +1047,45 @@ impl Window {
         #[cfg(any(test, feature = "test-support"))]
         if self.next_frame.retained.reused_any() {
             // Reused subtrees do not paint, and the bounds they would have
-            // recorded for tests to find them by are last frame's.
-            for (selector, bounds) in &self.rendered_frame.debug_bounds {
+            // recorded for tests to find them by are last frame's. Only
+            // selectors painted inside a subtree drawn from last frame carry
+            // over: one a rebuilt view no longer paints is gone.
+            let rendered = &self.rendered_frame;
+            let next = &mut self.next_frame;
+            for (selector, bounds) in &rendered.debug_bounds {
+                let Some(owner) = rendered.retained.debug_owners.get(selector) else {
+                    continue;
+                };
+                if next.retained.reused_ids.contains(owner)
+                    && !next.debug_bounds.contains_key(selector)
+                {
+                    next.debug_bounds.insert(selector.clone(), *bounds);
+                    next.retained
+                        .debug_owners
+                        .insert(selector.clone(), owner.clone());
+                }
+            }
+        }
+    }
+}
+
+impl Window {
+    /// Records where the element with `selector` was painted, for tests, and
+    /// the retained subtree it was painted in.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn note_debug_bounds(&mut self, selector: &str, bounds: Bounds<Pixels>) {
+        self.next_frame
+            .debug_bounds
+            .insert(selector.to_string(), bounds);
+        match self.retained_state.subtree_stack.last() {
+            Some(owner) => {
                 self.next_frame
-                    .debug_bounds
-                    .entry(selector.clone())
-                    .or_insert(*bounds);
+                    .retained
+                    .debug_owners
+                    .insert(selector.to_string(), owner.clone());
+            }
+            None => {
+                self.next_frame.retained.debug_owners.remove(selector);
             }
         }
     }

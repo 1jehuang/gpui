@@ -476,6 +476,9 @@ impl Window {
 
         let target = &mut self.next_frame.retained;
         target.reused_any = true;
+        // What it paints outside the gaps is last frame's.
+        #[cfg(any(test, feature = "test-support"))]
+        target.reused_ids.insert(own.id.clone());
         let index = target.push(own);
         target.open.push(index);
         self.retained_state.subtree_stack.push(id.clone());
@@ -656,6 +659,8 @@ impl Window {
             if !painted {
                 copy.paint = PaintStatus::Unpainted;
             }
+            #[cfg(any(test, feature = "test-support"))]
+            target.reused_ids.insert(copy.id.clone());
             copied.push((target.push(copy), segment));
         }
         copied
