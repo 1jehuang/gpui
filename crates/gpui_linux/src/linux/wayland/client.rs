@@ -2562,32 +2562,31 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 drop(state);
                 window.handle_input(input);
             }
-            zwp_pointer_gesture_pinch_v1::Event::Update { time: _, scale, .. } => {
-                let new_absolute_scale = scale as f32;
-                let previous_scale = state.pinch_scale;
-                let zoom_delta = new_absolute_scale - previous_scale;
-                state.pinch_scale = new_absolute_scale;
-
-                let input = PlatformInput::Pinch(PinchEvent {
-                    position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
-                    delta: zoom_delta,
-                    modifiers: state.modifiers,
-                    phase: TouchPhase::Moved,
-                });
+            zwp_pointer_gesture_pinch_v1::Event::Update { scale, dx, dy, .. } => {
+                let (position, modifiers) =
+                    (state.mouse_location.unwrap_or_default(), state.modifiers);
+                let (pinch, scroll) = crate::fast::pinch::pinch_update(
+                    &mut state.pinch_scale,
+                    scale as f32,
+                    position,
+                    point(px(dx as f32), px(dy as f32)),
+                    modifiers,
+                );
                 drop(state);
-                window.handle_input(input);
+                window.handle_input(pinch);
+                scroll.map(|scroll| window.handle_input(scroll));
             }
             zwp_pointer_gesture_pinch_v1::Event::End {
                 serial: _,
                 time: _,
-                cancelled: _,
+                cancelled,
             } => {
                 state.pinch_scale = 1.0;
                 let input = PlatformInput::Pinch(PinchEvent {
                     position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
                     delta: 0.0,
                     modifiers: state.modifiers,
-                    phase: TouchPhase::Ended,
+                    phase: crate::fast::pinch::end_phase(cancelled != 0),
                 });
                 drop(state);
                 window.handle_input(input);

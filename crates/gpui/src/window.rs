@@ -337,7 +337,7 @@ thread_local! {
     /// Points to the current App's element arena during draw operations.
     /// This allows multiple test Apps to have isolated arenas, preventing
     /// cross-session corruption when the scheduler interleaves their tasks.
-    static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
+    pub(crate) static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
 }
 
 /// Whether a window draw is currently in progress on this thread.
@@ -351,22 +351,13 @@ thread_local! {
 /// message pumping in the Windows window procedure), instead of running a
 /// nested draw or panicking on the already-borrowed App.
 fn draw_in_progress() -> bool {
-    CURRENT_ELEMENT_ARENA.with(|current| current.get().is_some())
+    crate::fast::element_arena::draw_in_progress()
 }
 
 /// Allocates an element in the current arena. Uses the app-specific arena if one
 /// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
 pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
-    CURRENT_ELEMENT_ARENA.with(|current| {
-        if let Some(arena_ptr) = current.get() {
-            // SAFETY: The pointer is valid for the duration of the draw operation
-            // that set it, and we're being called during that same draw.
-            let arena_cell = unsafe { &*arena_ptr };
-            f(&mut arena_cell.borrow_mut())
-        } else {
-            ELEMENT_ARENA.with_borrow_mut(f)
-        }
-    })
+    crate::fast::element_arena::with_element_arena(f)
 }
 
 /// Scope guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw
@@ -387,7 +378,7 @@ pub(crate) struct ElementArenaScope {
     /// The entered arena: compared against the argument in `exit`, and
     /// dereferenced in `Drop` to end its scope (see the SAFETY note there).
     entered: *const RefCell<Arena>,
-    previous: Option<*const RefCell<Arena>>,
+    previous: crate::fast::element_arena::PreviousArena,
     exited: bool,
 }
 
@@ -395,11 +386,7 @@ impl ElementArenaScope {
     /// Enter a scope where element allocations use the given arena.
     pub(crate) fn enter(arena: &RefCell<Arena>) -> Self {
         arena.borrow_mut().begin_scope();
-        let previous = CURRENT_ELEMENT_ARENA.with(|current| {
-            let prev = current.get();
-            current.set(Some(arena as *const RefCell<Arena>));
-            prev
-        });
+        let previous = crate::fast::element_arena::PreviousArena::enter(arena);
         Self {
             entered: arena as *const RefCell<Arena>,
             previous,
@@ -437,9 +424,7 @@ impl Drop for ElementArenaScope {
         // keeps the arena's scope depth correct even when a draw panics; if this
         // only happened in `exit`, a panic between `enter` and `exit` would leave
         // the depth elevated and defer every future clear.
-        CURRENT_ELEMENT_ARENA.with(|current| {
-            current.set(self.previous);
-        });
+        self.previous.restore();
         // SAFETY: `entered` came from a `&RefCell<Arena>` in `enter`, and the
         // arena (owned by the `App` being drawn) outlives this guard on both the
         // normal and unwinding paths, since the guard is a local of the draw.
