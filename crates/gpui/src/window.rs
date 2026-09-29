@@ -1010,6 +1010,7 @@ pub(crate) struct PaintIndex {
     pub(crate) accessed_element_states_index: usize,
     pub(crate) tab_handle_index: usize,
     pub(crate) line_layout_index: LineLayoutIndex,
+    pub(crate) debug_paints_index: usize,
 }
 
 impl Frame {
@@ -3776,10 +3777,13 @@ impl Window {
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
+            debug_paints_index: self.next_frame.retained.debug_paints_len(),
         }
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.reuse_debug_bounds(&range);
         self.reuse_window_control_hitboxes(&range);
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
