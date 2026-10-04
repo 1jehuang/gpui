@@ -79,7 +79,9 @@ impl NSStringExt for id {
             if cstr.is_null() {
                 ""
             } else {
-                CStr::from_ptr(cstr as *mut c_char).to_str().unwrap()
+                // Never panic here: callers include `extern "C"` AppKit
+                // callbacks such as `insertText:`, where a panic aborts.
+                CStr::from_ptr(cstr as *mut c_char).to_str().unwrap_or("")
             }
         }
     }

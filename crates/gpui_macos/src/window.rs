@@ -3666,9 +3666,21 @@ where
     let mut lock = window_state.as_ref().lock();
     if let Some(mut input_handler) = lock.input_handler.take() {
         drop(lock);
-        let result = f(&mut input_handler);
+        // Every caller is an `extern "C"` NSTextInputClient method invoked by
+        // AppKit. A panic unwinding out of one cannot cross the Objective-C
+        // frame, so Rust aborts the whole process (`panic_cannot_unwind`).
+        // An input method should never be able to crash the app, so a panic
+        // in the app's handler drops that one IME event and keeps running.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut input_handler)));
         window_state.lock().input_handler = Some(input_handler);
-        Some(result)
+        match result {
+            Ok(result) => Some(result),
+            Err(_) => {
+                log::error!("text input handler panicked; dropped the input method event");
+                None
+            }
+        }
     } else {
         None
     }

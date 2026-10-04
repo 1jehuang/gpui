@@ -142,6 +142,31 @@ impl<V: 'static> ElementInputHandler<V> {
     }
 }
 
+impl<V: 'static> ElementInputHandler<V> {
+    /// Run one platform text-input callback against the view, containing any
+    /// panic inside the view update.
+    ///
+    /// These callbacks come straight from the OS input method (on macOS from
+    /// `extern "C"` NSTextInputClient methods, where an escaping panic aborts
+    /// the process). Catching inside the update also lets the entity lease end
+    /// normally, so the view stays usable. A failed callback answers with the
+    /// default, which input methods treat as "no text" or "nothing marked".
+    fn update_guarded<R: Default>(
+        &self,
+        cx: &mut App,
+        f: impl FnOnce(&mut V, &mut Context<V>) -> R,
+    ) -> R {
+        self.view.update(cx, |view, cx| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(view, cx))).unwrap_or_else(
+                |_| {
+                    log::error!("text input handler panicked; ignored this input method event");
+                    R::default()
+                },
+            )
+        })
+    }
+}
+
 impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
     fn selected_text_range(
         &mut self,
@@ -149,14 +174,13 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<UTF16Selection> {
-        self.view.update(cx, |view, cx| {
+        self.update_guarded(cx, |view, cx| {
             view.selected_text_range(ignore_disabled_input, window, cx)
         })
     }
 
     fn marked_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
-        self.view
-            .update(cx, |view, cx| view.marked_text_range(window, cx))
+        self.update_guarded(cx, |view, cx| view.marked_text_range(window, cx))
     }
 
     fn text_for_range(
@@ -166,7 +190,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<String> {
-        self.view.update(cx, |view, cx| {
+        self.update_guarded(cx, |view, cx| {
             view.text_for_range(range_utf16, adjusted_range, window, cx)
         })
     }
@@ -178,7 +202,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.view.update(cx, |view, cx| {
+        self.update_guarded(cx, |view, cx| {
             view.replace_text_in_range(replacement_range, text, window, cx)
         });
     }
@@ -191,7 +215,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.view.update(cx, |view, cx| {
+        self.update_guarded(cx, |view, cx| {
             view.replace_and_mark_text_in_range(
                 range_utf16,
                 new_text,
@@ -203,13 +227,11 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
-        self.view
-            .update(cx, |view, cx| view.unmark_text(window, cx));
+        self.update_guarded(cx, |view, cx| view.unmark_text(window, cx));
     }
 
     fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut App) {
-        self.view
-            .update(cx, |view, cx| view.paste(item, window, cx));
+        self.update_guarded(cx, |view, cx| view.paste(item, window, cx));
     }
 
     fn bounds_for_range(
@@ -218,7 +240,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        self.view.update(cx, |view, cx| {
+        self.update_guarded(cx, |view, cx| {
             view.bounds_for_range(range_utf16, self.element_bounds, window, cx)
         })
     }
@@ -229,7 +251,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<usize> {
-        self.view.update(cx, |view, cx| {
+        self.update_guarded(cx, |view, cx| {
             view.character_index_for_point(point, window, cx)
         })
     }
@@ -240,7 +262,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.view.update(cx, |view, cx| {
+        self.update_guarded(cx, |view, cx| {
             view.set_selected_text_range(range_utf16, window, cx)
         })
     }
@@ -250,18 +272,15 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
     }
 
     fn text_length_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
-        self.view
-            .update(cx, |view, cx| view.text_length_utf16(window, cx))
+        self.update_guarded(cx, |view, cx| view.text_length_utf16(window, cx))
     }
 
     fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
-        self.view
-            .update(cx, |view, cx| view.accepts_text_input(window, cx))
+        self.update_guarded(cx, |view, cx| view.accepts_text_input(window, cx))
     }
 
     fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, cx: &mut App) -> bool {
-        self.view
-            .update(cx, |view, cx| view.accepts_text_input(window, cx))
+        self.update_guarded(cx, |view, cx| view.accepts_text_input(window, cx))
     }
 
     fn text_input_configuration(
@@ -269,8 +288,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> TextInputConfiguration {
-        self.view
-            .update(cx, |view, cx| view.text_input_configuration(window, cx))
+        self.update_guarded(cx, |view, cx| view.text_input_configuration(window, cx))
     }
 
     fn text_input_editable_range(
@@ -278,8 +296,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Range<usize>> {
-        self.view
-            .update(cx, |view, cx| view.text_input_editable_range(window, cx))
+        self.update_guarded(cx, |view, cx| view.text_input_editable_range(window, cx))
     }
 }
 
@@ -304,6 +321,7 @@ mod tests {
             move |_, cx| ConfigurationTestView {
                 focus_handle: cx.focus_handle(),
                 configuration: custom,
+                inserted: String::new(),
             }
         });
         let view = window.root(cx).unwrap();
@@ -381,9 +399,29 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn a_panicking_input_handler_is_contained_and_the_view_stays_usable(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+            inserted: String::new(),
+        });
+        let view = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let mut handler = ElementInputHandler::new(Bounds::default(), view.clone());
+            handler.replace_text_in_range(None, "你", window, cx);
+            // On macOS this panic would otherwise abort from `insertText:`.
+            handler.replace_text_in_range(None, "panic", window, cx);
+            handler.replace_text_in_range(None, "好", window, cx);
+        })
+        .unwrap();
+        assert_eq!(view.read_with(cx, |view, _| view.inserted.clone()), "你好");
+    }
+
     struct ConfigurationTestView {
         focus_handle: FocusHandle,
         configuration: TextInputConfiguration,
+        inserted: String,
     }
 
     impl Render for ConfigurationTestView {
@@ -439,10 +477,12 @@ mod tests {
         fn replace_text_in_range(
             &mut self,
             _range: Option<std::ops::Range<usize>>,
-            _text: &str,
+            text: &str,
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) {
+            assert_ne!(text, "panic", "simulated input handler bug");
+            self.inserted.push_str(text);
         }
 
         fn replace_and_mark_text_in_range(
