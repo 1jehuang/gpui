@@ -14,3 +14,4 @@ crates/gpui/src/taffy.rs removed=50 # request_layout, request_measured_layout an
 crates/gpui/src/elements/list.rs added=45 # jcode: a list resized to a new width keeps each row's height as a size hint (one-line hook)
 crates/gpui_linux/src/linux/wayland/client.rs hunk=12 # jcode: pinch updates forward scale and pan to fast::pinch
 crates/gpui_linux/src/linux/x11/client.rs hunk=16 # jcode: pinch updates forward scale and pan to fast::pinch
+crates/gpui_wgpu/src/wgpu_renderer.rs removed=90 # jcode: write_instance_binding and create_texture_bind_group bodies are replaced by fast::bindings, which binds the whole instance data once and keeps texture bind groups across frames; they forward to it

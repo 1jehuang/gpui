@@ -14,6 +14,9 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+#[path = "fast/bindings.rs"]
+mod fast_bindings;
+
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
@@ -231,6 +234,7 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    bindings: fast_bindings::FrameBindings,
 }
 
 impl WgpuRenderer {
@@ -604,6 +608,7 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            bindings: Default::default(),
         })
     }
 
@@ -1403,6 +1408,7 @@ impl WgpuRenderer {
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        self.bindings.begin_frame();
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1533,6 +1539,7 @@ impl WgpuRenderer {
             }
         }
 
+        fast_bindings::flush(self);
         self.resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
@@ -1583,23 +1590,7 @@ impl WgpuRenderer {
         label: &str,
         texture_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
-        let resources = self.resources();
-        resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &resources.bind_group_layouts.texture,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
-                    },
-                ],
-            })
+        fast_bindings::texture_bind_group(self, label, texture_view)
     }
 
     fn draw_instances(
@@ -1775,71 +1766,8 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         instances: &[T],
     ) -> Result<InstanceBinding> {
-        let data = unsafe { Self::instance_bytes(instances) };
-        // wgpu rejects zero-sized bindings, so empty primitive arrays still
-        // reserve the 16-byte minimum.
-        let size = (data.len() as u64).max(16);
-        let stride = (std::mem::size_of::<T>() as u64).max(1);
-        let (alignment, allocation_size) = if self.uses_webgl_instance_data {
-            // The texture transport has no binding offset: the shader indexes
-            // the instance texture absolutely, so each allocation must start on
-            // a whole instance (a stride multiple) and a whole texel, and must
-            // end on a texel boundary so the zero padding of its final partial
-            // texel cannot overlap the next allocation.
-            (
-                least_common_multiple(self.instance_data_alignment, stride),
-                size.next_multiple_of(INSTANCE_TEXTURE_TEXEL_SIZE),
-            )
-        } else {
-            (self.instance_data_alignment.max(1), size)
-        };
-        let mut offset = (*instance_offset).next_multiple_of(alignment);
-        if offset + allocation_size > self.instance_data_capacity {
-            self.grow_instance_data(allocation_size)?;
-            offset = 0;
-        }
-        *instance_offset = offset + allocation_size;
-
-        let first_instance = if self.uses_webgl_instance_data {
-            u32::try_from(offset / stride).context("instance index exceeds u32 range")?
-        } else {
-            0
-        };
-
-        let resources = self.resources();
-        if !data.is_empty() {
-            match &resources.instance_data {
-                InstanceData::Storage(buffer) => resources.queue.write_buffer(buffer, offset, data),
-                InstanceData::Texture { .. } => {
-                    Self::write_instance_texture(resources, offset, data)
-                }
-            }
-        }
-        let bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &resources.bind_group_layouts.instances,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: match &resources.instance_data {
-                        InstanceData::Storage(buffer) => {
-                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer,
-                                offset,
-                                size: NonZeroU64::new(size),
-                            })
-                        }
-                        InstanceData::Texture { view, .. } => {
-                            wgpu::BindingResource::TextureView(view)
-                        }
-                    },
-                }],
-            });
-        Ok(InstanceBinding {
-            bind_group,
-            first_instance,
-        })
+        let _ = label;
+        fast_bindings::write_instance_binding(self, instance_offset, instances)
     }
 
     fn write_instance_texture(resources: &WgpuResources, offset: u64, data: &[u8]) {
