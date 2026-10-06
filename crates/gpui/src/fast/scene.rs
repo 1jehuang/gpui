@@ -36,15 +36,49 @@ fn sort_by_gathering<T: Clone, K: Ord>(
     gathered: &mut Vec<T>,
     key: impl Fn(&T) -> K,
 ) {
-    if items.len() < 2 {
+    if !sort_order(items, order, key) {
         return;
+    }
+    gathered.clear();
+    gathered.extend(order.iter().map(|&index| items[index as usize].clone()));
+    mem::swap(items, gathered);
+}
+
+/// [`sort_by_gathering`] for paths, which own their vertices: each path is
+/// moved into place rather than cloned, which copied every vertex of every
+/// path each frame.
+fn sort_paths_by_gathering(
+    items: &mut Vec<Path<ScaledPixels>>,
+    order: &mut Vec<u32>,
+    gathered: &mut Vec<Path<ScaledPixels>>,
+) {
+    if !sort_order(items, order, |path| path.order) {
+        return;
+    }
+    let mut taken: Vec<Option<Path<ScaledPixels>>> =
+        mem::take(items).into_iter().map(Some).collect();
+    gathered.clear();
+    gathered.extend(
+        order
+            .iter()
+            .map(|&index| taken[index as usize].take().expect("each index once")),
+    );
+    mem::swap(items, gathered);
+}
+
+/// Fills `order` with the indices of `items` in drawing order. Returns
+/// whether that differs from the order they are in.
+fn sort_order<T, K: Ord>(items: &[T], order: &mut Vec<u32>, key: impl Fn(&T) -> K) -> bool {
+    if items.len() < 2 {
+        return false;
     }
     order.clear();
     order.extend(0..items.len() as u32);
     order.sort_unstable_by_key(|&index| (key(&items[index as usize]), index));
-    gathered.clear();
-    gathered.extend(order.iter().map(|&index| items[index as usize].clone()));
-    mem::swap(items, gathered);
+    order
+        .iter()
+        .enumerate()
+        .any(|(at, &index)| at != index as usize)
 }
 
 impl Scene {
@@ -66,7 +100,7 @@ impl Scene {
         }
         sort!(shadows, |shadow: &Shadow| shadow.order);
         sort!(quads, |quad: &Quad| quad.order);
-        sort!(paths, |path: &Path<ScaledPixels>| path.order);
+        sort_paths_by_gathering(&mut self.paths, &mut scratch.order, &mut scratch.paths);
         sort!(underlines, |underline: &Underline| underline.order);
         sort!(monochrome_sprites, |sprite: &MonochromeSprite| (
             sprite.order,
