@@ -112,7 +112,7 @@ impl Scene {
             Primitive::Path(path) => {
                 path.order = order;
                 path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
+                self.paths.push(crate::fast::scene::path_for_drawing(path));
             }
             Primitive::Underline(underline) => {
                 underline.order = order;
@@ -142,7 +142,9 @@ impl Scene {
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Primitive(primitive) => {
+                    self.insert_primitive(crate::fast::scene::replayed(primitive, prev_scene))
+                }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }

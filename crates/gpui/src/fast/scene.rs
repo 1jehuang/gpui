@@ -22,6 +22,40 @@ pub(crate) struct SortScratch {
     subpixel_sprites: Vec<SubpixelSprite>,
     polychrome_sprites: Vec<PolychromeSprite>,
     surfaces: Vec<PaintSurface>,
+    /// Where each path drawn this frame ended up after sorting, by the index
+    /// it was inserted at (its [`crate::PathId`]), so a reused subtree can
+    /// find the vertices its paint operations no longer hold.
+    path_positions: Vec<u32>,
+}
+
+/// The path a scene draws, for `path` being inserted. Its vertices move to
+/// the drawn copy, and the paint operation kept for reuse holds none: they
+/// were cloned for every path drawn, and again for every path reused.
+pub(crate) fn path_for_drawing(path: &mut Path<ScaledPixels>) -> Path<ScaledPixels> {
+    let vertices = mem::take(&mut path.vertices);
+    let mut drawn = path.clone();
+    drawn.vertices = vertices;
+    drawn
+}
+
+/// `primitive`, recorded in `prev_scene`, as it is drawn again. A path takes
+/// back the vertices its drawn copy in `prev_scene` holds.
+pub(crate) fn replayed(primitive: &crate::Primitive, prev_scene: &Scene) -> crate::Primitive {
+    let mut primitive = primitive.clone();
+    if let crate::Primitive::Path(path) = &mut primitive {
+        let inserted = path.id.0;
+        let drawn = prev_scene
+            .sort_scratch
+            .path_positions
+            .get(inserted)
+            .and_then(|&position| prev_scene.paths.get(position as usize))
+            .filter(|drawn| drawn.id == path.id)
+            .or_else(|| prev_scene.paths.iter().find(|drawn| drawn.id == path.id));
+        if let Some(drawn) = drawn {
+            path.vertices = drawn.vertices.clone();
+        }
+    }
+    primitive
 }
 
 /// Puts `items` in the order `key` gives, keeping the order they came in
@@ -101,6 +135,13 @@ impl Scene {
         sort!(shadows, |shadow: &Shadow| shadow.order);
         sort!(quads, |quad: &Quad| quad.order);
         sort_paths_by_gathering(&mut self.paths, &mut scratch.order, &mut scratch.paths);
+        scratch.path_positions.clear();
+        scratch.path_positions.resize(self.paths.len(), u32::MAX);
+        for (position, path) in self.paths.iter().enumerate() {
+            if let Some(slot) = scratch.path_positions.get_mut(path.id.0) {
+                *slot = position as u32;
+            }
+        }
         sort!(underlines, |underline: &Underline| underline.order);
         sort!(monochrome_sprites, |sprite: &MonochromeSprite| (
             sprite.order,

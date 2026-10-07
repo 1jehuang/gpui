@@ -1264,3 +1264,129 @@ fn asking_a_focused_input_how_it_is_configured_does_not_change_it() {
         "the input is drawn from the last frame"
     );
 }
+
+struct Triangle {
+    at: f32,
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for Triangle {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        let at = self.at;
+        div().size(px(40.)).child(
+            crate::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let o = bounds.origin;
+                    let mut path = crate::Path::new(o);
+                    path.push_triangle(
+                        (
+                            o + crate::point(px(at), px(0.)),
+                            o + crate::point(px(at + 20.), px(0.)),
+                            o + crate::point(px(at), px(20.)),
+                        ),
+                        (
+                            crate::point(0., 1.),
+                            crate::point(0., 1.),
+                            crate::point(0., 1.),
+                        ),
+                    );
+                    window.paint_path(path, crate::black());
+                },
+            )
+            .size_full(),
+        )
+    }
+}
+
+struct Triangles {
+    kept: Entity<Triangle>,
+    changing: Entity<Triangle>,
+}
+
+impl Render for Triangles {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .child(self.changing.clone())
+            .child(self.kept.clone())
+    }
+}
+
+/// The vertices of every path drawn, in drawing order.
+fn path_vertices(window: &Window) -> Vec<Vec<(f32, f32)>> {
+    window
+        .rendered_frame
+        .scene
+        .paths
+        .iter()
+        .map(|path| {
+            path.vertices
+                .iter()
+                .map(|v| (v.xy_position.x.0, v.xy_position.y.0))
+                .collect()
+        })
+        .collect()
+}
+
+/// A view drawn again from the last frame still hands the renderer every
+/// vertex of the paths it painted, frame after frame, while a view beside it
+/// paints new ones.
+#[test]
+fn reused_views_keep_the_vertices_of_their_paths() {
+    let mut cx = TestAppContext::single();
+    let kept_builds = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let kept_builds = kept_builds.clone();
+        move |_, cx| Triangles {
+            kept: cx.new(|_| Triangle {
+                at: 5.,
+                builds: kept_builds,
+            }),
+            changing: cx.new(|_| Triangle {
+                at: 0.,
+                builds: Rc::new(Cell::new(0)),
+            }),
+        }
+    });
+    let changing = window
+        .update(&mut cx, |v, _, _| v.changing.clone())
+        .unwrap();
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            path_vertices(window)
+        })
+        .unwrap()
+    };
+    let first = frame(&mut cx);
+    assert_eq!(first.len(), 2);
+    assert!(first.iter().all(|vertices| vertices.len() == 3));
+    for step in 1..5 {
+        changing.update(&mut cx, |triangle, cx| {
+            triangle.at = step as f32;
+            cx.notify();
+        });
+        let drawn = frame(&mut cx);
+        assert_eq!(drawn.len(), 2);
+        assert_eq!(
+            drawn[1], first[1],
+            "frame {step}: the reused path keeps its vertices"
+        );
+        let scale = cx
+            .update_window(window.into(), |_, window, _| window.scale_factor())
+            .unwrap();
+        assert_eq!(
+            drawn[0][0].0 - first[0][0].0,
+            step as f32 * scale,
+            "frame {step}: the changed path is drawn where it moved"
+        );
+    }
+    assert!(
+        kept_builds.get() < 5,
+        "the kept triangle should be drawn from the last frame at least once ({} builds)",
+        kept_builds.get()
+    );
+}
