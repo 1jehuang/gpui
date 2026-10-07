@@ -5352,6 +5352,14 @@ impl Window {
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            // A file dragged in from another app is pointer input too. Without
+            // this, typing and then dropping a file left the window in keyboard
+            // modality, so hover hit tests failed and the drop was ignored.
+            PlatformInput::FileDrop(
+                FileDropEvent::Entered { .. }
+                | FileDropEvent::Pending { .. }
+                | FileDropEvent::Submit { .. },
+            ) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
@@ -8016,6 +8024,58 @@ mod tests {
         path: PathBuf,
         observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
         observed_drops: Rc<RefCell<Vec<PathBuf>>>,
+    }
+
+    struct FileDropTargetView(Rc<RefCell<Vec<PathBuf>>>);
+
+    impl Render for FileDropTargetView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let dropped = self.0.clone();
+            div()
+                .size_full()
+                .on_drop(move |paths: &ExternalPaths, _, _| {
+                    dropped.borrow_mut().extend(paths.paths().iter().cloned());
+                })
+        }
+    }
+
+    /// Typing switches the window to keyboard modality, which hides hover.
+    /// A file dragged in afterwards must still reach the element under it.
+    #[gpui::test]
+    fn test_file_drop_after_typing_reaches_hovered_target(cx: &mut TestAppContext) {
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let dropped = dropped.clone();
+                move |_, _| FileDropTargetView(dropped)
+            })
+            .into();
+        let path = PathBuf::from("/tmp/dropped.png");
+        let position = point(px(20.), px(20.));
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                KeyDownEvent {
+                    keystroke: Keystroke::parse("a").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(window.last_input_was_keyboard());
+            for event in [
+                FileDropEvent::Entered {
+                    position,
+                    paths: ExternalPaths([path.clone()].into_iter().collect()),
+                },
+                FileDropEvent::Pending { position },
+                FileDropEvent::Submit { position },
+            ] {
+                window.dispatch_event(event.to_platform_input(), cx);
+            }
+        })
+        .unwrap();
+        assert_eq!(*dropped.borrow(), vec![path]);
     }
 
     struct FileDropExitView(Rc<Cell<usize>>);
