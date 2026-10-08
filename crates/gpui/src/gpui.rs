@@ -46,7 +46,7 @@ pub mod profiler;
     target_os = "linux",
     target_os = "freebsd",
     target_family = "wasm",
-    feature = "test-support",
+    feature = "test-api",
     feature = "bench-support"
 ))]
 #[expect(missing_docs)]
@@ -60,14 +60,14 @@ mod subscription;
 mod svg_renderer;
 mod tab_stop;
 mod taffy;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-api"))]
 pub mod test;
 mod text_system;
 mod util;
 mod view;
 mod window;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-api"))]
 pub use proptest;
 
 #[cfg(doc)]
@@ -108,7 +108,7 @@ pub use element::*;
 pub use elements::*;
 pub use executor::*;
 pub use fast::element_arena::ElementArenaContext;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-api"))]
 pub use fast::stats::LayoutStats;
 pub use geometry::*;
 pub use gestures::*;
@@ -170,7 +170,7 @@ pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
 use taffy::TaffyLayoutEngine;
 pub use taffy::{AvailableSpace, LayoutId};
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-api"))]
 pub use test::*;
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};

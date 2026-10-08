@@ -68,14 +68,14 @@ where
 impl BackgroundExecutor {
     /// Creates a new BackgroundExecutor from the given PlatformDispatcher.
     pub fn new(dispatcher: Arc<dyn PlatformDispatcher>) -> Self {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, feature = "test-api"))]
         let scheduler: Arc<dyn Scheduler> = if let Some(test_dispatcher) = dispatcher.as_test() {
             test_dispatcher.scheduler().clone()
         } else {
             Arc::new(PlatformScheduler::new(dispatcher.clone()))
         };
 
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(any(test, feature = "test-api")))]
         let scheduler: Arc<dyn Scheduler> = Arc::new(PlatformScheduler::new(dispatcher.clone()));
 
         Self {
@@ -188,19 +188,19 @@ impl BackgroundExecutor {
     }
 
     /// In tests, run an arbitrary number of tasks (determined by the SEED environment variable)
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn simulate_random_delay(&self) -> impl Future<Output = ()> + use<> {
         self.dispatcher.as_test().unwrap().simulate_random_delay()
     }
 
     /// In tests, move time forward. This does not run any tasks, but does make `timer`s ready.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn advance_clock(&self, duration: Duration) {
         self.dispatcher.as_test().unwrap().advance_clock(duration)
     }
 
     /// In tests, run one task.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn tick(&self) -> bool {
         self.dispatcher.as_test().unwrap().scheduler().tick()
     }
@@ -211,14 +211,14 @@ impl BackgroundExecutor {
     /// timer can keep `has_pending_tasks()` true even after all currently-runnable tasks have been
     /// drained. To preserve the historical semantics that tests relied on (drain all work that can
     /// make progress), we advance the clock to the next timer when no runnable tasks remain.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn run_until_parked(&self) {
         let scheduler = self.dispatcher.as_test().unwrap().scheduler();
         scheduler.run();
     }
 
     /// In tests, prevents `run_until_parked` from panicking if there are outstanding tasks.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn allow_parking(&self) {
         self.dispatcher
             .as_test()
@@ -232,7 +232,7 @@ impl BackgroundExecutor {
     }
 
     /// Sets the range of ticks to run before timing out in block_on.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn set_block_on_ticks(&self, range: std::ops::RangeInclusive<usize>) {
         self.dispatcher
             .as_test()
@@ -242,7 +242,7 @@ impl BackgroundExecutor {
     }
 
     /// Undoes the effect of [`Self::allow_parking`].
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn forbid_parking(&self) {
         self.dispatcher
             .as_test()
@@ -252,14 +252,14 @@ impl BackgroundExecutor {
     }
 
     /// In tests, returns the rng used by the dispatcher.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn rng(&self) -> scheduler::SharedRng {
         self.dispatcher.as_test().unwrap().scheduler().rng()
     }
 
     /// How many CPUs are available to the dispatcher.
     pub fn num_cpus(&self) -> usize {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, feature = "test-api"))]
         if let Some(test) = self.dispatcher.as_test() {
             return test.num_cpus_override().unwrap_or(4);
         }
@@ -268,7 +268,7 @@ impl BackgroundExecutor {
 
     /// Override the number of CPUs reported by this executor in tests.
     /// Panics if not called on a test executor.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn set_num_cpus(&self, count: usize) {
         self.dispatcher
             .as_test()
@@ -290,7 +290,7 @@ impl BackgroundExecutor {
 impl ForegroundExecutor {
     /// Creates a new ForegroundExecutor from the given PlatformDispatcher.
     pub fn new(dispatcher: Arc<dyn PlatformDispatcher>) -> Self {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, feature = "test-api"))]
         let (scheduler, session_id): (Arc<dyn Scheduler>, _) =
             if let Some(test_dispatcher) = dispatcher.as_test() {
                 (
@@ -309,14 +309,14 @@ impl ForegroundExecutor {
                 };
             };
 
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(any(test, feature = "test-api")))]
         let platform_scheduler = Arc::new(PlatformScheduler::new(dispatcher.clone()));
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(any(test, feature = "test-api")))]
         let inner = platform_scheduler.foreground_executor();
-        #[cfg(all(not(any(test, feature = "test-support")), feature = "profiler"))]
+        #[cfg(all(not(any(test, feature = "test-api")), feature = "profiler"))]
         let foreground_runnables = Some(platform_scheduler.foreground_runnable_counter());
 
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, feature = "test-api"))]
         let inner = {
             let scheduler_for_dispatch = Arc::downgrade(&scheduler);
             scheduler::LocalExecutor::new(session_id, scheduler, move |runnable| {
@@ -326,7 +326,7 @@ impl ForegroundExecutor {
             })
         };
 
-        #[cfg(all(any(test, feature = "test-support"), feature = "profiler"))]
+        #[cfg(all(any(test, feature = "test-api"), feature = "profiler"))]
         // The deterministic test scheduler does not invoke GPUI's task profiler
         // hooks, so an increment here would have no matching decrement.
         let foreground_runnables = None;
@@ -404,7 +404,7 @@ impl ForegroundExecutor {
     }
 
     /// Used by the test harness to run an async test in a synchronous fashion.
-    #[cfg(all(not(target_family = "wasm"), any(test, feature = "test-support")))]
+    #[cfg(all(not(target_family = "wasm"), any(test, feature = "test-api")))]
     #[track_caller]
     pub fn block_test<R>(&self, future: impl Future<Output = R>) -> R {
         use std::cell::Cell;

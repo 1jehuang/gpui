@@ -881,16 +881,18 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     /// Set a key that can be used to look up this element's bounds
     /// in the [`crate::VisualTestContext::debug_bounds`] map
     /// This is a noop in release builds
     fn debug_selector(mut self, f: impl FnOnce() -> String) -> Self {
-        self.interactivity().debug_selector = Some(f());
+        if crate::fast::test_api::bookkeeping_enabled() {
+            self.interactivity().debug_selector = Some(f());
+        }
         self
     }
 
-    #[cfg(not(any(test, feature = "test-support")))]
+    #[cfg(not(any(test, feature = "test-api")))]
     /// Set a key that can be used to look up this element's bounds
     /// in the [`crate::VisualTestContext::debug_bounds`] map
     /// This is a noop in release builds
@@ -2196,7 +2198,7 @@ pub struct Interactivity {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub(crate) debug_selector: Option<String>,
 }
 
@@ -2523,7 +2525,7 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
-                #[cfg(any(feature = "test-support", test))]
+                #[cfg(any(feature = "test-api", test))]
                 if let Some(debug_selector) = &self.debug_selector {
                     window.note_debug_bounds(debug_selector, bounds);
                 }

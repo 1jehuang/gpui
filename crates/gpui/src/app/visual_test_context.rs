@@ -380,7 +380,7 @@ impl VisualTestAppContext {
     ///
     /// This renders the scene to a Metal texture and reads the pixels directly,
     /// which does not require the window to be visible on screen.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
         self.update_window(window, |_, window, _cx| window.render_to_image())?
     }

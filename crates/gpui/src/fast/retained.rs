@@ -41,7 +41,7 @@ pub(crate) struct RetainedSubtrees {
     /// for a paint drawn again from this frame to record the ones in it.
     /// [`PaintIndex::debug_paints_index`] points into it; outside tests it
     /// stays empty.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub(crate) debug_paints: Vec<(String, Bounds<Pixels>)>,
 }
 
@@ -276,7 +276,7 @@ impl RetainedSubtrees {
         self.by_id.clear();
         self.open.clear();
         self.reused_any = false;
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, feature = "test-api"))]
         self.debug_paints.clear();
     }
 
@@ -405,7 +405,7 @@ impl Window {
     /// Turning it off draws every view from scratch each frame, as upstream
     /// GPUI does. The `GPUI_VIEW_RETENTION=0` environment variable turns it
     /// off for every window.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn set_view_retention(&mut self, enabled: bool) {
         if self.retained_state.view_retention != enabled {
             self.retained_state.view_retention = enabled;
@@ -415,7 +415,7 @@ impl Window {
 
     /// Whether views are drawn again from what they drew on the last frame.
     /// See [`Window::set_view_retention`].
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub fn view_retention(&self) -> bool {
         self.retained_state.view_retention
     }
@@ -1047,7 +1047,7 @@ impl Window {
     /// Records where the element with `selector` was painted, for tests, in
     /// painting order, so that drawing the paint around it again from this
     /// frame records it again.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub(crate) fn note_debug_bounds(&mut self, selector: &str, bounds: Bounds<Pixels>) {
         self.next_frame
             .debug_bounds
@@ -1060,7 +1060,7 @@ impl Window {
 
     /// Records again the debug selectors last frame painted in `range`, which
     /// is being drawn again from last frame.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub(crate) fn reuse_debug_bounds(&mut self, range: &Range<PaintIndex>) {
         let paints = &self.rendered_frame.retained.debug_paints
             [range.start.debug_paints_index..range.end.debug_paints_index];
@@ -1079,9 +1079,9 @@ impl Window {
 impl RetainedSubtrees {
     /// How many debug selectors were painted so far, for [`PaintIndex`].
     pub(crate) fn debug_paints_len(&self) -> usize {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, feature = "test-api"))]
         return self.debug_paints.len();
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(any(test, feature = "test-api")))]
         0
     }
 }

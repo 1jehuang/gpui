@@ -14,7 +14,8 @@ path = "src/gpui_apple.rs"
 [features]
 default = []
 bench-support = ["gpui/bench-support"]
-test-support = ["gpui/test-support"]
+test-api = ["gpui/test-api"]
+test-support = ["test-api", "gpui/test-support"]
 runtime_shaders = []
 
 [dependencies]

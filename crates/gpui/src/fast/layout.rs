@@ -124,7 +124,7 @@ enum Claim {
 impl TaffyLayoutEngine {
     /// How many nodes the tree is currently holding, retained and transient
     /// alike. Used by tests to check that retention does not leak.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-api"))]
     pub(crate) fn node_count(&self) -> usize {
         self.taffy.total_node_count()
     }
