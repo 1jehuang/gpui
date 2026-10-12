@@ -86,6 +86,19 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        let started = std::time::Instant::now();
+        let result = self.handle_msg_inner(handle, msg, wparam, lparam);
+        slow_messages::record(msg, started.elapsed());
+        result
+    }
+
+    fn handle_msg_inner(
+        self: &Rc<Self>,
+        handle: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         let handled = match msg {
             // `DefWindowProc` answers `MA_NOACTIVATE` for a left click on `HTCAPTION`.
             // The activation is only triggered when `DefWindowProc` handles the following `WM_NCLBUTTONDOWN`.
@@ -1802,5 +1815,104 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+/// Reports window messages whose handling blocked the UI thread, so a stall a
+/// user sees (a click that freezes the window for 50 ms) names the message
+/// that caused it in the application log. Cheap: one `Instant` pair per
+/// message, and at most one log line per message kind per second.
+pub(crate) mod slow_messages {
+    use std::{cell::RefCell, time::Duration, time::Instant};
+
+    use super::*;
+
+    /// One frame at 60 Hz. Anything longer is a visible hitch.
+    const SLOW: Duration = Duration::from_millis(16);
+    const LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+    #[derive(Default)]
+    struct State {
+        /// (message, last logged, suppressed since then)
+        recent: Vec<(u32, Instant, u32)>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+
+    pub(crate) fn record(msg: u32, elapsed: Duration) {
+        if elapsed < SLOW {
+            return;
+        }
+        STATE.with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return;
+            };
+            let now = Instant::now();
+            let suppressed = match state.recent.iter_mut().find(|(m, _, _)| *m == msg) {
+                Some((_, last, suppressed)) if now.duration_since(*last) < LOG_INTERVAL => {
+                    *suppressed += 1;
+                    return;
+                }
+                Some((_, last, suppressed)) => {
+                    *last = now;
+                    std::mem::take(suppressed)
+                }
+                None => {
+                    state.recent.push((msg, now, 0));
+                    0
+                }
+            };
+            log::warn!(
+                "slow window message {} took {:.1} ms{}",
+                name(msg),
+                elapsed.as_secs_f64() * 1000.0,
+                if suppressed > 0 {
+                    format!(" ({suppressed} more slow since last report)")
+                } else {
+                    String::new()
+                }
+            );
+        });
+    }
+
+    pub(crate) fn name(msg: u32) -> String {
+        let known = match msg {
+            WM_MOUSEMOVE => "WM_MOUSEMOVE",
+            WM_LBUTTONDOWN => "WM_LBUTTONDOWN",
+            WM_LBUTTONUP => "WM_LBUTTONUP",
+            WM_LBUTTONDBLCLK => "WM_LBUTTONDBLCLK",
+            WM_RBUTTONDOWN => "WM_RBUTTONDOWN",
+            WM_RBUTTONUP => "WM_RBUTTONUP",
+            WM_MBUTTONDOWN => "WM_MBUTTONDOWN",
+            WM_MBUTTONUP => "WM_MBUTTONUP",
+            WM_MOUSEWHEEL => "WM_MOUSEWHEEL",
+            WM_MOUSEHWHEEL => "WM_MOUSEHWHEEL",
+            WM_MOUSEACTIVATE => "WM_MOUSEACTIVATE",
+            WM_MOUSELEAVE => "WM_MOUSELEAVE",
+            WM_NCHITTEST => "WM_NCHITTEST",
+            WM_NCMOUSEMOVE => "WM_NCMOUSEMOVE",
+            WM_NCLBUTTONDOWN => "WM_NCLBUTTONDOWN",
+            WM_NCLBUTTONUP => "WM_NCLBUTTONUP",
+            WM_SETCURSOR => "WM_SETCURSOR",
+            WM_PAINT => "WM_PAINT",
+            WM_TIMER => "WM_TIMER",
+            WM_ACTIVATE => "WM_ACTIVATE",
+            WM_SETFOCUS => "WM_SETFOCUS",
+            WM_KILLFOCUS => "WM_KILLFOCUS",
+            WM_CAPTURECHANGED => "WM_CAPTURECHANGED",
+            WM_SIZE => "WM_SIZE",
+            WM_MOVE => "WM_MOVE",
+            WM_KEYUP => "WM_KEYUP",
+            WM_CHAR => "WM_CHAR",
+            WM_IME_COMPOSITION => "WM_IME_COMPOSITION",
+            WM_GPUI_KEYDOWN => "WM_GPUI_KEYDOWN",
+            WM_GPUI_FORCE_UPDATE_WINDOW => "WM_GPUI_FORCE_UPDATE_WINDOW",
+            WM_GPUI_CURSOR_STYLE_CHANGED => "WM_GPUI_CURSOR_STYLE_CHANGED",
+            WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD => "foreground tasks",
+            _ => return format!("0x{msg:04x}"),
+        };
+        known.to_string()
     }
 }
