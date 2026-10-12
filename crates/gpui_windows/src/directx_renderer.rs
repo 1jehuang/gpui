@@ -430,6 +430,29 @@ impl DirectXRenderer {
             timings.sort_by(|a, b| b.1.cmp(&a.1));
             let total: std::time::Duration = timings.iter().map(|(_, d)| *d).sum();
             if total >= std::time::Duration::from_millis(8) {
+                let viewport = self
+                    .resources
+                    .as_ref()
+                    .map(|r| r.viewport.Width * r.viewport.Height)
+                    .unwrap_or(1.0)
+                    .max(1.0);
+                let area =
+                    |bounds: &Bounds<ScaledPixels>| bounds.size.width.0 * bounds.size.height.0;
+                let quad_area: f32 = scene
+                    .quads
+                    .iter()
+                    .map(|quad| area(&quad.bounds.intersect(&quad.content_mask.bounds)))
+                    .sum();
+                let shadow_area: f32 = scene.shadows.iter().map(|s| area(&s.bounds)).sum();
+                log::info!(
+                    "DirectX scene: {} quads covering {:.1} windows, {} shadows covering {:.1}, {} paths, {} batches",
+                    scene.quads.len(),
+                    quad_area / viewport,
+                    scene.shadows.len(),
+                    shadow_area / viewport,
+                    scene.paths.len(),
+                    scene.batches().count(),
+                );
                 log::info!(
                     "DirectX batches {:.1} ms: {}",
                     total.as_secs_f64() * 1000.0,
