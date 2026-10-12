@@ -453,6 +453,37 @@ impl DirectXRenderer {
                     scene.paths.len(),
                     scene.batches().count(),
                 );
+                let mut largest: Vec<_> = scene
+                    .quads
+                    .iter()
+                    .map(|quad| {
+                        (
+                            area(&quad.bounds.intersect(&quad.content_mask.bounds)),
+                            quad,
+                        )
+                    })
+                    .filter(|(covered, _)| *covered / viewport >= 0.05)
+                    .collect();
+                largest.sort_by(|a, b| b.0.total_cmp(&a.0));
+                log::info!(
+                    "DirectX largest quads: {}",
+                    largest
+                        .iter()
+                        .take(10)
+                        .map(|(covered, quad)| format!(
+                            "[{:.2}w at {:.0},{:.0} {:.0}x{:.0} order {} bg {:?} border {:?}]",
+                            covered / viewport,
+                            quad.bounds.origin.x.0,
+                            quad.bounds.origin.y.0,
+                            quad.bounds.size.width.0,
+                            quad.bounds.size.height.0,
+                            quad.order,
+                            quad.background,
+                            quad.border_widths.top.0,
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
                 log::info!(
                     "DirectX batches {:.1} ms: {}",
                     total.as_secs_f64() * 1000.0,
