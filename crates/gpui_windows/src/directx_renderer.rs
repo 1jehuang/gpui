@@ -338,6 +338,16 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.render(scene, background_appearance)?;
+        if batch_profiling_enabled() {
+            let started = std::time::Instant::now();
+            let result = self.present();
+            self.wait_for_gpu();
+            let elapsed = started.elapsed();
+            if elapsed >= std::time::Duration::from_millis(8) {
+                log::info!("DirectX present {:.1} ms", elapsed.as_secs_f64() * 1000.0);
+            }
+            return result;
+        }
         self.present()
     }
 
@@ -362,11 +372,15 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+        let profile = batch_profiling_enabled();
+        let mut timings: Vec<(&'static str, std::time::Duration)> = Vec::new();
         for batch in scene.batches() {
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
-            match batch {
+            let kind = batch_kind(&batch);
+            let started = profile.then(std::time::Instant::now);
+            let result = match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
@@ -385,8 +399,15 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+            };
+            if let Some(started) = started {
+                self.wait_for_gpu();
+                match timings.iter_mut().find(|(name, _)| *name == kind) {
+                    Some((_, total)) => *total += started.elapsed(),
+                    None => timings.push((kind, started.elapsed())),
+                }
             }
-            .with_context(|| {
+            result.with_context(|| {
                 format!(
                     "scene too large:\
                     {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
@@ -401,7 +422,61 @@ impl DirectXRenderer {
                 )
             })?;
         }
+        if profile {
+            self.wait_for_gpu();
+            timings.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: std::time::Duration = timings.iter().map(|(_, d)| *d).sum();
+            if total >= std::time::Duration::from_millis(8) {
+                log::info!(
+                    "DirectX batches {:.1} ms: {}",
+                    total.as_secs_f64() * 1000.0,
+                    timings
+                        .iter()
+                        .map(|(name, d)| format!("{name} {:.1}", d.as_secs_f64() * 1000.0))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Block until the GPU has executed everything submitted so far. Used
+    /// only by `GPUI_DX_PROFILE=1` to attribute GPU time to primitive kinds.
+    fn wait_for_gpu(&self) {
+        let Some(devices) = self.devices.as_ref() else {
+            return;
+        };
+        unsafe {
+            let desc = D3D11_QUERY_DESC {
+                Query: D3D11_QUERY_EVENT,
+                MiscFlags: 0,
+            };
+            let mut query = None;
+            if devices.device.CreateQuery(&desc, Some(&mut query)).is_err() {
+                return;
+            }
+            let Some(query) = query else { return };
+            devices.device_context.End(&query);
+            let mut done = windows::core::BOOL(0);
+            // S_FALSE (not ready) also maps to Ok, so poll the returned flag.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !done.as_bool() && std::time::Instant::now() < deadline {
+                if devices
+                    .device_context
+                    .GetData(
+                        &query,
+                        Some(&mut done as *mut _ as *mut _),
+                        std::mem::size_of_val(&done) as u32,
+                        0,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+        }
     }
 
     /// Render `scene` to an offscreen CPU image **without presenting** so
@@ -2060,5 +2135,23 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+fn batch_profiling_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GPUI_DX_PROFILE").as_deref() == Ok("1"))
+}
+
+fn batch_kind(batch: &PrimitiveBatch) -> &'static str {
+    match batch {
+        PrimitiveBatch::Shadows(_) => "shadows",
+        PrimitiveBatch::Quads(_) => "quads",
+        PrimitiveBatch::Paths(_) => "paths",
+        PrimitiveBatch::Underlines(_) => "underlines",
+        PrimitiveBatch::MonochromeSprites { .. } => "mono sprites",
+        PrimitiveBatch::SubpixelSprites { .. } => "subpixel sprites",
+        PrimitiveBatch::PolychromeSprites { .. } => "poly sprites",
+        PrimitiveBatch::Surfaces(_) => "surfaces",
     }
 }
