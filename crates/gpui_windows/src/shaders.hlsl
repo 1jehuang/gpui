@@ -1052,8 +1052,15 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     return output;
 }
 
+// The path intermediate is the 4x MSAA surface itself. Averaging its samples
+// here resolves only the pixels each path covers, instead of resolving the
+// whole window every path batch.
+Texture2DMS<float4, 4> t_path_samples: register(t2);
+
 float4 path_sprite_fragment(PathSpriteVertexOutput input): SV_Target {
-    return t_sprite.Sample(s_sprite, input.texture_coords);
+    int2 pixel = int2(input.position.xy);
+    return (t_path_samples.Load(pixel, 0) + t_path_samples.Load(pixel, 1)
+        + t_path_samples.Load(pixel, 2) + t_path_samples.Load(pixel, 3)) * 0.25;
 }
 
 /*

@@ -63,6 +63,8 @@ pub(crate) struct DirectXRendererDevices {
     pub(crate) dxgi_factory: IDXGIFactory6,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
+    /// Direct3D 11.1 context for rect-limited `ClearView`, when available.
+    device_context1: Option<ID3D11DeviceContext1>,
     dxgi_device: Option<IDXGIDevice>,
     annotation: Option<ID3DUserDefinedAnnotation>,
 }
@@ -73,8 +75,7 @@ struct DirectXResources {
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
-    // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
+    // Path intermediate: a 4x MSAA target, read back sample by sample
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
@@ -138,12 +139,14 @@ impl DirectXRendererDevices {
             Some(device.cast().context("Creating DXGI device")?)
         };
         let annotation = device_context.cast().ok();
+        let device_context1 = device_context.cast().ok();
 
         Ok(Self {
             adapter: adapter.clone(),
             dxgi_factory: dxgi_factory.clone(),
             device: device.clone(),
             device_context: device_context.clone(),
+            device_context1,
             dxgi_device,
             annotation,
         })
@@ -694,12 +697,21 @@ impl DirectXRenderer {
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
-        // Clear intermediate MSAA texture
+        // Clear only what this batch can touch. Clearing (and resolving) the
+        // whole 4x MSAA surface for every path batch cost tens of
+        // milliseconds per frame on integrated GPUs at high DPI, which made
+        // every click that repaints the window stall it (Jcode Desktop #5).
+        let region = path_batch_region(paths, &resources.viewport);
         unsafe {
-            devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
-                &[0.0; 4],
-            );
+            let view = resources.path_intermediate_msaa_view.as_ref().unwrap();
+            match (&devices.device_context1, region) {
+                (Some(context1), Some(rect)) => {
+                    context1.ClearView(view, &[0.0; 4], Some(&[rect]));
+                }
+                _ => devices
+                    .device_context
+                    .ClearRenderTargetView(view, &[0.0; 4]),
+            }
             // Set intermediate MSAA texture as render target
             devices.device_context.OMSetRenderTargets(
                 Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
@@ -732,15 +744,9 @@ impl DirectXRenderer {
             1,
         )?;
 
-        // Resolve MSAA to non-MSAA intermediate texture
+        // No full-surface resolve: the path sprite shader averages the MSAA
+        // samples itself, only inside each path's bounds.
         unsafe {
-            devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
-                0,
-                &resources.path_intermediate_msaa_texture,
-                0,
-                RENDER_TARGET_FORMAT,
-            );
             // Restore main render target
             devices
                 .device_context
@@ -785,13 +791,26 @@ impl DirectXRenderer {
             &sprites,
         )?;
 
-        // Draw the sprites with the path texture
-        self.pipelines.path_sprite_pipeline.draw_with_texture(
+        // Draw the sprites, resolving the MSAA samples bound at t2.
+        unsafe {
+            devices
+                .device_context
+                .PSSetShaderResources(2, Some(slice::from_ref(&resources.path_intermediate_srv)));
+        }
+        let result = self.pipelines.path_sprite_pipeline.draw(
             &devices.device_context,
-            slice::from_ref(&resources.path_intermediate_srv),
-            slice::from_ref(&self.globals.sampler),
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            4,
             sprites.len() as u32,
-        )
+        );
+        // The MSAA surface is the next batch's render target. D3D11 refuses
+        // to bind a resource as a target while it is bound for reading.
+        unsafe {
+            devices
+                .device_context
+                .PSSetShaderResources(2, Some(&[None]));
+        }
+        result
     }
 
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
@@ -961,7 +980,6 @@ impl DirectXResources {
         let (
             render_target,
             render_target_view,
-            path_intermediate_texture,
             path_intermediate_srv,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
@@ -973,7 +991,6 @@ impl DirectXResources {
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
-            path_intermediate_texture,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
@@ -991,7 +1008,6 @@ impl DirectXResources {
         let (
             render_target,
             render_target_view,
-            path_intermediate_texture,
             path_intermediate_srv,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
@@ -999,7 +1015,6 @@ impl DirectXResources {
         ) = create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
@@ -1250,31 +1265,6 @@ impl<T> PipelineState<T> {
         Ok(())
     }
 
-    fn draw_with_texture(
-        &self,
-        device_context: &ID3D11DeviceContext,
-        texture: &[Option<ID3D11ShaderResourceView>],
-        sampler: &[Option<ID3D11SamplerState>],
-        instance_count: u32,
-    ) -> Result<()> {
-        set_pipeline_state(
-            device_context,
-            slice::from_ref(&self.view),
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-            &self.vertex,
-            &self.fragment,
-            &self.blend_state,
-        );
-        unsafe {
-            device_context.PSSetSamplers(0, Some(sampler));
-            device_context.VSSetShaderResources(0, Some(texture));
-            device_context.PSSetShaderResources(0, Some(texture));
-
-            device_context.DrawInstanced(4, instance_count, 0, 0);
-        }
-        Ok(())
-    }
-
     fn draw_range(
         &self,
         device_context: &ID3D11DeviceContext,
@@ -1430,7 +1420,6 @@ fn create_resources(
 ) -> Result<(
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
     Option<ID3D11ShaderResourceView>,
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
@@ -1438,10 +1427,16 @@ fn create_resources(
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
     let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
         create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
+    let mut path_intermediate_srv = None;
+    unsafe {
+        devices.device.CreateShaderResourceView(
+            &path_intermediate_msaa_texture,
+            None,
+            Some(&mut path_intermediate_srv),
+        )?
+    };
     let viewport = D3D11_VIEWPORT {
         TopLeftX: 0.0,
         TopLeftY: 0.0,
@@ -1453,7 +1448,6 @@ fn create_resources(
     Ok((
         render_target,
         render_target_view,
-        path_intermediate_texture,
         path_intermediate_srv,
         path_intermediate_msaa_texture,
         path_intermediate_msaa_view,
@@ -1470,39 +1464,6 @@ fn create_render_target_and_its_view(
     let mut render_target_view = None;
     unsafe { device.CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))? };
     Ok((render_target, render_target_view))
-}
-
-#[inline]
-fn create_path_intermediate_texture(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
-    let texture = unsafe {
-        let mut output = None;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: RENDER_TARGET_FORMAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
-        output.unwrap()
-    };
-
-    let mut shader_resource_view = None;
-    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
-
-    Ok((texture, Some(shader_resource_view.unwrap())))
 }
 
 #[inline]
@@ -1524,7 +1485,7 @@ fn create_path_intermediate_msaa_texture_and_view(
                 Quality: D3D11_STANDARD_MULTISAMPLE_PATTERN.0 as u32,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -2154,4 +2115,27 @@ fn batch_kind(batch: &PrimitiveBatch) -> &'static str {
         PrimitiveBatch::PolychromeSprites { .. } => "poly sprites",
         PrimitiveBatch::Surfaces(_) => "surfaces",
     }
+}
+
+/// The device-pixel rectangle a path batch can write, clamped to the
+/// viewport. `None` means "clear everything" (no paths, or empty bounds).
+fn path_batch_region(
+    paths: &[Path<ScaledPixels>],
+    viewport: &D3D11_VIEWPORT,
+) -> Option<windows::Win32::Foundation::RECT> {
+    let mut bounds = paths.first()?.clipped_bounds();
+    for path in &paths[1..] {
+        bounds = bounds.union(&path.clipped_bounds());
+    }
+    // One pixel of slack for antialiasing coverage at the edges.
+    let left = (bounds.origin.x.0.floor() - 1.0).max(0.0);
+    let top = (bounds.origin.y.0.floor() - 1.0).max(0.0);
+    let right = ((bounds.origin.x.0 + bounds.size.width.0).ceil() + 1.0).min(viewport.Width);
+    let bottom = ((bounds.origin.y.0 + bounds.size.height.0).ceil() + 1.0).min(viewport.Height);
+    (right > left && bottom > top).then(|| windows::Win32::Foundation::RECT {
+        left: left as i32,
+        top: top as i32,
+        right: right as i32,
+        bottom: bottom as i32,
+    })
 }
