@@ -1374,13 +1374,17 @@ impl WindowsWindowInner {
             // will rebuild the scene with fresh atlas textures.
             self.state.renderer.borrow_mut().mark_drawable();
         }
+        let frame_started = std::time::Instant::now();
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,
         });
+        slow_messages::record_phase("frame (layout, paint, present)", frame_started.elapsed());
 
         self.state.callbacks.request_frame.set(Some(request_frame));
+        let ime_started = std::time::Instant::now();
         self.update_ime_enabled(handle);
+        slow_messages::record_phase("IME state update", ime_started.elapsed());
         unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
         Some(0)
@@ -1845,6 +1849,20 @@ pub(crate) mod slow_messages {
         if elapsed < SLOW {
             return;
         }
+        report(msg, &name(msg), elapsed);
+    }
+
+    /// A named sub-step of a message (layout, GPU present, IME), so a slow
+    /// WM_PAINT says which part was slow. Phases use ids above every message.
+    pub(crate) fn record_phase(phase: &'static str, elapsed: Duration) {
+        if elapsed < SLOW {
+            return;
+        }
+        let id = 0x8000_0000 | (phase.as_ptr() as usize as u32 & 0x7fff_ffff);
+        report(id, phase, elapsed);
+    }
+
+    fn report(msg: u32, label: &str, elapsed: Duration) {
         STATE.with(|state| {
             let Ok(mut state) = state.try_borrow_mut() else {
                 return;
@@ -1866,7 +1884,7 @@ pub(crate) mod slow_messages {
             };
             log::warn!(
                 "slow window message {} took {:.1} ms{}",
-                name(msg),
+                label,
                 elapsed.as_secs_f64() * 1000.0,
                 if suppressed > 0 {
                     format!(" ({suppressed} more slow since last report)")

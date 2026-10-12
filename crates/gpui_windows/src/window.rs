@@ -1012,11 +1012,13 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        let started = std::time::Instant::now();
         self.state
             .renderer
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
+        crate::events::slow_messages::record_phase("DirectX draw+present", started.elapsed());
     }
 
     #[cfg(any(test, feature = "test-support"))]
