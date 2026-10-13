@@ -9,3 +9,4 @@ mod oracle;
 mod retained;
 mod retained_bench;
 mod support;
+mod ui_scale;
