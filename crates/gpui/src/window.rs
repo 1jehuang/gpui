@@ -1157,6 +1157,7 @@ pub struct Window {
     pub(crate) viewport_size: Size<Pixels>,
     pub(crate) layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) fast_layout: crate::fast::layout_key::WindowLayout,
+    pub(crate) ui_scale: crate::fast::ui_scale::UiScale,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) global_ids: crate::fast::global_id::GlobalIdCache,
@@ -1184,11 +1185,11 @@ pub struct Window {
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
-    mouse_position: Point<Pixels>,
+    pub(crate) mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
-    scale_factor: f32,
+    pub(crate) scale_factor: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1930,7 +1931,9 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        window.dispatch_event(window.ui_scale.to_zoomed_input(event), cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -2025,6 +2028,7 @@ impl Window {
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
             fast_layout: Default::default(),
+            ui_scale: Default::default(),
             root: None,
             element_id_stack: SmallVec::default(),
             global_ids: Default::default(),
@@ -2390,7 +2394,8 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        let region = region.map(|region| self.ui_scale.to_platform_region(region));
+        self.platform_window.set_input_region(region.as_deref());
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
@@ -2671,6 +2676,7 @@ impl Window {
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
         self.mouse_position = self.platform_window.mouse_position();
+        self.apply_ui_scale();
 
         self.refresh();
 
@@ -2749,7 +2755,8 @@ impl Window {
     /// During drawing this is a consistent frame snapshot. Outside drawing it
     /// reflects the latest platform sample, not a synchronous geometry query.
     pub fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
-        self.platform_window.visual_viewport_bounds()
+        self.ui_scale
+            .to_zoomed_bounds(self.platform_window.visual_viewport_bounds())
     }
 
     /// Returns a conservative rectangle avoiding platform-known obscured content.
@@ -2757,7 +2764,9 @@ impl Window {
     /// Intersects the visual viewport with the full layout area inset by system
     /// safe areas and keyboard occlusion. Unknown overlays cannot be excluded.
     pub fn fully_visible_bounds(&self) -> Bounds<Pixels> {
-        let insets = self.platform_window.insets().effective();
+        let insets = self
+            .ui_scale
+            .to_zoomed_edges(self.platform_window.insets().effective());
         let viewport = self.viewport_size();
         let left = insets.left.max(Pixels::ZERO).min(viewport.width);
         let top = insets.top.max(Pixels::ZERO).min(viewport.height);
@@ -2810,7 +2819,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window
+            .show_window_menu(self.ui_scale.to_platform_point(position))
     }
 
     /// Handle window movement for Linux and macOS.
@@ -2824,7 +2834,8 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window
+            .set_client_inset(self.ui_scale.to_platform_length(inset));
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -6374,6 +6385,7 @@ impl Window {
         self.on_next_frame(|window, cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
+                    let bounds = window.ui_scale.to_platform_bounds(bounds);
                     window.platform_window.update_ime_position(bounds);
                 }
                 window.platform_window.set_input_handler(input_handler);
