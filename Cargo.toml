@@ -439,3 +439,4 @@ debug = "full"
 lto = false
 codegen-units = 16
 
+cgl = { path = "vendor/cgl" }

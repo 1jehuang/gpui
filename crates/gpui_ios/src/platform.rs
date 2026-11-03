@@ -39,6 +39,8 @@ pub(crate) fn retain_window(window: id) {
     WINDOWS.with(|w| w.borrow_mut().push(window));
 }
 
+#[link(name = "UIKit", kind = "framework")]
+#[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {
     fn UIApplicationMain(argc: c_int, argv: *mut *mut c_char, principal: id, delegate: id) -> c_int;
 }
