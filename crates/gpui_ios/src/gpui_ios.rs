@@ -93,3 +93,54 @@ pub(crate) unsafe fn to_str<'a>(s: id) -> &'a str {
     }
     unsafe { CStr::from_ptr(cstr) }.to_str().unwrap_or("")
 }
+
+/// Routes `log` records and panics to NSLog so they show up in the device
+/// syslog (`idevicesyslog`, Console.app). Installed once by `IosPlatform::new`.
+pub(crate) fn install_logging() {
+    struct NsLogger;
+    impl log::Log for NsLogger {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Info
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                ns_log(&format!("[{}] {}: {}", r.level(), r.target(), r.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    static LOGGER: NsLogger = NsLogger;
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ns_log(&format!("[PANIC] {info}"));
+        prev(info);
+    }));
+}
+
+pub(crate) fn ns_log(msg: &str) {
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {
+        fn NSLog(fmt: id, ...);
+    }
+    unsafe { NSLog(ns_string("gpui: %@"), ns_string(msg)) }
+    // Also append to <container>/Documents/gpui.log (pullable over USB with
+    // house_arrest; NSLog payloads are redacted as <private> in syslog).
+    use std::io::Write;
+    static LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let path = LOG_PATH.get_or_init(|| {
+        unsafe extern "C" {
+            fn NSHomeDirectory() -> id;
+        }
+        let home = unsafe { to_str(NSHomeDirectory()) }.to_owned();
+        std::path::Path::new(&home).join("Documents/gpui.log")
+    });
+    {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            let _ = writeln!(f, "{t:.3} {msg}");
+        }
+    }
+}

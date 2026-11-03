@@ -83,6 +83,7 @@ impl Default for IosPlatform {
 
 impl IosPlatform {
     pub fn new() -> Self {
+        crate::install_logging();
         let dispatcher = Arc::new(IosDispatcher);
         Self {
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
@@ -115,6 +116,18 @@ extern "C" fn did_finish(_: &Object, _: Sel, _app: id, _opts: id) -> BOOL {
     if let Some(launch) = LAUNCH.with(|l| l.borrow_mut().take()) {
         launch();
     }
+    log::info!("ios did_finish returned");
+    #[cfg(debug_assertions)]
+    let dev = true;
+    #[cfg(not(debug_assertions))]
+    let dev = std::env::var_os("GPUI_IOS_NO_IDLE_LOCK").is_some() || option_env!("GPUI_IOS_NO_IDLE_LOCK").is_some();
+    if dev {
+        // Dev builds: keep the screen awake so USB launches never hit a locked phone.
+        unsafe {
+            let app: id = msg_send![class!(UIApplication), sharedApplication];
+            let _: () = msg_send![app, setIdleTimerDisabled: YES];
+        }
+    }
     YES
 }
 
@@ -124,6 +137,7 @@ extern "C" fn lifecycle(_: &Object, sel: Sel, _app: id) {
         "applicationWillResignActive:" => AppLifecyclePhase::Inactive,
         _ => AppLifecyclePhase::Background,
     };
+    log::info!("ios lifecycle {}", sel.name());
     LIFECYCLE.with(|cb| {
         if let Some(cb) = cb.borrow_mut().as_mut() {
             cb(phase);

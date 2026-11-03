@@ -136,7 +136,8 @@ impl WindowState {
         unsafe {
             let is_first: BOOL = msg_send![self.view, isFirstResponder];
             if visible && is_first == NO {
-                let _: BOOL = msg_send![self.view, becomeFirstResponder];
+                let ok: BOOL = msg_send![self.view, becomeFirstResponder];
+                log::info!("ios keyboard: becomeFirstResponder -> {ok}");
             } else if !visible && is_first == YES {
                 let _: BOOL = msg_send![self.view, resignFirstResponder];
             }
@@ -204,10 +205,20 @@ impl IosWindow {
             // Frame loop.
             let link: id = msg_send![class!(CADisplayLink), displayLinkWithTarget: view selector: sel!(gpuiStep:)];
             let run_loop: id = msg_send![class!(NSRunLoop), mainRunLoop];
-            let mode = ns_string("kCFRunLoopCommonModes"); // == NSRunLoopCommonModes
-            let _: () = msg_send![link, addToRunLoop: run_loop forMode: mode];
+            unsafe extern "C" {
+                static NSRunLoopCommonModes: id;
+            }
+            let _: () = msg_send![link, setPaused: NO];
+            let _: () = msg_send![link, addToRunLoop: run_loop forMode: NSRunLoopCommonModes];
+            let responds: BOOL = msg_send![view, respondsToSelector: sel!(gpuiStep:)];
+            log::info!("ios display link {link:p} responds {responds}");
 
             state.layout();
+            log::info!(
+                "ios window open: frame {:?} scale {scale} layer {}",
+                frame.size,
+                state.renderer.borrow().layer().is_some()
+            );
             Ok(Self {
                 state,
                 display: Rc::new(IosDisplay),
@@ -284,6 +295,12 @@ extern "C" fn layout_subviews(this: &Object, _: Sel) {
 }
 
 extern "C" fn step(this: &Object, _: Sel, _link: id) {
+    static STEPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 3 || n == 120 {
+        let has = state_of(this).map(|s| s.callbacks.borrow().request_frame.is_some());
+        log::info!("ios step #{n}: state/request_frame {has:?}");
+    }
     if let Some(state) = state_of(this) {
         state.with_cb(
             |c| &mut c.request_frame,
@@ -346,6 +363,9 @@ extern "C" fn touches(this: &Object, sel: Sel, touches: id, _event: id) {
                 None
             };
             state.mouse_position.set(position);
+            if !matches!(phase, TouchPhase::Moved) {
+                log::info!("ios touch {phase:?} at {position:?}");
+            }
             state.dispatch(PlatformInput::Touch(TouchEvent {
                 id: TouchId(touch as usize as u64),
                 phase,
@@ -524,6 +544,11 @@ impl PlatformWindow for IosWindow {
         self.state.callbacks.borrow_mut().appearance_changed = Some(callback);
     }
     fn draw(&self, scene: &Scene) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 3 || n % 600 == 0 {
+            log::info!("ios draw #{n}: size {:?} scale {}", self.state.size.get(), self.state.scale.get());
+        }
         self.state.renderer.borrow_mut().draw(scene);
     }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
