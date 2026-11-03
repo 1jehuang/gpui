@@ -2752,6 +2752,18 @@ impl Window {
         self.platform_window.visual_viewport_bounds()
     }
 
+    /// Returns the window insets reported by the platform (safe area and
+    /// keyboard). Zero on platforms without system overlays.
+    pub fn window_insets(&self) -> crate::WindowInsets {
+        self.platform_window.insets()
+    }
+
+    /// Returns the safe-area insets (status bar, notch, home indicator) in
+    /// logical pixels. Zero on desktop platforms.
+    pub fn safe_area_insets(&self) -> Edges<Pixels> {
+        self.platform_window.insets().safe_area
+    }
+
     /// Returns a conservative rectangle avoiding platform-known obscured content.
     ///
     /// Intersects the visual viewport with the full layout area inset by system

@@ -185,6 +185,12 @@ impl MetalRenderer {
     }
 
     fn create_device() -> metal::Device {
+        // iOS has exactly one GPU, and `isRemovable`/`isLowPower` are
+        // macOS-only selectors (unrecognized-selector abort on iPhone).
+        #[cfg(target_os = "ios")]
+        if let Some(d) = metal::Device::system_default() {
+            return d;
+        }
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
