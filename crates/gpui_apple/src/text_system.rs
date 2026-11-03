@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use cocoa::appkit::CGFloat;
+use core_graphics::base::CGFloat;
 use collections::{HashMap, HashSet};
 use core_foundation::{
     array::{CFArray, CFArrayRef},
@@ -12,7 +12,7 @@ use core_graphics::{
     base::{CGGlyph, kCGImageAlphaPremultipliedLast},
     color_space::CGColorSpace,
     context::{CGContext, CGTextDrawingMode},
-    display::CGPoint,
+    geometry::CGPoint,
 };
 use core_text::{
     font::CTFont,
@@ -53,7 +53,7 @@ use crate::open_type::apply_features_and_fallbacks;
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
 
-/// macOS text system using CoreText for font shaping.
+/// Apple (macOS/iOS) text system using CoreText for font shaping.
 pub struct MacTextSystem(RwLock<MacTextSystemState>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -71,7 +71,7 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    sized_fonts: crate::fast::text_system::SizedFonts,
+    sized_fonts: crate::sized_fonts::SizedFonts,
 }
 
 impl MacTextSystem {
@@ -769,7 +769,7 @@ mod lenient_font_attributes {
 
 #[cfg(test)]
 mod tests {
-    use crate::MacTextSystem;
+    use crate::text_system::MacTextSystem;
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
 
     #[test]

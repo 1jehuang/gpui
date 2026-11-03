@@ -17,7 +17,7 @@ bench-support = ["gpui/bench-support", "gpui_apple/bench-support"]
 test-api = ["gpui/test-api", "gpui_apple/test-api"]
 test-support = ["test-api", "gpui/test-support", "gpui_apple/test-support"]
 runtime_shaders = ["gpui_apple/runtime_shaders"]
-font-kit = ["dep:font-kit"]
+font-kit = ["dep:font-kit", "gpui_apple/font-kit"]
 screen-capture = ["gpui/screen-capture"]
 
 [dependencies]

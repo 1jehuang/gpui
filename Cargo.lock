@@ -3072,9 +3072,11 @@ dependencies = [
  "anyhow",
  "block",
  "cbindgen",
- "cocoa 0.26.0",
  "collections",
  "core-foundation 0.10.0",
+ "core-foundation-sys",
+ "core-graphics 0.24.0",
+ "core-text",
  "core-video",
  "derive_more",
  "etagere",
@@ -3086,6 +3088,31 @@ dependencies = [
  "objc",
  "objc2 0.6.3",
  "parking_lot",
+ "pathfinder_geometry",
+ "smallvec",
+ "zed-font-kit 0.14.1-zed (git+https://github.com/zed-industries/font-kit?rev=94b0f28166665e8fd2f53ff6d268a14955c82269)",
+]
+
+[[package]]
+name = "gpui_ios"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-task",
+ "block",
+ "core-foundation 0.10.0",
+ "core-graphics 0.24.0",
+ "dispatch2",
+ "foreign-types",
+ "futures",
+ "gpui",
+ "gpui_apple",
+ "log",
+ "metal",
+ "objc",
+ "parking_lot",
+ "raw-window-handle",
+ "uuid",
 ]
 
 [[package]]
@@ -3211,6 +3238,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "gpui",
+ "gpui_ios",
  "gpui_linux",
  "gpui_macos",
  "gpui_web",

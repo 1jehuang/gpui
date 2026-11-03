@@ -36,7 +36,7 @@ impl SizedFonts {
 
 #[cfg(test)]
 mod tests {
-    use crate::MacTextSystem;
+    use crate::text_system::MacTextSystem;
     use gpui::{FontRun, PlatformTextSystem, font, px};
 
     /// Fonts are made once per size and kept, so a line laid out with a kept

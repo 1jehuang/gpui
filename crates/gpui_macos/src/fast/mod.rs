@@ -7,5 +7,5 @@
 //! call to it. The logic itself — data structures, algorithms, bookkeeping,
 //! tests — is written here, one file per topic.
 
-#[cfg(feature = "font-kit")]
-pub(crate) mod text_system;
+// The CoreText text system (and its kept-sized-fonts cache) moved to
+// `gpui_apple` so the iOS backend can share it.

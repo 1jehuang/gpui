@@ -1,12 +1,13 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    macos_build::run();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" || target_os == "ios" {
+        apple_build::run(&target_os);
+    }
 }
 
-#[cfg(target_os = "macos")]
-mod macos_build {
+mod apple_build {
     use std::{
         env,
         path::{Path, PathBuf},
@@ -14,13 +15,29 @@ mod macos_build {
 
     use cbindgen::Config;
 
-    pub fn run() {
+    pub fn run(target_os: &str) {
         let header_path = generate_shader_bindings();
 
-        #[cfg(feature = "runtime_shaders")]
+        // Always emit the self-contained shader source. It is used when the
+        // `runtime_shaders` feature is on, and as the fallback when no Metal
+        // toolchain (`xcrun metal`) is available, e.g. cross-compiling for
+        // iOS from Linux.
         emit_stitched_shaders(&header_path);
-        #[cfg(not(feature = "runtime_shaders"))]
-        compile_metal_shaders(&header_path);
+        let runtime = env::var_os("CARGO_FEATURE_RUNTIME_SHADERS").is_some()
+            || !metal_toolchain_available();
+        if runtime {
+            println!("cargo:rustc-cfg=gpui_apple_runtime_shaders");
+        } else {
+            compile_metal_shaders(&header_path, target_os);
+        }
+    }
+
+    fn metal_toolchain_available() -> bool {
+        std::process::Command::new("xcrun")
+            .args(["-sdk", "macosx", "-f", "metal"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     fn generate_shader_bindings() -> PathBuf {
@@ -105,7 +122,6 @@ mod macos_build {
 
     /// To enable runtime compilation, we need to "stitch" the shaders file with the generated header
     /// so that it is self-contained.
-    #[cfg(feature = "runtime_shaders")]
     fn emit_stitched_shaders(header_path: &Path) {
         fn stitch_header(header: &Path, shader_path: &Path) -> std::io::Result<PathBuf> {
             let header_contents = std::fs::read_to_string(header)?;
@@ -122,8 +138,7 @@ mod macos_build {
         println!("cargo:rerun-if-changed={shader_source_path}");
     }
 
-    #[cfg(not(feature = "runtime_shaders"))]
-    fn compile_metal_shaders(header_path: &Path) {
+    fn compile_metal_shaders(header_path: &Path, target_os: &str) {
         use std::process::{self, Command};
         let shader_path = "./src/shaders.metal";
         let air_output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.air");
@@ -139,15 +154,27 @@ mod macos_build {
         std::fs::copy(shader_path, &staged_shader_path).unwrap();
 
         let output = Command::new("xcrun")
-            .args([
-                "-sdk",
-                "macosx",
-                "metal",
-                "-gline-tables-only",
-                "-mmacosx-version-min=10.15.7",
-                "-MO",
-                "-c",
-            ])
+            .args(if target_os == "ios" {
+                [
+                    "-sdk",
+                    "iphoneos",
+                    "metal",
+                    "-gline-tables-only",
+                    "-mios-version-min=16.0",
+                    "-MO",
+                    "-c",
+                ]
+            } else {
+                [
+                    "-sdk",
+                    "macosx",
+                    "metal",
+                    "-gline-tables-only",
+                    "-mmacosx-version-min=10.15.7",
+                    "-MO",
+                    "-c",
+                ]
+            })
             .arg(&staged_shader_path)
             .args(["-include", header_path.to_str().unwrap(), "-o"])
             .arg(&air_output_path)
@@ -163,7 +190,11 @@ mod macos_build {
         }
 
         let output = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metallib"])
+            .args([
+                "-sdk",
+                if target_os == "ios" { "iphoneos" } else { "macosx" },
+                "metallib",
+            ])
             .arg(&air_output_path)
             .arg("-o")
             .arg(metallib_output_path)

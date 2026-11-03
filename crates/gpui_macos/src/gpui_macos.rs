@@ -25,12 +25,6 @@ pub mod metal_renderer {
     pub use gpui_apple::metal_renderer::MetalHeadlessRenderer;
 }
 
-#[cfg(feature = "font-kit")]
-mod open_type;
-
-#[cfg(feature = "font-kit")]
-mod text_system;
-
 mod platform;
 mod window;
 mod window_appearance;
@@ -54,7 +48,7 @@ pub(crate) use platform::*;
 pub(crate) use window::*;
 
 #[cfg(feature = "font-kit")]
-pub(crate) use text_system::*;
+pub(crate) use gpui_apple::MacTextSystem;
 
 pub use platform::MacPlatform;
 

@@ -17,19 +17,24 @@ bench-support = ["gpui/bench-support"]
 test-api = ["gpui/test-api"]
 test-support = ["test-api", "gpui/test-support"]
 runtime_shaders = []
+font-kit = ["dep:font-kit"]
 
 [dependencies]
 gpui.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 anyhow.workspace = true
 block.workspace = true
-cocoa.workspace = true
 collections.workspace = true
 core-foundation.workspace = true
+core-foundation-sys.workspace = true
+core-graphics.workspace = true
+core-text.workspace = true
 core-video.workspace = true
 derive_more.workspace = true
 etagere.workspace = true
+# WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
+font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", package = "zed-font-kit", version = "0.14.1-zed", optional = true }
 foreign-types.workspace = true
 image.workspace = true
 log.workspace = true
@@ -37,8 +42,10 @@ metal.workspace = true
 objc.workspace = true
 objc2.workspace = true
 parking_lot.workspace = true
+pathfinder_geometry.workspace = true
+smallvec.workspace = true
 
-[target.'cfg(target_os = "macos")'.build-dependencies]
+[build-dependencies]
 cbindgen.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
