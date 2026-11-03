@@ -377,7 +377,7 @@ extern "C" fn touches(this: &Object, sel: Sel, touches: id, _event: id) {
     }
 }
 
-fn key(state: &WindowState, key: &str, key_char: Option<String>) {
+fn key(state: &WindowState, key: &str, key_char: Option<String>) -> bool {
     let keystroke = Keystroke {
         modifiers: Modifiers::default(),
         key: key.into(),
@@ -387,12 +387,13 @@ fn key(state: &WindowState, key: &str, key_char: Option<String>) {
         keystroke,
         is_held: false,
         prefer_character_input: true,
-    }));
+    }))
 }
 
 extern "C" fn insert_text(this: &Object, _: Sel, text: id) {
     let Some(state) = state_of(this) else { return };
     let text = unsafe { to_str(text) }.to_string();
+    log::info!("ios insertText {:?} handler {}", text.len(), state.input_handler.borrow().is_some());
     if text == "\n" {
         key(state, "enter", None);
         return;
@@ -403,8 +404,13 @@ extern "C" fn insert_text(this: &Object, _: Sel, text: id) {
     if text.chars().count() == 1 {
         let k = text.to_lowercase();
         let k = if k == " " { "space".into() } else { k };
-        key(state, &k, Some(text));
-    } else if let Some(mut handler) = state.input_handler.borrow_mut().take() {
+        // Like macOS: a keystroke no binding consumed becomes text input.
+        if key(state, &k, Some(text.clone())) {
+            return;
+        }
+    }
+    let handler = state.input_handler.borrow_mut().take();
+    if let Some(mut handler) = handler {
         handler.replace_text_in_range(None, &text);
         state.input_handler.borrow_mut().get_or_insert(handler);
     }
