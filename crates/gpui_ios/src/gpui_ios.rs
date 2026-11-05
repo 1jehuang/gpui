@@ -9,6 +9,7 @@
 mod dispatcher;
 mod display;
 mod platform;
+mod text_input;
 mod window;
 
 pub use platform::IosPlatform;
@@ -40,6 +41,19 @@ pub(crate) struct CGSize {
 pub(crate) struct CGRect {
     pub origin: CGPoint,
     pub size: CGSize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NSRange {
+    pub location: usize,
+    pub length: usize,
+}
+
+unsafe impl objc::Encode for NSRange {
+    fn encode() -> objc::Encoding {
+        unsafe { objc::Encoding::from_str("{_NSRange=QQ}") }
+    }
 }
 
 #[repr(C)]

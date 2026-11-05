@@ -54,6 +54,9 @@ pub(crate) struct WindowState {
     input_handler: RefCell<Option<PlatformInputHandler>>,
     callbacks: RefCell<Callbacks>,
     keyboard_wanted: Cell<bool>,
+    /// UITextInputTraits of the focused field: autocorrect, autocapitalize,
+    /// spellcheck, return key.
+    traits: Cell<(isize, isize, isize, isize)>,
 }
 
 impl WindowState {
@@ -131,6 +134,15 @@ impl WindowState {
         }
     }
 
+    /// Runs `f` with the focused input handler taken out of its slot, so the
+    /// GPUI update it performs may re-enter the window safely.
+    pub(crate) fn with_handler<R>(&self, f: impl FnOnce(&mut PlatformInputHandler) -> R) -> Option<R> {
+        let mut handler = self.input_handler.borrow_mut().take()?;
+        let result = f(&mut handler);
+        self.input_handler.borrow_mut().get_or_insert(handler);
+        Some(result)
+    }
+
     fn set_keyboard(&self, visible: bool) {
         self.keyboard_wanted.set(visible);
         unsafe {
@@ -138,8 +150,10 @@ impl WindowState {
             if visible && is_first == NO {
                 let ok: BOOL = msg_send![self.view, becomeFirstResponder];
                 log::info!("ios keyboard: becomeFirstResponder -> {ok}");
+                crate::text_input::attach_interaction(self.view);
             } else if !visible && is_first == YES {
                 let _: BOOL = msg_send![self.view, resignFirstResponder];
+                crate::text_input::detach_interaction(self.view);
             }
         }
     }
@@ -182,6 +196,7 @@ impl IosWindow {
                 input_handler: RefCell::new(None),
                 callbacks: RefCell::new(Callbacks::default()),
                 keyboard_wanted: Cell::new(false),
+                traits: Cell::new((1, 0, 1, 0)),
             });
             (*view).set_ivar::<*const c_void>(STATE_IVAR, Rc::into_raw(state.clone()) as *const c_void);
 
@@ -228,7 +243,7 @@ impl IosWindow {
     }
 }
 
-fn state_of(this: &Object) -> Option<&'static WindowState> {
+pub(crate) fn state_of(this: &Object) -> Option<&'static WindowState> {
     unsafe {
         let ptr: *const c_void = *this.get_ivar(STATE_IVAR);
         (ptr as *const WindowState).as_ref()
@@ -240,9 +255,12 @@ fn view_class() -> &'static Class {
     let ptr = *CLASS.get_or_init(|| unsafe {
         let mut decl = ClassDecl::new("GPUIView", class!(UIView)).expect("GPUIView");
         decl.add_ivar::<*const c_void>(STATE_IVAR);
-        if let Some(p) = Protocol::get("UIKeyInput") {
-            decl.add_protocol(p);
+        for name in ["UIKeyInput", "UITextInput"] {
+            if let Some(p) = Protocol::get(name) {
+                decl.add_protocol(p);
+            }
         }
+        crate::text_input::add_methods(&mut decl);
         decl.add_method(sel!(layoutSubviews), layout_subviews as extern "C" fn(&Object, Sel));
         decl.add_method(sel!(safeAreaInsetsDidChange), layout_subviews as extern "C" fn(&Object, Sel));
         decl.add_method(sel!(gpuiStep:), step as extern "C" fn(&Object, Sel, id));
@@ -256,10 +274,12 @@ fn view_class() -> &'static Class {
         decl.add_method(sel!(touchesEnded:withEvent:), touch);
         decl.add_method(sel!(touchesCancelled:withEvent:), touch);
         decl.add_method(sel!(canBecomeFirstResponder), yes as extern "C" fn(&Object, Sel) -> BOOL);
-        decl.add_method(sel!(hasText), yes as extern "C" fn(&Object, Sel) -> BOOL);
         decl.add_method(sel!(insertText:), insert_text as extern "C" fn(&Object, Sel, id));
         decl.add_method(sel!(deleteBackward), delete_backward as extern "C" fn(&Object, Sel));
-        decl.add_method(sel!(autocorrectionType), zero as extern "C" fn(&Object, Sel) -> isize);
+        decl.add_method(sel!(autocorrectionType), autocorrection as extern "C" fn(&Object, Sel) -> isize);
+        decl.add_method(sel!(autocapitalizationType), autocapitalization as extern "C" fn(&Object, Sel) -> isize);
+        decl.add_method(sel!(spellCheckingType), spell_checking as extern "C" fn(&Object, Sel) -> isize);
+        decl.add_method(sel!(returnKeyType), return_key as extern "C" fn(&Object, Sel) -> isize);
         decl.add_method(sel!(keyboardAppearance), one as extern "C" fn(&Object, Sel) -> isize);
         decl.register() as *const Class as usize
     });
@@ -281,9 +301,44 @@ fn controller_class() -> &'static Class {
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
     YES
 }
-extern "C" fn zero(_: &Object, _: Sel) -> isize {
-    0
+fn traits(this: &Object) -> (isize, isize, isize, isize) {
+    state_of(this).map(|s| s.traits.get()).unwrap_or((1, 0, 1, 0))
 }
+extern "C" fn autocorrection(this: &Object, _: Sel) -> isize {
+    traits(this).0
+}
+extern "C" fn autocapitalization(this: &Object, _: Sel) -> isize {
+    traits(this).1
+}
+extern "C" fn spell_checking(this: &Object, _: Sel) -> isize {
+    traits(this).2
+}
+extern "C" fn return_key(this: &Object, _: Sel) -> isize {
+    traits(this).3
+}
+
+/// Maps GPUI's configuration onto UIKit enums: UITextAutocorrectionType
+/// (no 1, yes 2), UITextAutocapitalizationType (none 0, words 1, sentences 2,
+/// all 3), UITextSpellCheckingType (no 1, yes 2) and UIReturnKeyType.
+pub(crate) fn uikit_traits(c: &gpui::TextInputConfiguration) -> (isize, isize, isize, isize) {
+    use gpui::{Autocapitalize, TextInputAction as A};
+    let cap = match c.autocapitalize {
+        Autocapitalize::None => 0,
+        Autocapitalize::Words => 1,
+        Autocapitalize::Sentences => 2,
+        Autocapitalize::Characters => 3,
+    };
+    let ret = match c.input_action {
+        A::Unspecified | A::Enter => 0,
+        A::Go => 1,
+        A::Search => 6,
+        A::Send => 7,
+        A::Done => 9,
+        A::Next | A::Previous => 4,
+    };
+    (if c.autocorrect { 2 } else { 1 }, cap, if c.suggestions { 2 } else { 1 }, ret)
+}
+
 extern "C" fn one(_: &Object, _: Sel) -> isize {
     1
 }
@@ -311,6 +366,7 @@ extern "C" fn step(this: &Object, _: Sel, _link: id) {
                 })
             },
         );
+        crate::text_input::sync_after_frame(this, state);
     }
 }
 
@@ -378,6 +434,8 @@ extern "C" fn touches(this: &Object, sel: Sel, touches: id, _event: id) {
 }
 
 fn key(state: &WindowState, key: &str, key_char: Option<String>) -> bool {
+    // Only printable keys prefer text input; backspace/enter must reach bindings.
+    let prefer_character_input = key_char.is_some();
     let keystroke = Keystroke {
         modifiers: Modifiers::default(),
         key: key.into(),
@@ -386,7 +444,7 @@ fn key(state: &WindowState, key: &str, key_char: Option<String>) -> bool {
     state.dispatch(PlatformInput::KeyDown(KeyDownEvent {
         keystroke,
         is_held: false,
-        prefer_character_input: true,
+        prefer_character_input,
     }))
 }
 
@@ -394,31 +452,36 @@ extern "C" fn insert_text(this: &Object, _: Sel, text: id) {
     let Some(state) = state_of(this) else { return };
     let text = unsafe { to_str(text) }.to_string();
     log::info!("ios insertText {:?} handler {}", text.len(), state.input_handler.borrow().is_some());
+    // UIKit originated this edit, so it must not be echoed back to the input
+    // delegate (that resets autocorrect and auto-shift).
+    crate::text_input::platform_edit(|| insert(state, &text));
+}
+
+fn insert(state: &WindowState, text: &str) {
     if text == "\n" {
         key(state, "enter", None);
         return;
     }
     // Multi-character insertions (autocomplete, paste, dictation) go straight
-    // to the focused input; single characters travel as keystrokes so key
+    // to the focused input. Single characters travel as keystrokes so key
     // bindings still see them.
     if text.chars().count() == 1 {
         let k = text.to_lowercase();
         let k = if k == " " { "space".into() } else { k };
         // Like macOS: a keystroke no binding consumed becomes text input.
-        if key(state, &k, Some(text.clone())) {
+        if key(state, &k, Some(text.to_string())) {
             return;
         }
     }
-    let handler = state.input_handler.borrow_mut().take();
-    if let Some(mut handler) = handler {
-        handler.replace_text_in_range(None, &text);
-        state.input_handler.borrow_mut().get_or_insert(handler);
-    }
+    state.with_handler(|h| h.replace_text_in_range(None, text));
 }
 
 extern "C" fn delete_backward(this: &Object, _: Sel) {
     if let Some(state) = state_of(this) {
-        key(state, "backspace", None);
+        log::info!("ios deleteBackward");
+        crate::text_input::platform_edit(|| {
+            key(state, "backspace", None);
+        });
     }
 }
 
@@ -478,6 +541,18 @@ impl PlatformWindow for IosWindow {
     }
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.state.input_handler.borrow_mut().take()
+    }
+    fn set_text_input_configuration(&mut self, configuration: gpui::TextInputConfiguration) {
+        let t = uikit_traits(&configuration);
+        if self.state.traits.replace(t) != t {
+            // UIKit reads traits when the keyboard attaches; reload live.
+            unsafe {
+                let is_first: BOOL = msg_send![self.state.view, isFirstResponder];
+                if is_first == YES {
+                    let _: () = msg_send![self.state.view, reloadInputViews];
+                }
+            }
+        }
     }
     fn show_soft_keyboard(&self) {
         self.state.set_keyboard(true);
