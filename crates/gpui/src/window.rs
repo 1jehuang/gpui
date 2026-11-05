@@ -1207,6 +1207,8 @@ pub struct Window {
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
+    emulate_touch: bool,
+    emulated_touch_down: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
@@ -2072,6 +2074,8 @@ impl Window {
                     .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
             ),
             touch_prediction_enabled: true,
+            emulate_touch: false,
+            emulated_touch_down: false,
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
@@ -5364,6 +5368,10 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let event = match self.emulated_touch(event) {
+            Ok(touch) => touch,
+            Err(event) => event,
+        };
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -5585,6 +5593,58 @@ impl Window {
     /// before gesture recognition, so pans track only raw touch positions.
     pub fn set_touch_prediction_enabled(&mut self, enabled: bool) {
         self.touch_prediction_enabled = enabled;
+    }
+
+    /// Whether left-button mouse input is translated into single-finger
+    /// [`TouchEvent`]s, so a desktop window exercises the exact touch path a
+    /// phone does (gesture recognizer, pan scroll with touch phases, taps,
+    /// long press). For mobile previews. Defaults to false.
+    pub fn emulate_touch_from_mouse(&self) -> bool {
+        self.emulate_touch
+    }
+
+    /// See [`Self::emulate_touch_from_mouse`].
+    pub fn set_emulate_touch_from_mouse(&mut self, enabled: bool) {
+        self.emulate_touch = enabled;
+        self.emulated_touch_down = false;
+    }
+
+    /// Ok(touch) when mouse input should be replaced by an emulated touch.
+    fn emulated_touch(&mut self, event: PlatformInput) -> Result<PlatformInput, PlatformInput> {
+        if !self.emulate_touch {
+            return Err(event);
+        }
+        let (phase, position) = match &event {
+            PlatformInput::MouseDown(e) if e.button == MouseButton::Left => {
+                self.emulated_touch_down = true;
+                (crate::TouchPhase::Started, e.position)
+            }
+            PlatformInput::MouseMove(e) if self.emulated_touch_down => {
+                if e.pressed_button != Some(MouseButton::Left) {
+                    // Release happened outside the window.
+                    self.emulated_touch_down = false;
+                    (crate::TouchPhase::Cancelled, e.position)
+                } else {
+                    (crate::TouchPhase::Moved, e.position)
+                }
+            }
+            PlatformInput::MouseUp(e) if e.button == MouseButton::Left && self.emulated_touch_down => {
+                self.emulated_touch_down = false;
+                (crate::TouchPhase::Ended, e.position)
+            }
+            PlatformInput::MouseExited(e) if self.emulated_touch_down => {
+                self.emulated_touch_down = false;
+                (crate::TouchPhase::Cancelled, e.position)
+            }
+            _ => return Err(event),
+        };
+        Ok(PlatformInput::Touch(TouchEvent {
+            id: crate::TouchId(u64::MAX),
+            phase,
+            position,
+            predicted_position: None,
+            force: None,
+        }))
     }
 
     /// Runs the portable gesture recognizer over a raw touch event and
@@ -8547,6 +8607,85 @@ mod tests {
 
     struct TouchDragListener {
         events: Rc<RefCell<Vec<(TouchPhase, Pixels)>>>,
+    }
+
+    /// A pan-scroll listener that requests animation frames, like a mobile
+    /// app's swipe handler. Mirrors the jcode-mobile iOS crash: the listener
+    /// runs outside render, where there is no current view.
+    struct ScrollFrameRequester {
+        phases: Rc<RefCell<Vec<TouchPhase>>>,
+    }
+
+    impl Render for ScrollFrameRequester {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("pan")
+                .size_full()
+                .on_scroll_wheel(cx.listener(|this, e: &crate::ScrollWheelEvent, window, cx| {
+                    this.phases.borrow_mut().push(e.touch_phase);
+                    window.request_animation_frame();
+                    cx.notify();
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn emulated_mouse_drag_pans_with_touch_phases_without_panicking(cx: &mut TestAppContext) {
+        let phases = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let phases = phases.clone();
+            move |_, _| ScrollFrameRequester { phases }
+        });
+        window
+            .update(cx, |_, window, _| window.set_emulate_touch_from_mouse(true))
+            .unwrap();
+        let mouse = |input: PlatformInput, cx: &mut TestAppContext| {
+            cx.test_window(window.into()).simulate_input(input);
+            cx.run_until_parked();
+        };
+        let at = |x: f32, y: f32| point(px(x), px(y));
+        mouse(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: at(200., 300.),
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        for i in 1..=8 {
+            mouse(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: at(200. - 15. * i as f32, 300.),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }),
+                cx,
+            );
+        }
+        mouse(
+            PlatformInput::MouseUp(crate::MouseUpEvent {
+                button: MouseButton::Left,
+                position: at(80., 300.),
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+        cx.executor().run_until_parked();
+        let phases = phases.borrow();
+        assert!(phases.contains(&TouchPhase::Moved), "{phases:?}");
+        assert_eq!(phases.last(), Some(&TouchPhase::Ended), "{phases:?}");
+    }
+
+    #[gpui::test]
+    fn request_animation_frame_outside_render_does_not_panic(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        window
+            .update(cx, |_, window, _| window.request_animation_frame())
+            .unwrap();
+        cx.executor().run_until_parked();
     }
 
     impl Render for TouchDragListener {
