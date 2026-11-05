@@ -19,6 +19,7 @@ font-kit = ["gpui_apple/font-kit"]
 gpui.workspace = true
 
 [target.'cfg(target_os = "ios")'.dependencies]
+accesskit.workspace = true
 anyhow.workspace = true
 async-task.workspace = true
 dispatch2 = "0.3.1"

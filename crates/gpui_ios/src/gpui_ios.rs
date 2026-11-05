@@ -6,6 +6,7 @@
 //! raw touch forwarding (GPUI core recognizes gestures), the software
 //! keyboard, and safe-area/keyboard insets.
 
+mod accessibility;
 mod apple_sign_in;
 mod dispatcher;
 mod display;

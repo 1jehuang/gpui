@@ -59,6 +59,8 @@ pub(crate) struct WindowState {
     traits: Cell<(isize, isize, isize, isize)>,
     /// Content kind of the focused field (keyboardType, textContentType).
     purpose: Cell<gpui::TextInputPurpose>,
+    /// VoiceOver bridge fed from GPUI's AccessKit tree.
+    a11y: crate::accessibility::A11yBridge,
 }
 
 impl WindowState {
@@ -200,7 +202,10 @@ impl IosWindow {
                 keyboard_wanted: Cell::new(false),
                 traits: Cell::new((1, 0, 1, 0)),
                 purpose: Cell::new(gpui::TextInputPurpose::Text),
+                a11y: crate::accessibility::A11yBridge::new(),
             });
+            state.a11y.set_scale(scale);
+            crate::accessibility::set_view(view);
             (*view).set_ivar::<*const c_void>(STATE_IVAR, Rc::into_raw(state.clone()) as *const c_void);
 
             let controller: id = msg_send![controller_class(), new];
@@ -267,6 +272,9 @@ fn view_class() -> &'static Class {
         decl.add_method(sel!(layoutSubviews), layout_subviews as extern "C" fn(&Object, Sel));
         decl.add_method(sel!(safeAreaInsetsDidChange), layout_subviews as extern "C" fn(&Object, Sel));
         decl.add_method(sel!(gpuiStep:), step as extern "C" fn(&Object, Sel, id));
+        decl.add_method(sel!(gpuiA11yStatusChanged:), a11y_status as extern "C" fn(&Object, Sel, id));
+        decl.add_method(sel!(accessibilityElements), a11y_elements as extern "C" fn(&Object, Sel) -> id);
+        decl.add_method(sel!(isAccessibilityElement), no as extern "C" fn(&Object, Sel) -> BOOL);
         decl.add_method(
             sel!(gpuiKeyboardChanged:),
             keyboard_changed as extern "C" fn(&Object, Sel, id),
@@ -303,6 +311,17 @@ fn controller_class() -> &'static Class {
     unsafe { &*(ptr as *const Class) }
 }
 
+extern "C" fn no(_: &Object, _: Sel) -> BOOL {
+    NO
+}
+extern "C" fn a11y_status(this: &Object, _: Sel, _note: id) {
+    if let Some(state) = state_of(this) {
+        state.a11y.sync_status();
+    }
+}
+extern "C" fn a11y_elements(this: &Object, _: Sel) -> id {
+    state_of(this).map_or(nil, |s| s.a11y.elements())
+}
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
     YES
 }
@@ -683,4 +702,10 @@ impl PlatformWindow for IosWindow {
         None
     }
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        self.state.a11y.init(callbacks, self.state.view);
+    }
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        self.state.a11y.apply(tree_update);
+    }
 }

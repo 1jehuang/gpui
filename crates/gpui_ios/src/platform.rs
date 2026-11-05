@@ -31,6 +31,25 @@ thread_local! {
     static LAUNCH: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static LIFECYCLE: RefCell<Option<Box<dyn FnMut(AppLifecyclePhase)>>> = RefCell::new(None);
     static WINDOWS: RefCell<Vec<id>> = RefCell::new(Vec::new());
+    static OPEN_URLS: RefCell<Option<Box<dyn FnMut(Vec<String>)>>> = RefCell::new(None);
+    /// URLs delivered before the app registered `on_open_urls` (cold launch).
+    static PENDING_URLS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+/// Hands opened URLs (custom scheme, universal links) to the app, or queues
+/// them until it registers its handler.
+pub(crate) fn deliver_urls(urls: Vec<String>) {
+    log::info!("ios open urls {urls:?}");
+    let delivered = OPEN_URLS.with(|cb| match cb.borrow_mut().as_mut() {
+        Some(cb) => {
+            cb(urls.clone());
+            true
+        }
+        None => false,
+    });
+    if !delivered {
+        PENDING_URLS.with(|p| p.borrow_mut().extend(urls));
+    }
 }
 
 /// Keeps UIWindows alive for the life of the process (UIKit only holds
@@ -72,7 +91,6 @@ pub struct IosPlatform {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     active_window: RefCell<Option<AnyWindowHandle>>,
-    open_urls: RefCell<Option<Box<dyn FnMut(Vec<String>)>>>,
 }
 
 impl Default for IosPlatform {
@@ -90,7 +108,6 @@ impl IosPlatform {
             foreground_executor: ForegroundExecutor::new(dispatcher),
             text_system: Arc::new(gpui_apple::AppleTextSystem::new()),
             active_window: RefCell::new(None),
-            open_urls: RefCell::new(None),
         }
     }
 }
@@ -107,6 +124,20 @@ fn delegate_class() -> &'static Class {
         decl.add_method(sel!(applicationDidBecomeActive:), phase);
         decl.add_method(sel!(applicationWillResignActive:), phase);
         decl.add_method(sel!(applicationDidEnterBackground:), phase);
+        decl.add_method(
+            sel!(application:openURL:options:),
+            open_url as extern "C" fn(&Object, Sel, id, id, id) -> BOOL,
+        );
+        // Siri / Shortcuts / Spotlight: NSUserActivity carrying a `url` (or a web URL).
+        decl.add_method(
+            sel!(application:continueUserActivity:restorationHandler:),
+            continue_activity as extern "C" fn(&Object, Sel, id, id, id) -> BOOL,
+        );
+        // Home-screen quick actions: the item's `type` is delivered as a URL.
+        decl.add_method(
+            sel!(application:performActionForShortcutItem:completionHandler:),
+            shortcut_item as extern "C" fn(&Object, Sel, id, id, id),
+        );
         use crate::remote_notifications as rn;
         decl.add_method(
             sel!(application:didRegisterForRemoteNotificationsWithDeviceToken:),
@@ -142,6 +173,49 @@ extern "C" fn did_finish(_: &Object, _: Sel, _app: id, _opts: id) -> BOOL {
         }
     }
     YES
+}
+
+extern "C" fn open_url(_: &Object, _: Sel, _app: id, url: id, _opts: id) -> BOOL {
+    if url.is_null() {
+        return objc::runtime::NO;
+    }
+    let s: id = unsafe { msg_send![url, absoluteString] };
+    deliver_urls(vec![unsafe { crate::to_str(s) }.to_string()]);
+    YES
+}
+
+extern "C" fn continue_activity(_: &Object, _: Sel, _app: id, activity: id, _restore: id) -> BOOL {
+    if activity.is_null() {
+        return objc::runtime::NO;
+    }
+    unsafe {
+        let info: id = msg_send![activity, userInfo];
+        let mut url: id = if info.is_null() { nil } else { msg_send![info, objectForKey: ns_string("url")] };
+        if url.is_null() {
+            let web: id = msg_send![activity, webpageURL];
+            if !web.is_null() {
+                url = msg_send![web, absoluteString];
+            }
+        }
+        if url.is_null() {
+            let kind: id = msg_send![activity, activityType];
+            log::info!("ios continueUserActivity without url: {}", crate::to_str(kind));
+            return objc::runtime::NO;
+        }
+        deliver_urls(vec![crate::to_str(url).to_string()]);
+    }
+    YES
+}
+
+extern "C" fn shortcut_item(_: &Object, _: Sel, _app: id, item: id, completion: id) {
+    if !item.is_null() {
+        let kind: id = unsafe { msg_send![item, type] };
+        deliver_urls(vec![unsafe { crate::to_str(kind) }.to_string()]);
+    }
+    if !completion.is_null() {
+        let block = completion as *mut block::Block<(BOOL,), ()>;
+        unsafe { (*block).call((YES,)) };
+    }
 }
 
 extern "C" fn lifecycle(_: &Object, sel: Sel, _app: id) {
@@ -228,7 +302,11 @@ impl Platform for IosPlatform {
         }
     }
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
-        *self.open_urls.borrow_mut() = Some(callback);
+        OPEN_URLS.with(|cb| *cb.borrow_mut() = Some(callback));
+        let pending = PENDING_URLS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        if !pending.is_empty() {
+            deliver_urls(pending);
+        }
     }
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
         Task::ready(Ok(()))
