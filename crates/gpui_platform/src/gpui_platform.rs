@@ -3,6 +3,12 @@
 
 pub use gpui::Platform;
 
+/// iOS-only platform services (APNs registration, badge).
+#[cfg(target_os = "ios")]
+pub mod ios {
+    pub use gpui_ios::{RemoteNotificationEvent, register_for_remote_notifications, set_badge_count};
+}
+
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.

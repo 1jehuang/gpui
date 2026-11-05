@@ -9,10 +9,14 @@
 mod dispatcher;
 mod display;
 mod platform;
+mod remote_notifications;
 mod text_input;
 mod window;
 
 pub use platform::IosPlatform;
+pub use remote_notifications::{
+    RemoteNotificationEvent, register_for_remote_notifications, set_badge_count,
+};
 
 use objc::{class, msg_send, runtime::Object, sel, sel_impl};
 use std::ffi::{CStr, c_char};

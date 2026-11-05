@@ -107,6 +107,19 @@ fn delegate_class() -> &'static Class {
         decl.add_method(sel!(applicationDidBecomeActive:), phase);
         decl.add_method(sel!(applicationWillResignActive:), phase);
         decl.add_method(sel!(applicationDidEnterBackground:), phase);
+        use crate::remote_notifications as rn;
+        decl.add_method(
+            sel!(application:didRegisterForRemoteNotificationsWithDeviceToken:),
+            rn::did_register as extern "C" fn(&Object, Sel, id, id),
+        );
+        decl.add_method(
+            sel!(application:didFailToRegisterForRemoteNotificationsWithError:),
+            rn::did_fail as extern "C" fn(&Object, Sel, id, id),
+        );
+        decl.add_method(
+            sel!(application:didReceiveRemoteNotification:fetchCompletionHandler:),
+            rn::did_receive as extern "C" fn(&Object, Sel, id, id, id),
+        );
         decl.register() as *const Class as usize
     });
     unsafe { &*(ptr as *const Class) }
