@@ -6,6 +6,7 @@
 //! raw touch forwarding (GPUI core recognizes gestures), the software
 //! keyboard, and safe-area/keyboard insets.
 
+mod apple_sign_in;
 mod dispatcher;
 mod display;
 mod platform;
@@ -13,6 +14,7 @@ mod remote_notifications;
 mod text_input;
 mod window;
 
+pub use apple_sign_in::{AppleCredential, AppleSignInError, sign_in_with_apple};
 pub use platform::IosPlatform;
 pub use remote_notifications::{
     RemoteNotificationEvent, register_for_remote_notifications, set_badge_count,
