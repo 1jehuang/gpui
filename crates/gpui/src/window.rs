@@ -2606,8 +2606,18 @@ impl Window {
     /// method directly for decorative motion, check [`App::reduce_motion`]
     /// and skip the frame request when it is set.
     pub fn request_animation_frame(&self) {
-        let entity = self.current_view();
-        self.on_next_frame(move |_, cx| cx.notify(entity));
+        // Outside render/paint (e.g. an event listener) there is no current
+        // view; unwrapping would abort the app (iOS touch handlers hit this).
+        // Fall back to the window root, or just schedule a redraw.
+        let entity = self
+            .rendered_entity_stack
+            .last()
+            .copied()
+            .or_else(|| self.root.as_ref().map(|r| r.entity_id()));
+        self.on_next_frame(move |window, cx| match entity {
+            Some(entity) => cx.notify(entity),
+            None => window.refresh(),
+        });
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
