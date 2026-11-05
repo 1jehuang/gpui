@@ -1993,6 +1993,23 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// What the field holds, so platforms can pick a keyboard layout and
+    /// offer autofill (e.g. one-time codes from Messages or Mail on iOS).
+    pub purpose: TextInputPurpose,
+}
+
+/// The semantic kind of content a text field holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputPurpose {
+    /// Free-form text.
+    #[default]
+    Text,
+    /// An email address.
+    Email,
+    /// A one-time verification code (SMS or email sign-in code).
+    OneTimeCode,
+    /// A number.
+    Number,
 }
 
 /// Automatic capitalization applied by software keyboards.

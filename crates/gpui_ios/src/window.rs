@@ -57,6 +57,8 @@ pub(crate) struct WindowState {
     /// UITextInputTraits of the focused field: autocorrect, autocapitalize,
     /// spellcheck, return key.
     traits: Cell<(isize, isize, isize, isize)>,
+    /// Content kind of the focused field (keyboardType, textContentType).
+    purpose: Cell<gpui::TextInputPurpose>,
 }
 
 impl WindowState {
@@ -197,6 +199,7 @@ impl IosWindow {
                 callbacks: RefCell::new(Callbacks::default()),
                 keyboard_wanted: Cell::new(false),
                 traits: Cell::new((1, 0, 1, 0)),
+                purpose: Cell::new(gpui::TextInputPurpose::Text),
             });
             (*view).set_ivar::<*const c_void>(STATE_IVAR, Rc::into_raw(state.clone()) as *const c_void);
 
@@ -281,6 +284,8 @@ fn view_class() -> &'static Class {
         decl.add_method(sel!(spellCheckingType), spell_checking as extern "C" fn(&Object, Sel) -> isize);
         decl.add_method(sel!(returnKeyType), return_key as extern "C" fn(&Object, Sel) -> isize);
         decl.add_method(sel!(keyboardAppearance), one as extern "C" fn(&Object, Sel) -> isize);
+        decl.add_method(sel!(keyboardType), keyboard_type as extern "C" fn(&Object, Sel) -> isize);
+        decl.add_method(sel!(textContentType), content_type as extern "C" fn(&Object, Sel) -> id);
         decl.register() as *const Class as usize
     });
     unsafe { &*(ptr as *const Class) }
@@ -315,6 +320,40 @@ extern "C" fn spell_checking(this: &Object, _: Sel) -> isize {
 }
 extern "C" fn return_key(this: &Object, _: Sel) -> isize {
     traits(this).3
+}
+fn purpose(this: &Object) -> gpui::TextInputPurpose {
+    state_of(this).map(|s| s.purpose.get()).unwrap_or_default()
+}
+extern "C" fn keyboard_type(this: &Object, _: Sel) -> isize {
+    uikit_keyboard_type(purpose(this))
+}
+extern "C" fn content_type(this: &Object, _: Sel) -> id {
+    // UITextContentType constants are NSStrings with these exact values.
+    match uikit_content_type(purpose(this)) {
+        Some(s) => ns_string(s),
+        None => nil,
+    }
+}
+
+/// UIKeyboardType: default 0, numberPad 4, emailAddress 7.
+pub(crate) fn uikit_keyboard_type(p: gpui::TextInputPurpose) -> isize {
+    use gpui::TextInputPurpose as P;
+    match p {
+        P::Text => 0,
+        P::Email => 7,
+        P::OneTimeCode | P::Number => 4,
+    }
+}
+
+/// UITextContentType value; `oneTimeCode` enables code autofill from
+/// Messages and Mail above the keyboard.
+pub(crate) fn uikit_content_type(p: gpui::TextInputPurpose) -> Option<&'static str> {
+    use gpui::TextInputPurpose as P;
+    match p {
+        P::Email => Some("email"),
+        P::OneTimeCode => Some("one-time-code"),
+        P::Text | P::Number => None,
+    }
 }
 
 /// Maps GPUI's configuration onto UIKit enums: UITextAutocorrectionType
@@ -544,7 +583,9 @@ impl PlatformWindow for IosWindow {
     }
     fn set_text_input_configuration(&mut self, configuration: gpui::TextInputConfiguration) {
         let t = uikit_traits(&configuration);
-        if self.state.traits.replace(t) != t {
+        let p = configuration.purpose;
+        let traits_changed = self.state.traits.replace(t) != t;
+        if self.state.purpose.replace(p) != p || traits_changed {
             // UIKit reads traits when the keyboard attaches; reload live.
             unsafe {
                 let is_first: BOOL = msg_send![self.state.view, isFirstResponder];
