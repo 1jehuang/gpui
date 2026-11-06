@@ -153,14 +153,28 @@ mod apple_build {
         let staged_shader_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metal");
         std::fs::copy(shader_path, &staged_shader_path).unwrap();
 
+        // Simulator targets (aarch64-apple-ios-sim, x86_64-apple-ios) need a
+        // simulator metallib; a device one fails at pipeline creation.
+        let ios_sdk = if env::var("CARGO_CFG_TARGET_ABI").as_deref() == Ok("sim")
+            || env::var("TARGET").map_or(false, |t| t.ends_with("-ios-sim") || t.starts_with("x86_64-apple-ios"))
+        {
+            "iphonesimulator"
+        } else {
+            "iphoneos"
+        };
+        let ios_min = if ios_sdk == "iphonesimulator" {
+            "-mios-simulator-version-min=16.0"
+        } else {
+            "-mios-version-min=16.0"
+        };
         let output = Command::new("xcrun")
             .args(if target_os == "ios" {
                 [
                     "-sdk",
-                    "iphoneos",
+                    ios_sdk,
                     "metal",
                     "-gline-tables-only",
-                    "-mios-version-min=16.0",
+                    ios_min,
                     "-MO",
                     "-c",
                 ]
@@ -192,7 +206,7 @@ mod apple_build {
         let output = Command::new("xcrun")
             .args([
                 "-sdk",
-                if target_os == "ios" { "iphoneos" } else { "macosx" },
+                if target_os == "ios" { ios_sdk } else { "macosx" },
                 "metallib",
             ])
             .arg(&air_output_path)
