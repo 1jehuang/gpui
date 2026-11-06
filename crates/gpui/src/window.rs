@@ -4023,7 +4023,17 @@ impl Window {
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
     /// time.
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
-        cx.asset_entry::<A>(source).use_by(self.current_view())
+        // Outside render (e.g. a listener) fall back to the root view instead
+        // of unwrapping an empty view stack, which aborts release iOS builds.
+        let view = self
+            .rendered_entity_stack
+            .last()
+            .copied()
+            .or_else(|| self.root.as_ref().map(|r| r.entity_id()));
+        match view {
+            Some(view) => cx.asset_entry::<A>(source).use_by(view),
+            None => cx.asset_entry::<A>(source).get(),
+        }
     }
 
     /// Asynchronously load an asset, if the asset hasn't finished loading or doesn't exist this will return None.
@@ -8677,6 +8687,32 @@ mod tests {
         let phases = phases.borrow();
         assert!(phases.contains(&TouchPhase::Moved), "{phases:?}");
         assert_eq!(phases.last(), Some(&TouchPhase::Ended), "{phases:?}");
+    }
+
+    #[gpui::test]
+    fn use_asset_outside_render_does_not_panic(cx: &mut TestAppContext) {
+        struct NumAsset;
+        impl crate::Asset for NumAsset {
+            type Source = u32;
+            type Output = u32;
+            fn load(
+                source: u32,
+                _: &mut crate::App,
+            ) -> impl std::future::Future<Output = u32> + Send + 'static {
+                async move { source * 2 }
+            }
+        }
+        let window = cx.add_window(|_, _| EmptyView);
+        window
+            .update(cx, |_, window, cx| {
+                window.use_asset::<NumAsset>(&21, cx);
+            })
+            .unwrap();
+        cx.executor().run_until_parked();
+        let out = window
+            .update(cx, |_, window, cx| window.use_asset::<NumAsset>(&21, cx))
+            .unwrap();
+        assert_eq!(out, Some(42));
     }
 
     #[gpui::test]
