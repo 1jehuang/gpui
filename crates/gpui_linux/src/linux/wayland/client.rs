@@ -34,7 +34,7 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_shm_pool, wl_surface, wl_touch,
     },
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
@@ -91,6 +91,7 @@ use crate::linux::{
         cursor::Cursor,
         serial::{Serial, SerialKind, SerialTracker},
         to_shape,
+        touch::Touches,
         window::WaylandWindow,
     },
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
@@ -319,6 +320,8 @@ pub(crate) struct WaylandClientState {
     pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
+    wl_touch: Option<wl_touch::WlTouch>,
+    touches: Touches<WaylandWindowStatePtr>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -790,6 +793,9 @@ impl Drop for WaylandClient {
         if let Some(wl_pointer) = &state.wl_pointer {
             wl_pointer.release();
         }
+        if let Some(touch) = &state.wl_touch {
+            touch.release();
+        }
         if let Some(cursor_shape_device) = &state.cursor_shape_device {
             cursor_shape_device.destroy();
         }
@@ -991,6 +997,8 @@ impl WaylandClient {
             compositor_gpu,
             wl_seat: seat,
             wl_pointer: None,
+            wl_touch: None,
+            touches: Touches::default(),
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
@@ -1470,6 +1478,10 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                 version,
             } => match &interface[..] {
                 "wl_seat" => {
+                    let cancelled = state.touches.cancel();
+                    if let Some(touch) = state.wl_touch.take() {
+                        touch.release();
+                    }
                     if let Some(wl_pointer) = state.wl_pointer.take() {
                         wl_pointer.release();
                     }
@@ -1483,6 +1495,11 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                         qh,
                         (),
                     );
+                    drop(state);
+                    for (window, event) in cancelled {
+                        window.handle_input(PlatformInput::Touch(event));
+                    }
+                    return;
                 }
                 "wl_output" => {
                     let output = registry.bind::<wl_output::WlOutput, _, _>(
@@ -1781,6 +1798,15 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
         {
             let client = state.get_client();
             let mut state = client.borrow_mut();
+            let mut cancelled = Vec::new();
+            if capabilities.contains(wl_seat::Capability::Touch) {
+                if state.wl_touch.is_none() {
+                    state.wl_touch = Some(seat.get_touch(qh, ()));
+                }
+            } else if let Some(touch) = state.wl_touch.take() {
+                touch.release();
+                cancelled = state.touches.cancel();
+            }
             if capabilities.contains(wl_seat::Capability::Keyboard) {
                 let keyboard = seat.get_keyboard(qh, ());
 
@@ -1827,6 +1853,65 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
 
                 state.wl_pointer = Some(pointer);
             }
+            drop(state);
+            for (window, event) in cancelled {
+                window.handle_input(PlatformInput::Touch(event));
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        touch: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        // Ignore queued events from a device that has lost its capability.
+        if state.wl_touch.as_ref() != Some(touch) {
+            return;
+        }
+        let events = match event {
+            wl_touch::Event::Down {
+                serial,
+                surface,
+                id,
+                x,
+                y,
+                ..
+            } => {
+                let Some(window) = get_window(&mut state, &surface.id()) else {
+                    return;
+                };
+                if window.is_blocked() {
+                    return;
+                }
+                state.serial_tracker.update(SerialKind::TouchPress, serial);
+                // Wayland already supplies logical surface-local coordinates.
+                state
+                    .touches
+                    .down(id, window, point(px(x as f32), px(y as f32)))
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => state
+                .touches
+                .motion(id, point(px(x as f32), px(y as f32)))
+                .into_iter()
+                .collect(),
+            wl_touch::Event::Up { id, .. } => state.touches.up(id).into_iter().collect(),
+            wl_touch::Event::Cancel => state.touches.cancel(),
+            // GPUI consumes individual contacts, not frame/shape metadata.
+            _ => return,
+        };
+        // Input callbacks may borrow the client again. Never dispatch under
+        // the RefCell borrow or real touch input will panic reentrantly.
+        drop(state);
+        for (window, event) in events {
+            window.handle_input(PlatformInput::Touch(event));
         }
     }
 }

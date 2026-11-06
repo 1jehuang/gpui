@@ -6,6 +6,7 @@ pub(crate) enum SerialKind {
     InputMethod,
     MouseEnter,
     MousePress,
+    TouchPress,
     KeyPress,
 }
 
@@ -45,7 +46,10 @@ impl SerialTracker {
     pub fn update(&mut self, kind: SerialKind, value: u32) {
         let serial = Serial(value);
 
-        if matches!(&kind, SerialKind::KeyPress | SerialKind::MousePress) {
+        if matches!(
+            &kind,
+            SerialKind::KeyPress | SerialKind::MousePress | SerialKind::TouchPress
+        ) {
             self.selection_serial = Some(SelectionSerial(serial));
         }
 
@@ -92,6 +96,14 @@ mod tests {
         serial_tracker.update(SerialKind::MousePress, 3783);
 
         assert_eq!(raw_selection_serial(&serial_tracker), Some(3783));
+    }
+
+    #[test]
+    fn test_selection_serial_uses_touch_press() {
+        let mut serial_tracker = SerialTracker::new();
+        serial_tracker.update(SerialKind::MousePress, 10);
+        serial_tracker.update(SerialKind::TouchPress, 11);
+        assert_eq!(raw_selection_serial(&serial_tracker), Some(11));
     }
 
     #[test]
