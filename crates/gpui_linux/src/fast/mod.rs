@@ -2,3 +2,5 @@
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) mod pinch;
+#[cfg(feature = "wayland")]
+pub(crate) mod wayland_scroll;

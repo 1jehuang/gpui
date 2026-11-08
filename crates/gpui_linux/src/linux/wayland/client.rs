@@ -101,7 +101,7 @@ use gpui::{
     FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
+    PlatformKeyboardLayout, PlatformWindow, Point, SharedString,
     Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
@@ -348,16 +348,17 @@ pub(crate) struct WaylandClientState {
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
-    axis_source: AxisSource,
+    pub(crate) axis_source: AxisSource,
+    pub(crate) finger_scroll: crate::fast::wayland_scroll::FingerScroll,
     pub mouse_location: Option<Point<Pixels>>,
-    continuous_scroll_delta: Option<Point<Pixels>>,
-    discrete_scroll_delta: Option<Point<f32>>,
+    pub(crate) continuous_scroll_delta: Option<Point<Pixels>>,
+    pub(crate) discrete_scroll_delta: Option<Point<f32>>,
     vertical_modifier: f32,
     horizontal_modifier: f32,
-    scroll_event_received: bool,
+    pub(crate) scroll_event_received: bool,
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
-    mouse_focused_window: Option<WaylandWindowStatePtr>,
+    pub(crate) mouse_focused_window: Option<WaylandWindowStatePtr>,
     keyboard_focused_window: Option<WaylandWindowStatePtr>,
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
     cursor_style: Option<CursorStyle>,
@@ -1047,6 +1048,7 @@ impl WaylandClient {
             capslock: Capslock { on: false },
             scroll_event_received: false,
             axis_source: AxisSource::Wheel,
+            finger_scroll: crate::fast::wayland_scroll::FingerScroll::default(),
             mouse_location: None,
             continuous_scroll_delta: None,
             discrete_scroll_delta: None,
@@ -2469,6 +2471,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
             }
 
             // Axis Events
+            wl_pointer::Event::AxisStop { axis: WEnum::Value(axis), .. } => {
+                state.finger_scroll.stop(axis);
+            }
             wl_pointer::Event::AxisSource {
                 axis_source: WEnum::Value(axis_source),
             } => {
@@ -2482,6 +2487,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if state.axis_source == AxisSource::Wheel {
                     return;
                 }
+                state.finger_scroll.axis(axis);
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
                 } else {
@@ -2563,34 +2569,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
             }
             wl_pointer::Event::Frame => {
-                if state.scroll_event_received {
-                    state.scroll_event_received = false;
-                    let continuous = state.continuous_scroll_delta.take();
-                    let discrete = state.discrete_scroll_delta.take();
-                    if let Some(continuous) = continuous {
-                        if let Some(window) = state.mouse_focused_window.clone() {
-                            let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
-                                position: state.mouse_location.unwrap(),
-                                delta: ScrollDelta::Pixels(continuous),
-                                modifiers: state.modifiers,
-                                touch_phase: TouchPhase::Moved,
-                            });
-                            drop(state);
-                            window.handle_input(input);
-                        }
-                    } else if let Some(discrete) = discrete
-                        && let Some(window) = state.mouse_focused_window.clone()
-                    {
-                        let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position: state.mouse_location.unwrap(),
-                            delta: ScrollDelta::Lines(discrete),
-                            modifiers: state.modifiers,
-                            touch_phase: TouchPhase::Moved,
-                        });
-                        drop(state);
-                        window.handle_input(input);
-                    }
-                }
+                let events = crate::fast::wayland_scroll::finish_frame(&mut state);
+                let window = state.mouse_focused_window.clone();
+                drop(state);
+                crate::fast::wayland_scroll::dispatch_frame(window, events);
             }
             _ => {}
         }
