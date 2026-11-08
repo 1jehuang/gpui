@@ -5706,6 +5706,11 @@ impl Window {
                 cx.propagate_event = true;
                 self.dispatch_mouse_event(&scroll_wheel, cx);
             }
+            RecognizedTouchGesture::Pinch(pinch) => {
+                self.mouse_position = pinch.position;
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(&pinch, cx);
+            }
             RecognizedTouchGesture::Tap { down, up } => {
                 self.mouse_position = up.position;
                 cx.propagate_event = true;
