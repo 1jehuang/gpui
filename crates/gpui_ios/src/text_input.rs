@@ -551,8 +551,30 @@ pub(crate) fn attach_interaction(view: id) {
         let _: () = msg_send![view, addInteraction: i];
         let _: id = msg_send![i, retain];
         (*view).set_ivar::<id>(INTERACTION, i);
+        release_touches(view);
     }
     LAST.with(|c| c.set(None));
+}
+
+/// The interaction spans the whole GPUI view, not only the focused field.
+/// UIKit's defaults let its tap/loupe recognizers cancel or delay every touch
+/// on the view, so a tap outside the field reached GPUI as `touchesCancelled`,
+/// produced no click, and could never blur the input. Keep its recognizers
+/// observing only, so raw touches always reach GPUI.
+unsafe fn release_touches(view: id) {
+    unsafe {
+        let recognizers: id = msg_send![view, gestureRecognizers];
+        if recognizers.is_null() {
+            return;
+        }
+        let count: usize = msg_send![recognizers, count];
+        for n in 0..count {
+            let r: id = msg_send![recognizers, objectAtIndex: n];
+            let _: () = msg_send![r, setCancelsTouchesInView: NO];
+            let _: () = msg_send![r, setDelaysTouchesBegan: NO];
+            let _: () = msg_send![r, setDelaysTouchesEnded: NO];
+        }
+    }
 }
 
 pub(crate) fn detach_interaction(view: id) {
