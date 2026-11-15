@@ -70,8 +70,26 @@ pub(super) fn write_instance_binding<T>(
             first_instance: 0,
         });
     }
-    let stride = (std::mem::size_of::<T>() as u64).max(1);
     let webgl = renderer.uses_webgl_instance_data;
+    let padded_path = !webgl
+        && std::any::type_name::<T>()
+            == std::any::type_name::<crate::wgpu_renderer::PathRasterizationVertex>();
+    let padded;
+    let data = if padded_path {
+        assert_eq!(
+            std::mem::size_of::<T>(),
+            crate::fast::storage_padding::PATH_RECORD_SIZE
+        );
+        padded = crate::fast::storage_padding::path_records(data);
+        padded.as_slice()
+    } else {
+        data
+    };
+    let stride = if padded_path {
+        crate::fast::storage_padding::PATH_STORAGE_STRIDE as u64
+    } else {
+        (std::mem::size_of::<T>() as u64).max(1)
+    };
     let (alignment, size) = if webgl {
         // The texture transport writes whole texels, so an allocation also
         // starts and ends on a texel boundary.

@@ -25,7 +25,7 @@ const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 /// logic plus the storage-buffer instance transport.
 const STORAGE_BUFFER_SHADERS: &str = concat!(
     include_str!("shaders.wgsl"),
-    include_str!("shaders_storage.wgsl"),
+    include_str!("fast/shaders_storage.wgsl"),
 );
 
 /// Shader variant for WebGL2, which has no storage buffers: the shared shader
@@ -41,7 +41,7 @@ const WEBGL_SHADERS: &str = concat!(
 const SUBPIXEL_SHADERS: &str = concat!(
     "enable dual_source_blending;\n",
     include_str!("shaders.wgsl"),
-    include_str!("shaders_storage.wgsl"),
+    include_str!("fast/shaders_storage.wgsl"),
     include_str!("shaders_subpixel.wgsl"),
 );
 
