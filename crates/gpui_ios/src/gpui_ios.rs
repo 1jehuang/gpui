@@ -10,6 +10,9 @@ mod accessibility;
 mod apple_sign_in;
 mod dispatcher;
 mod display;
+mod fast {
+    pub(crate) mod text_interaction;
+}
 mod platform;
 mod remote_notifications;
 mod text_input;

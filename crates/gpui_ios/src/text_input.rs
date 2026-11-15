@@ -459,8 +459,14 @@ extern "C" fn first_rect(this: &Object, _: Sel, range: id) -> CGRect {
 
 extern "C" fn caret_rect(this: &Object, _: Sel, pos: id) -> CGRect {
     let (Some(state), Some(p)) = (state_of(this), offset_of(pos)) else { return CGRect::default() };
-    // Measure the character after the caret, or the one before at the end.
-    let mut rect = rect_for(state, p..p + 1);
+    // Empty fields have a caret but no character after it. Insertion-range
+    // geometry also anchors the edit menu at the end without probing len..len+1.
+    let len = doc_len(state);
+    let p = p.min(len);
+    let mut rect = rect_for(state, crate::fast::text_interaction::caret_range(p, len));
+    if rect.size.height == 0.0 && p < len {
+        rect = rect_for(state, crate::fast::text_interaction::character_range(p, len));
+    }
     if rect.size.height == 0.0 && p > 0 {
         rect = rect_for(state, p - 1..p);
         rect.origin.x += rect.size.width;
@@ -510,9 +516,12 @@ fn selection_rect_class() -> &'static Class {
 }
 
 fn index_at(this: &Object, p: CGPoint) -> Option<usize> {
-    state_of(this)?
+    let state = state_of(this)?;
+    let len = doc_len(state);
+    state
         .with_handler(|h| h.character_index_for_point(point(px(p.x as f32), px(p.y as f32))))
         .flatten()
+        .map(|index| index.min(len))
 }
 
 extern "C" fn closest(this: &Object, _: Sel, p: CGPoint) -> id {
@@ -529,7 +538,10 @@ extern "C" fn closest_within(this: &Object, _: Sel, p: CGPoint, range: id) -> id
 
 extern "C" fn range_at_point(this: &Object, _: Sel, p: CGPoint) -> id {
     match index_at(this, p) {
-        Some(i) => text_range(i..i + 1),
+        Some(i) => text_range(crate::fast::text_interaction::character_range(
+            i,
+            state_of(this).map(doc_len).unwrap_or(0),
+        )),
         None => nil,
     }
 }
