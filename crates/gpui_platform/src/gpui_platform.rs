@@ -31,6 +31,11 @@ pub fn headless() -> gpui::Application {
     gpui::Application::with_platform(current_platform(true))
 }
 
+#[cfg(target_os = "android")]
+pub use gpui_android::{android_app, android_activity, application as android_application};
+#[cfg(target_os = "android")]
+pub use gpui_android as android;
+
 #[cfg(target_family = "wasm")]
 pub use gpui_web::WebBackendPreference;
 
@@ -84,6 +89,11 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         gpui_linux::current_platform(headless)
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        gpui_android::current_platform(headless)
     }
 
     #[cfg(target_family = "wasm")]
