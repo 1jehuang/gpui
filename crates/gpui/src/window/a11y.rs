@@ -100,6 +100,7 @@
 
 use crate::*;
 
+#[path = "a11y/debug.rs"]
 pub(crate) mod debug;
 
 use crate::{App, Bounds, FocusId, Pixels, SharedString, Window};

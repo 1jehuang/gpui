@@ -1,6 +1,10 @@
+#[path = "test/dispatcher.rs"]
 mod dispatcher;
+#[path = "test/display.rs"]
 mod display;
+#[path = "test/platform.rs"]
 mod platform;
+#[path = "test/window.rs"]
 mod window;
 
 pub use dispatcher::*;

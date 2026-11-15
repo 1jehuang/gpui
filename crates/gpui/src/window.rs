@@ -65,8 +65,6 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 
-use crate::fast::retained::{EnclosingRetained, RetainedState, RetainedSubtrees};
-
 pub use a11y::A11ySubtreeBuilder;
 
 use self::a11y::A11y;
@@ -337,7 +335,7 @@ thread_local! {
     /// Points to the current App's element arena during draw operations.
     /// This allows multiple test Apps to have isolated arenas, preventing
     /// cross-session corruption when the scheduler interleaves their tasks.
-    pub(crate) static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
+    static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
 }
 
 /// Whether a window draw is currently in progress on this thread.
@@ -351,13 +349,22 @@ thread_local! {
 /// message pumping in the Windows window procedure), instead of running a
 /// nested draw or panicking on the already-borrowed App.
 fn draw_in_progress() -> bool {
-    crate::fast::element_arena::draw_in_progress()
+    CURRENT_ELEMENT_ARENA.with(|current| current.get().is_some())
 }
 
 /// Allocates an element in the current arena. Uses the app-specific arena if one
 /// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
 pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
-    crate::fast::element_arena::with_element_arena(f)
+    CURRENT_ELEMENT_ARENA.with(|current| {
+        if let Some(arena_ptr) = current.get() {
+            // SAFETY: The pointer is valid for the duration of the draw operation
+            // that set it, and we're being called during that same draw.
+            let arena_cell = unsafe { &*arena_ptr };
+            f(&mut arena_cell.borrow_mut())
+        } else {
+            ELEMENT_ARENA.with_borrow_mut(f)
+        }
+    })
 }
 
 /// Scope guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw
@@ -378,7 +385,7 @@ pub(crate) struct ElementArenaScope {
     /// The entered arena: compared against the argument in `exit`, and
     /// dereferenced in `Drop` to end its scope (see the SAFETY note there).
     entered: *const RefCell<Arena>,
-    previous: crate::fast::element_arena::PreviousArena,
+    previous: Option<*const RefCell<Arena>>,
     exited: bool,
 }
 
@@ -386,7 +393,11 @@ impl ElementArenaScope {
     /// Enter a scope where element allocations use the given arena.
     pub(crate) fn enter(arena: &RefCell<Arena>) -> Self {
         arena.borrow_mut().begin_scope();
-        let previous = crate::fast::element_arena::PreviousArena::enter(arena);
+        let previous = CURRENT_ELEMENT_ARENA.with(|current| {
+            let prev = current.get();
+            current.set(Some(arena as *const RefCell<Arena>));
+            prev
+        });
         Self {
             entered: arena as *const RefCell<Arena>,
             previous,
@@ -424,7 +435,9 @@ impl Drop for ElementArenaScope {
         // keeps the arena's scope depth correct even when a draw panics; if this
         // only happened in `exit`, a panic between `enter` and `exit` would leave
         // the depth elevated and defer every future clear.
-        self.previous.restore();
+        CURRENT_ELEMENT_ARENA.with(|current| {
+            current.set(self.previous);
+        });
         // SAFETY: `entered` came from a `&RefCell<Arena>` in `enter`, and the
         // arena (owned by the `App` being drawn) outlives this guard on both the
         // normal and unwinding paths, since the guard is a local of the draw.
@@ -739,7 +752,7 @@ pub enum WindowControlArea {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct HitboxId(u64);
 
-#[cfg(feature = "test-api")]
+#[cfg(feature = "test-support")]
 impl HitboxId {
     /// A placeholder HitboxId exclusively for integration testing API's that
     /// need a hitbox but where the value of the hitbox does not matter. The
@@ -758,9 +771,6 @@ impl HitboxId {
     ///
     /// See [`Hitbox::is_hovered`] for details.
     pub fn is_hovered(self, window: &Window) -> bool {
-        if let Some(hovered) = window.note_hover_read(self) {
-            return hovered;
-        }
         // If this hitbox has captured the pointer, it's always considered hovered
         if window.captured_hitbox == Some(self) {
             return true;
@@ -783,7 +793,7 @@ impl HitboxId {
         self.hit_test(window)
     }
 
-    pub(crate) fn hit_test(self, window: &Window) -> bool {
+    fn hit_test(self, window: &Window) -> bool {
         let hit_test = &window.mouse_hit_test;
         for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
             if self == *id {
@@ -952,25 +962,24 @@ pub(crate) struct TooltipRequest {
 }
 
 pub(crate) struct DeferredDraw {
-    pub(crate) current_view: EntityId,
-    pub(crate) priority: usize,
-    pub(crate) parent_node: DispatchNodeId,
-    pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
-    pub(crate) text_style_stack: Vec<TextStyleRefinement>,
-    pub(crate) content_mask: Option<ContentMask<Pixels>>,
-    pub(crate) rem_size: Pixels,
-    pub(crate) element: Option<AnyElement>,
-    pub(crate) absolute_offset: Point<Pixels>,
-    pub(crate) prepaint_range: Range<PrepaintStateIndex>,
-    pub(crate) paint_range: Range<PaintIndex>,
-    pub(crate) enclosing_retained: EnclosingRetained,
+    current_view: EntityId,
+    priority: usize,
+    parent_node: DispatchNodeId,
+    element_id_stack: SmallVec<[ElementId; 32]>,
+    text_style_stack: Vec<TextStyleRefinement>,
+    content_mask: Option<ContentMask<Pixels>>,
+    rem_size: Pixels,
+    element: Option<AnyElement>,
+    absolute_offset: Point<Pixels>,
+    prepaint_range: Range<PrepaintStateIndex>,
+    paint_range: Range<PaintIndex>,
 }
 
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
-    pub(crate) accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -980,37 +989,34 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
-    pub(crate) retained: RetainedSubtrees,
 }
 
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
-    pub(crate) hitboxes_index: usize,
-    pub(crate) tooltips_index: usize,
-    pub(crate) deferred_draws_index: usize,
-    pub(crate) dispatch_tree_index: usize,
-    pub(crate) accessed_element_states_index: usize,
-    pub(crate) line_layout_index: LineLayoutIndex,
+    hitboxes_index: usize,
+    tooltips_index: usize,
+    deferred_draws_index: usize,
+    dispatch_tree_index: usize,
+    accessed_element_states_index: usize,
+    line_layout_index: LineLayoutIndex,
 }
 
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
-    pub(crate) scene_index: usize,
-    pub(crate) window_control_hitboxes_index: usize,
-    pub(crate) mouse_listeners_index: usize,
-    pub(crate) input_handlers_index: usize,
-    pub(crate) cursor_styles_index: usize,
-    pub(crate) accessed_element_states_index: usize,
-    pub(crate) tab_handle_index: usize,
-    pub(crate) line_layout_index: LineLayoutIndex,
-    pub(crate) debug_paints_index: usize,
+    scene_index: usize,
+    mouse_listeners_index: usize,
+    input_handlers_index: usize,
+    cursor_styles_index: usize,
+    accessed_element_states_index: usize,
+    tab_handle_index: usize,
+    line_layout_index: LineLayoutIndex,
 }
 
 impl Frame {
@@ -1030,7 +1036,7 @@ impl Frame {
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
 
-            #[cfg(any(test, feature = "test-api"))]
+            #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
 
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1039,7 +1045,6 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
-            retained: RetainedSubtrees::default(),
         }
     }
 
@@ -1056,10 +1061,9 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
-        self.retained.clear();
         self.focus = None;
 
-        #[cfg(any(test, feature = "test-api"))]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.debug_bounds.clear();
         }
@@ -1145,7 +1149,7 @@ pub struct Window {
     display_id: Option<DisplayId>,
     is_resizable: bool,
     is_minimizable: bool,
-    pub(crate) sprite_atlas: Arc<dyn PlatformAtlas>,
+    sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1153,14 +1157,11 @@ pub struct Window {
     ///
     /// This is used by `with_rem_size` to allow rendering an element tree with
     /// a given rem size.
-    pub(crate) rem_size_override_stack: SmallVec<[Pixels; 8]>,
+    rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
-    pub(crate) layout_engine: Option<TaffyLayoutEngine>,
-    pub(crate) fast_layout: crate::fast::layout_key::WindowLayout,
+    layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
-    pub(crate) global_ids: crate::fast::global_id::GlobalIdCache,
-    pub(crate) retained_state: RetainedState,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
@@ -1207,8 +1208,6 @@ pub struct Window {
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
-    emulate_touch: bool,
-    emulated_touch_down: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
@@ -1225,9 +1224,9 @@ pub struct Window {
     pub(crate) client_inset: Option<Pixels>,
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
-    pub(crate) captured_hitbox: Option<HitboxId>,
+    captured_hitbox: Option<HitboxId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
-    pub(crate) inspector: Option<Entity<Inspector>>,
+    inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
@@ -2026,11 +2025,8 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
-            fast_layout: Default::default(),
             root: None,
             element_id_stack: SmallVec::default(),
-            global_ids: Default::default(),
-            retained_state: RetainedState::new(cx),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
@@ -2074,8 +2070,6 @@ impl Window {
                     .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
             ),
             touch_prediction_enabled: true,
-            emulate_touch: false,
-            emulated_touch_down: false,
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
@@ -2610,25 +2604,15 @@ impl Window {
     /// method directly for decorative motion, check [`App::reduce_motion`]
     /// and skip the frame request when it is set.
     pub fn request_animation_frame(&self) {
-        // Outside render/paint (e.g. an event listener) there is no current
-        // view; unwrapping would abort the app (iOS touch handlers hit this).
-        // Fall back to the window root, or just schedule a redraw.
-        let entity = self
-            .rendered_entity_stack
-            .last()
-            .copied()
-            .or_else(|| self.root.as_ref().map(|r| r.entity_id()));
-        self.on_next_frame(move |window, cx| match entity {
-            Some(entity) => cx.notify(entity),
-            None => window.refresh(),
-        });
+        let entity = self.current_view();
+        self.on_next_frame(move |_, cx| cx.notify(entity));
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
     ///
     /// Tests have no platform frame loop, so this simulates the delivery of the
     /// next frame.
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_next_frame(&mut self, cx: &mut App) -> usize {
         let callbacks = self.next_frame_callbacks.take();
         let count = callbacks.len();
@@ -2701,7 +2685,7 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
@@ -2711,7 +2695,7 @@ impl Window {
     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads
     /// whose bounds don't intersect their content mask are culled at paint time and won't appear.
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn painted_quads(&self) -> Vec<Quad> {
         self.rendered_frame.scene.quads.clone()
     }
@@ -2764,18 +2748,6 @@ impl Window {
     /// reflects the latest platform sample, not a synchronous geometry query.
     pub fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
         self.platform_window.visual_viewport_bounds()
-    }
-
-    /// Returns the window insets reported by the platform (safe area and
-    /// keyboard). Zero on platforms without system overlays.
-    pub fn window_insets(&self) -> crate::WindowInsets {
-        self.platform_window.insets()
-    }
-
-    /// Returns the safe-area insets (status bar, notch, home indicator) in
-    /// logical pixels. Zero on desktop platforms.
-    pub fn safe_area_insets(&self) -> Edges<Pixels> {
-        self.platform_window.insets().safe_area
     }
 
     /// Returns a conservative rectangle avoiding platform-known obscured content.
@@ -2933,7 +2905,7 @@ impl Window {
     }
 
     /// Overrides the display scale factor for tests.
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
         self.refresh();
@@ -2962,7 +2934,7 @@ impl Window {
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
         self.with_id(element_id, |this| {
-            let global_id = this.global_ids.get(&this.element_id_stack);
+            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
 
             f(&global_id, this)
         })
@@ -3072,7 +3044,7 @@ impl Window {
     }
 
     #[inline]
-    pub(crate) fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+    fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.cover_bounds(self.content_mask().bounds),
         }
@@ -3108,7 +3080,6 @@ impl Window {
 
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
-        crate::fast::dependencies::read_pointer(self);
         self.mouse_position
     }
 
@@ -3148,7 +3119,6 @@ impl Window {
 
     /// The current state of the keyboard's modifiers
     pub fn modifiers(&self) -> Modifiers {
-        crate::fast::dependencies::read_keys(self);
         self.modifiers
     }
 
@@ -3164,7 +3134,6 @@ impl Window {
 
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
-        crate::fast::dependencies::read_keys(self);
         self.capslock
     }
 
@@ -3237,8 +3206,7 @@ impl Window {
             .rev()
             .find_map(|h| h.take())
         {
-            let accepts_text_input =
-                cx.querying_input_handler(|cx| input_handler.accepts_text_input(self, cx));
+            let accepts_text_input = input_handler.accepts_text_input(self, cx);
             self.platform_window.set_input_handler(input_handler);
             accepts_text_input
         } else {
@@ -3255,11 +3223,8 @@ impl Window {
                 });
         }
 
-        self.layout_engine.as_mut().unwrap().end_frame();
-        self.fast_layout.end_frame();
+        self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
-        self.global_ids.finish_frame();
-        self.finish_retained_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -3347,7 +3312,6 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
-        self.retained_state.note_notified(&views);
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
@@ -3421,7 +3385,6 @@ impl Window {
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
-        self.fast_layout.phase_times.begin();
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -3454,7 +3417,6 @@ impl Window {
         let scale_factor = self.scale_factor();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
-        self.fast_layout.phase_times.end_build();
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -3489,7 +3451,6 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.fast_layout.phase_times.end_prepaint();
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
@@ -3511,7 +3472,6 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
-        self.fast_layout.phase_times.end_paint();
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
@@ -3658,7 +3618,6 @@ impl Window {
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
-                    let recording = self.begin_deferred_retained_prepaint(deferred_draw_ix, cx);
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
@@ -3666,7 +3625,6 @@ impl Window {
                             });
                         });
                     });
-                    self.finish_deferred_retained(recording, cx);
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
@@ -3704,16 +3662,13 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
-                let recording =
-                    self.begin_deferred_retained_paint(&deferred_draw.enclosing_retained, cx);
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     window.with_content_mask(content_mask, |window| {
                         window.with_rem_size(Some(deferred_draw.rem_size), |window| {
                             element.paint(window, cx);
                         });
                     })
-                });
-                self.finish_deferred_retained(recording, cx);
+                })
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
@@ -3789,7 +3744,6 @@ impl Window {
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
-                    enclosing_retained: EnclosingRetained::default(),
                 }),
         );
     }
@@ -3797,21 +3751,16 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
-            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
-            debug_paints_index: self.next_frame.retained.debug_paints_len(),
         }
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
-        #[cfg(any(test, feature = "test-api"))]
-        self.reuse_debug_bounds(&range);
-        self.reuse_window_control_hitboxes(&range);
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -4023,17 +3972,7 @@ impl Window {
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
     /// time.
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
-        // Outside render (e.g. a listener) fall back to the root view instead
-        // of unwrapping an empty view stack, which aborts release iOS builds.
-        let view = self
-            .rendered_entity_stack
-            .last()
-            .copied()
-            .or_else(|| self.root.as_ref().map(|r| r.entity_id()));
-        match view {
-            Some(view) => cx.asset_entry::<A>(source).use_by(view),
-            None => cx.asset_entry::<A>(source).get(),
-        }
+        cx.asset_entry::<A>(source).use_by(self.current_view())
     }
 
     /// Asynchronously load an asset, if the asset hasn't finished loading or doesn't exist this will return None.
@@ -4285,7 +4224,6 @@ impl Window {
             absolute_offset,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
-            enclosing_retained: self.next_frame.retained.open_records(),
         });
     }
 
@@ -4681,7 +4619,7 @@ impl Window {
         Ok(())
     }
 
-    pub(crate) fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
@@ -4967,7 +4905,7 @@ impl Window {
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn has_image_atlas_entry(&self, data: &RenderImage) -> bool {
         data.frame_count() > 0
             && (0..data.frame_count()).all(|frame_index| {
@@ -5000,9 +4938,7 @@ impl Window {
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
 
-        let key = self.layout_key();
         self.layout_engine.as_mut().unwrap().request_layout(
-            key,
             style,
             rem_size,
             scale_factor,
@@ -5027,11 +4963,10 @@ impl Window {
 
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
-        let key = self.layout_key();
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(key, style, rem_size, scale_factor, measure)
+            .request_measured_layout(style, rem_size, scale_factor, measure)
     }
 
     /// Compute the layout for the given id within the given available space.
@@ -5144,9 +5079,7 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.rendered_entity_stack.push(id);
-        crate::fast::dependencies::enter_drawing_view(self, id);
         let result = f(self);
-        crate::fast::dependencies::leave_drawing_view(self);
         self.rendered_entity_stack.pop();
         result
     }
@@ -5197,8 +5130,7 @@ impl Window {
     fn apply_text_input_configuration(&mut self, cx: &mut App) {
         let configuration = match self.platform_window.take_input_handler() {
             Some(mut input_handler) => {
-                let configuration = cx
-                    .querying_input_handler(|cx| input_handler.text_input_configuration(self, cx));
+                let configuration = input_handler.text_input_configuration(self, cx);
                 self.platform_window.set_input_handler(input_handler);
                 configuration
             }
@@ -5378,10 +5310,6 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
-        let event = match self.emulated_touch(event) {
-            Ok(touch) => touch,
-            Err(event) => event,
-        };
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -5392,14 +5320,6 @@ impl Window {
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
-            // A file dragged in from another app is pointer input too. Without
-            // this, typing and then dropping a file left the window in keyboard
-            // modality, so hover hit tests failed and the drop was ignored.
-            PlatformInput::FileDrop(
-                FileDropEvent::Entered { .. }
-                | FileDropEvent::Pending { .. }
-                | FileDropEvent::Submit { .. },
-            ) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
@@ -5407,7 +5327,6 @@ impl Window {
             self.refresh();
         }
 
-        let ambient = crate::fast::dependencies::AmbientInput::of(self);
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
@@ -5523,7 +5442,6 @@ impl Window {
             }
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
-        ambient.stamp_changes(self, cx);
 
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
@@ -5605,58 +5523,6 @@ impl Window {
         self.touch_prediction_enabled = enabled;
     }
 
-    /// Whether left-button mouse input is translated into single-finger
-    /// [`TouchEvent`]s, so a desktop window exercises the exact touch path a
-    /// phone does (gesture recognizer, pan scroll with touch phases, taps,
-    /// long press). For mobile previews. Defaults to false.
-    pub fn emulate_touch_from_mouse(&self) -> bool {
-        self.emulate_touch
-    }
-
-    /// See [`Self::emulate_touch_from_mouse`].
-    pub fn set_emulate_touch_from_mouse(&mut self, enabled: bool) {
-        self.emulate_touch = enabled;
-        self.emulated_touch_down = false;
-    }
-
-    /// Ok(touch) when mouse input should be replaced by an emulated touch.
-    fn emulated_touch(&mut self, event: PlatformInput) -> Result<PlatformInput, PlatformInput> {
-        if !self.emulate_touch {
-            return Err(event);
-        }
-        let (phase, position) = match &event {
-            PlatformInput::MouseDown(e) if e.button == MouseButton::Left => {
-                self.emulated_touch_down = true;
-                (crate::TouchPhase::Started, e.position)
-            }
-            PlatformInput::MouseMove(e) if self.emulated_touch_down => {
-                if e.pressed_button != Some(MouseButton::Left) {
-                    // Release happened outside the window.
-                    self.emulated_touch_down = false;
-                    (crate::TouchPhase::Cancelled, e.position)
-                } else {
-                    (crate::TouchPhase::Moved, e.position)
-                }
-            }
-            PlatformInput::MouseUp(e) if e.button == MouseButton::Left && self.emulated_touch_down => {
-                self.emulated_touch_down = false;
-                (crate::TouchPhase::Ended, e.position)
-            }
-            PlatformInput::MouseExited(e) if self.emulated_touch_down => {
-                self.emulated_touch_down = false;
-                (crate::TouchPhase::Cancelled, e.position)
-            }
-            _ => return Err(event),
-        };
-        Ok(PlatformInput::Touch(TouchEvent {
-            id: crate::TouchId(u64::MAX),
-            phase,
-            position,
-            predicted_position: None,
-            force: None,
-        }))
-    }
-
     /// Runs the portable gesture recognizer over a raw touch event and
     /// dispatches whatever it resolves (scroll steps, synthesized taps)
     /// through the ordinary mouse-event path.
@@ -5705,11 +5571,6 @@ impl Window {
                 self.mouse_position = scroll_wheel.position;
                 cx.propagate_event = true;
                 self.dispatch_mouse_event(&scroll_wheel, cx);
-            }
-            RecognizedTouchGesture::Pinch(pinch) => {
-                self.mouse_position = pinch.position;
-                cx.propagate_event = true;
-                self.dispatch_mouse_event(&pinch, cx);
             }
             RecognizedTouchGesture::Tap { down, up } => {
                 self.mouse_position = up.position;
@@ -6907,7 +6768,6 @@ impl Window {
             None => Some(cx.new(|_| Inspector::new())),
             Some(_) => None,
         };
-        self.release_closed_inspector_ids();
         self.refresh();
     }
 
@@ -6929,8 +6789,19 @@ impl Window {
         _inspector_id: Option<&crate::InspectorElementId>,
         cx: &mut App,
         f: impl FnOnce(&mut Option<T>, &mut Self) -> R,
-    ) -> Option<R> {
-        self.with_active_inspector_state(_inspector_id, cx, f)
+    ) -> R {
+        if let Some(inspector_id) = _inspector_id
+            && let Some(inspector) = &self.inspector
+        {
+            let inspector = inspector.clone();
+            let active_element_id = inspector.read(cx).active_element_id();
+            if Some(inspector_id) == active_element_id {
+                return inspector.update(cx, |inspector, _cx| {
+                    inspector.with_active_element_state(self, f)
+                });
+            }
+        }
+        f(&mut None, self)
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -7081,7 +6952,7 @@ impl Window {
 
     /// For testing: set the current modifier keys state.
     /// This does not generate any events.
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_modifiers(&mut self, modifiers: Modifiers) {
         self.modifiers = modifiers;
     }
@@ -7089,7 +6960,7 @@ impl Window {
     /// For testing: simulate a mouse move event to the given position.
     /// This dispatches the event through the normal event handling path,
     /// which will trigger hover states and tooltips.
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_mouse_move(&mut self, position: Point<Pixels>, cx: &mut App) {
         let event = PlatformInput::MouseMove(MouseMoveEvent {
             position,
@@ -7154,7 +7025,7 @@ impl<V: 'static + Render> WindowHandle<V> {
     /// Get the root view out of this window.
     ///
     /// This will fail if the window is closed or if the root view's type does not match `V`.
-    #[cfg(any(test, feature = "test-api"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn root<C>(&self, cx: &mut C) -> Result<Entity<V>>
     where
         C: AppContext,
@@ -8123,58 +7994,6 @@ mod tests {
         observed_drops: Rc<RefCell<Vec<PathBuf>>>,
     }
 
-    struct FileDropTargetView(Rc<RefCell<Vec<PathBuf>>>);
-
-    impl Render for FileDropTargetView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let dropped = self.0.clone();
-            div()
-                .size_full()
-                .on_drop(move |paths: &ExternalPaths, _, _| {
-                    dropped.borrow_mut().extend(paths.paths().iter().cloned());
-                })
-        }
-    }
-
-    /// Typing switches the window to keyboard modality, which hides hover.
-    /// A file dragged in afterwards must still reach the element under it.
-    #[gpui::test]
-    fn test_file_drop_after_typing_reaches_hovered_target(cx: &mut TestAppContext) {
-        let dropped = Rc::new(RefCell::new(Vec::new()));
-        let window: AnyWindowHandle = cx
-            .add_window({
-                let dropped = dropped.clone();
-                move |_, _| FileDropTargetView(dropped)
-            })
-            .into();
-        let path = PathBuf::from("/tmp/dropped.png");
-        let position = point(px(20.), px(20.));
-        cx.update_window(window, |_, window, cx| {
-            window.dispatch_event(
-                KeyDownEvent {
-                    keystroke: Keystroke::parse("a").unwrap(),
-                    is_held: false,
-                    prefer_character_input: false,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            assert!(window.last_input_was_keyboard());
-            for event in [
-                FileDropEvent::Entered {
-                    position,
-                    paths: ExternalPaths([path.clone()].into_iter().collect()),
-                },
-                FileDropEvent::Pending { position },
-                FileDropEvent::Submit { position },
-            ] {
-                window.dispatch_event(event.to_platform_input(), cx);
-            }
-        })
-        .unwrap();
-        assert_eq!(*dropped.borrow(), vec![path]);
-    }
-
     struct FileDropExitView(Rc<Cell<usize>>);
 
     impl Render for FileDropExitView {
@@ -8622,111 +8441,6 @@ mod tests {
 
     struct TouchDragListener {
         events: Rc<RefCell<Vec<(TouchPhase, Pixels)>>>,
-    }
-
-    /// A pan-scroll listener that requests animation frames, like a mobile
-    /// app's swipe handler. Mirrors the jcode-mobile iOS crash: the listener
-    /// runs outside render, where there is no current view.
-    struct ScrollFrameRequester {
-        phases: Rc<RefCell<Vec<TouchPhase>>>,
-    }
-
-    impl Render for ScrollFrameRequester {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .id("pan")
-                .size_full()
-                .on_scroll_wheel(cx.listener(|this, e: &crate::ScrollWheelEvent, window, cx| {
-                    this.phases.borrow_mut().push(e.touch_phase);
-                    window.request_animation_frame();
-                    cx.notify();
-                }))
-        }
-    }
-
-    #[gpui::test]
-    fn emulated_mouse_drag_pans_with_touch_phases_without_panicking(cx: &mut TestAppContext) {
-        let phases = Rc::new(RefCell::new(Vec::new()));
-        let window = cx.add_window({
-            let phases = phases.clone();
-            move |_, _| ScrollFrameRequester { phases }
-        });
-        window
-            .update(cx, |_, window, _| window.set_emulate_touch_from_mouse(true))
-            .unwrap();
-        let mouse = |input: PlatformInput, cx: &mut TestAppContext| {
-            cx.test_window(window.into()).simulate_input(input);
-            cx.run_until_parked();
-        };
-        let at = |x: f32, y: f32| point(px(x), px(y));
-        mouse(
-            PlatformInput::MouseDown(MouseDownEvent {
-                button: MouseButton::Left,
-                position: at(200., 300.),
-                modifiers: Default::default(),
-                click_count: 1,
-                first_mouse: false,
-            }),
-            cx,
-        );
-        for i in 1..=8 {
-            mouse(
-                PlatformInput::MouseMove(MouseMoveEvent {
-                    position: at(200. - 15. * i as f32, 300.),
-                    pressed_button: Some(MouseButton::Left),
-                    modifiers: Default::default(),
-                }),
-                cx,
-            );
-        }
-        mouse(
-            PlatformInput::MouseUp(crate::MouseUpEvent {
-                button: MouseButton::Left,
-                position: at(80., 300.),
-                modifiers: Default::default(),
-                click_count: 1,
-            }),
-            cx,
-        );
-        cx.executor().run_until_parked();
-        let phases = phases.borrow();
-        assert!(phases.contains(&TouchPhase::Moved), "{phases:?}");
-        assert_eq!(phases.last(), Some(&TouchPhase::Ended), "{phases:?}");
-    }
-
-    #[gpui::test]
-    fn use_asset_outside_render_does_not_panic(cx: &mut TestAppContext) {
-        struct NumAsset;
-        impl crate::Asset for NumAsset {
-            type Source = u32;
-            type Output = u32;
-            fn load(
-                source: u32,
-                _: &mut crate::App,
-            ) -> impl std::future::Future<Output = u32> + Send + 'static {
-                async move { source * 2 }
-            }
-        }
-        let window = cx.add_window(|_, _| EmptyView);
-        window
-            .update(cx, |_, window, cx| {
-                window.use_asset::<NumAsset>(&21, cx);
-            })
-            .unwrap();
-        cx.executor().run_until_parked();
-        let out = window
-            .update(cx, |_, window, cx| window.use_asset::<NumAsset>(&21, cx))
-            .unwrap();
-        assert_eq!(out, Some(42));
-    }
-
-    #[gpui::test]
-    fn request_animation_frame_outside_render_does_not_panic(cx: &mut TestAppContext) {
-        let window = cx.add_window(|_, _| EmptyView);
-        window
-            .update(cx, |_, window, _| window.request_animation_frame())
-            .unwrap();
-        cx.executor().run_until_parked();
     }
 
     impl Render for TouchDragListener {

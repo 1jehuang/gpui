@@ -6,6 +6,7 @@ mod deferred;
 mod div;
 mod image_cache;
 mod img;
+#[path = "../fast/list.rs"]
 mod list;
 mod surface;
 mod svg;

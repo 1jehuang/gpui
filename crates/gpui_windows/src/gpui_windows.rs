@@ -6,9 +6,11 @@ mod direct_manipulation;
 mod direct_write;
 mod directx_atlas;
 mod directx_devices;
+#[path = "fast/directx_renderer.rs"]
 mod directx_renderer;
 mod dispatcher;
 mod display;
+#[path = "fast/events.rs"]
 mod events;
 mod keyboard;
 mod platform;

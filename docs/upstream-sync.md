@@ -46,8 +46,23 @@ only hold the hooks that call into it.
    Documentation goes in `docs/`.
 
 Which directories are upstream's is recorded in [`UPSTREAM`](../UPSTREAM) at
-the repository root: every directory in `crates/` except `gpui_perf`, and
-`tooling/perf`.
+the repository root. Crates absent from that list, including `gpui_android`,
+`gpui_ios` and `gpui_perf`, are our own code.
+
+### Redirected fork implementations
+
+The GPUI gesture, input, platform, window and list modules, the Wayland client,
+and the Windows renderer and event modules use `#[path]` redirects to their
+implementations in `src/fast/`. The original imported files remain intact and
+unused. These relocations preserve the existing fork's touch, input-method,
+retained-rendering and iOS behavior rather than reverting it to pass the check.
+New Wayland contact tracking also lives in `src/fast/`.
+
+The relocated implementations initially matched their pre-relocation contents
+byte-for-byte. Explicit child-module paths retain the original module hierarchy
+and accessibility/test modules. When syncing upstream, port changes from each
+unused original into its redirected implementation as described below. Do not
+edit an unused original expecting it to affect the compiled implementation.
 
 ## Checking
 

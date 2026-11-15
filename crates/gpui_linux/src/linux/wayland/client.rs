@@ -34,7 +34,7 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface, wl_touch,
+        wl_shm_pool, wl_surface,
     },
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
@@ -91,7 +91,6 @@ use crate::linux::{
         cursor::Cursor,
         serial::{Serial, SerialKind, SerialTracker},
         to_shape,
-        touch::Touches,
         window::WaylandWindow,
     },
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
@@ -101,7 +100,7 @@ use gpui::{
     FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, SharedString,
+    PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
     Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
@@ -320,8 +319,6 @@ pub(crate) struct WaylandClientState {
     pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
-    wl_touch: Option<wl_touch::WlTouch>,
-    touches: Touches<WaylandWindowStatePtr>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -348,17 +345,16 @@ pub(crate) struct WaylandClientState {
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
-    pub(crate) axis_source: AxisSource,
-    pub(crate) finger_scroll: crate::fast::wayland_scroll::FingerScroll,
+    axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
-    pub(crate) continuous_scroll_delta: Option<Point<Pixels>>,
-    pub(crate) discrete_scroll_delta: Option<Point<f32>>,
+    continuous_scroll_delta: Option<Point<Pixels>>,
+    discrete_scroll_delta: Option<Point<f32>>,
     vertical_modifier: f32,
     horizontal_modifier: f32,
-    pub(crate) scroll_event_received: bool,
+    scroll_event_received: bool,
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
-    pub(crate) mouse_focused_window: Option<WaylandWindowStatePtr>,
+    mouse_focused_window: Option<WaylandWindowStatePtr>,
     keyboard_focused_window: Option<WaylandWindowStatePtr>,
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
     cursor_style: Option<CursorStyle>,
@@ -794,9 +790,6 @@ impl Drop for WaylandClient {
         if let Some(wl_pointer) = &state.wl_pointer {
             wl_pointer.release();
         }
-        if let Some(touch) = &state.wl_touch {
-            touch.release();
-        }
         if let Some(cursor_shape_device) = &state.cursor_shape_device {
             cursor_shape_device.destroy();
         }
@@ -998,8 +991,6 @@ impl WaylandClient {
             compositor_gpu,
             wl_seat: seat,
             wl_pointer: None,
-            wl_touch: None,
-            touches: Touches::default(),
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
@@ -1048,7 +1039,6 @@ impl WaylandClient {
             capslock: Capslock { on: false },
             scroll_event_received: false,
             axis_source: AxisSource::Wheel,
-            finger_scroll: crate::fast::wayland_scroll::FingerScroll::default(),
             mouse_location: None,
             continuous_scroll_delta: None,
             discrete_scroll_delta: None,
@@ -1480,10 +1470,6 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                 version,
             } => match &interface[..] {
                 "wl_seat" => {
-                    let cancelled = state.touches.cancel();
-                    if let Some(touch) = state.wl_touch.take() {
-                        touch.release();
-                    }
                     if let Some(wl_pointer) = state.wl_pointer.take() {
                         wl_pointer.release();
                     }
@@ -1497,11 +1483,6 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                         qh,
                         (),
                     );
-                    drop(state);
-                    for (window, event) in cancelled {
-                        window.handle_input(PlatformInput::Touch(event));
-                    }
-                    return;
                 }
                 "wl_output" => {
                     let output = registry.bind::<wl_output::WlOutput, _, _>(
@@ -1800,15 +1781,6 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
         {
             let client = state.get_client();
             let mut state = client.borrow_mut();
-            let mut cancelled = Vec::new();
-            if capabilities.contains(wl_seat::Capability::Touch) {
-                if state.wl_touch.is_none() {
-                    state.wl_touch = Some(seat.get_touch(qh, ()));
-                }
-            } else if let Some(touch) = state.wl_touch.take() {
-                touch.release();
-                cancelled = state.touches.cancel();
-            }
             if capabilities.contains(wl_seat::Capability::Keyboard) {
                 let keyboard = seat.get_keyboard(qh, ());
 
@@ -1855,65 +1827,6 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
 
                 state.wl_pointer = Some(pointer);
             }
-            drop(state);
-            for (window, event) in cancelled {
-                window.handle_input(PlatformInput::Touch(event));
-            }
-        }
-    }
-}
-
-impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
-    fn event(
-        this: &mut Self,
-        touch: &wl_touch::WlTouch,
-        event: wl_touch::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let client = this.get_client();
-        let mut state = client.borrow_mut();
-        // Ignore queued events from a device that has lost its capability.
-        if state.wl_touch.as_ref() != Some(touch) {
-            return;
-        }
-        let events = match event {
-            wl_touch::Event::Down {
-                serial,
-                surface,
-                id,
-                x,
-                y,
-                ..
-            } => {
-                let Some(window) = get_window(&mut state, &surface.id()) else {
-                    return;
-                };
-                if window.is_blocked() {
-                    return;
-                }
-                state.serial_tracker.update(SerialKind::TouchPress, serial);
-                // Wayland already supplies logical surface-local coordinates.
-                state
-                    .touches
-                    .down(id, window, point(px(x as f32), px(y as f32)))
-            }
-            wl_touch::Event::Motion { id, x, y, .. } => state
-                .touches
-                .motion(id, point(px(x as f32), px(y as f32)))
-                .into_iter()
-                .collect(),
-            wl_touch::Event::Up { id, .. } => state.touches.up(id).into_iter().collect(),
-            wl_touch::Event::Cancel => state.touches.cancel(),
-            // GPUI consumes individual contacts, not frame/shape metadata.
-            _ => return,
-        };
-        // Input callbacks may borrow the client again. Never dispatch under
-        // the RefCell borrow or real touch input will panic reentrantly.
-        drop(state);
-        for (window, event) in events {
-            window.handle_input(PlatformInput::Touch(event));
         }
     }
 }
@@ -2471,9 +2384,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
             }
 
             // Axis Events
-            wl_pointer::Event::AxisStop { axis: WEnum::Value(axis), .. } => {
-                state.finger_scroll.stop(axis);
-            }
             wl_pointer::Event::AxisSource {
                 axis_source: WEnum::Value(axis_source),
             } => {
@@ -2487,7 +2397,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if state.axis_source == AxisSource::Wheel {
                     return;
                 }
-                state.finger_scroll.axis(axis);
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
                 } else {
@@ -2569,10 +2478,34 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
             }
             wl_pointer::Event::Frame => {
-                let events = crate::fast::wayland_scroll::finish_frame(&mut state);
-                let window = state.mouse_focused_window.clone();
-                drop(state);
-                crate::fast::wayland_scroll::dispatch_frame(window, events);
+                if state.scroll_event_received {
+                    state.scroll_event_received = false;
+                    let continuous = state.continuous_scroll_delta.take();
+                    let discrete = state.discrete_scroll_delta.take();
+                    if let Some(continuous) = continuous {
+                        if let Some(window) = state.mouse_focused_window.clone() {
+                            let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                position: state.mouse_location.unwrap(),
+                                delta: ScrollDelta::Pixels(continuous),
+                                modifiers: state.modifiers,
+                                touch_phase: TouchPhase::Moved,
+                            });
+                            drop(state);
+                            window.handle_input(input);
+                        }
+                    } else if let Some(discrete) = discrete
+                        && let Some(window) = state.mouse_focused_window.clone()
+                    {
+                        let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position: state.mouse_location.unwrap(),
+                            delta: ScrollDelta::Lines(discrete),
+                            modifiers: state.modifiers,
+                            touch_phase: TouchPhase::Moved,
+                        });
+                        drop(state);
+                        window.handle_input(input);
+                    }
+                }
             }
             _ => {}
         }
@@ -2629,31 +2562,32 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 drop(state);
                 window.handle_input(input);
             }
-            zwp_pointer_gesture_pinch_v1::Event::Update { scale, dx, dy, .. } => {
-                let (position, modifiers) =
-                    (state.mouse_location.unwrap_or_default(), state.modifiers);
-                let (pinch, scroll) = crate::fast::pinch::pinch_update(
-                    &mut state.pinch_scale,
-                    scale as f32,
-                    position,
-                    point(px(dx as f32), px(dy as f32)),
-                    modifiers,
-                );
+            zwp_pointer_gesture_pinch_v1::Event::Update { time: _, scale, .. } => {
+                let new_absolute_scale = scale as f32;
+                let previous_scale = state.pinch_scale;
+                let zoom_delta = new_absolute_scale - previous_scale;
+                state.pinch_scale = new_absolute_scale;
+
+                let input = PlatformInput::Pinch(PinchEvent {
+                    position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    delta: zoom_delta,
+                    modifiers: state.modifiers,
+                    phase: TouchPhase::Moved,
+                });
                 drop(state);
-                window.handle_input(pinch);
-                scroll.map(|scroll| window.handle_input(scroll));
+                window.handle_input(input);
             }
             zwp_pointer_gesture_pinch_v1::Event::End {
                 serial: _,
                 time: _,
-                cancelled,
+                cancelled: _,
             } => {
                 state.pinch_scale = 1.0;
                 let input = PlatformInput::Pinch(PinchEvent {
                     position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
                     delta: 0.0,
                     modifiers: state.modifiers,
-                    phase: crate::fast::pinch::end_phase(cancelled != 0),
+                    phase: TouchPhase::Ended,
                 });
                 drop(state);
                 window.handle_input(input);

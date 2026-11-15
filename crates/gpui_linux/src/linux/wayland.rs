@@ -1,9 +1,11 @@
+#[path = "../fast/wayland_client.rs"]
 mod client;
 mod clipboard;
 mod cursor;
 mod display;
 mod popup;
 mod serial;
+#[path = "../fast/wayland_touch.rs"]
 mod touch;
 pub(crate) mod window;
 

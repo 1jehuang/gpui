@@ -28,14 +28,17 @@ mod fast;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
+#[path = "fast/gestures.rs"]
 mod gestures;
 mod global;
+#[path = "fast/input.rs"]
 mod input;
 mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
 mod path_builder;
+#[path = "fast/platform.rs"]
 mod platform;
 pub mod prelude;
 /// Profiling utilities for task, frame, and thread performance tracking.
@@ -65,6 +68,7 @@ pub mod test;
 mod text_system;
 mod util;
 mod view;
+#[path = "fast/window.rs"]
 mod window;
 
 #[cfg(any(test, feature = "test-api"))]
