@@ -1,6 +1,10 @@
 //! NativeActivity backend for the same GPUI scene graph used on desktop.
 #[cfg(any(target_os = "android", test))]
 mod accessibility;
+#[cfg(any(target_os = "android", test))]
+mod keyboard_configuration;
+#[cfg(target_os = "android")]
+pub use keyboard_configuration::AndroidTextInputConfiguration;
 #[cfg(target_os = "android")]
 mod dispatcher;
 #[cfg(target_os = "android")]

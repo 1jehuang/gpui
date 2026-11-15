@@ -12,6 +12,14 @@ pub trait AndroidPlatformServices: Send + Sync + 'static {
     fn set_keyboard_visible(&self, _visible: bool) -> bool {
         false
     }
+    /// Apply EditorInfo hints without changing GPUI text or interrupting composition.
+    /// Return false to retry when the activity's IME endpoint is not ready yet.
+    fn set_text_input_configuration(
+        &self,
+        _configuration: crate::AndroidTextInputConfiguration,
+    ) -> bool {
+        false
+    }
 }
 
 static SERVICES: RwLock<Option<Arc<dyn AndroidPlatformServices>>> = RwLock::new(None);

@@ -50,6 +50,7 @@ pub(crate) struct WindowState {
     native: RefCell<Option<ndk::native_window::NativeWindow>>,
     callbacks: RefCell<Callbacks>,
     handler: RefCell<Option<PlatformInputHandler>>,
+    keyboard_configuration: crate::keyboard_configuration::ConfigurationDelivery,
     size: Cell<Size<Pixels>>,
     scale: Cell<f32>,
     visible: Cell<bool>,
@@ -64,6 +65,12 @@ pub(crate) struct WindowState {
     needs_full_redraw: Cell<bool>,
 }
 impl WindowState {
+    fn apply_keyboard_configuration(&self) {
+        self.keyboard_configuration.apply(|configuration| {
+            crate::services::services()
+                .is_some_and(|services| services.set_text_input_configuration(configuration))
+        });
+    }
     fn callback<T, R>(
         &self,
         slot: impl Fn(&mut Callbacks) -> &mut Option<T>,
@@ -142,7 +149,8 @@ impl WindowState {
         }
     }
     pub fn native_insets(&self, safe: [i32; 4], ime: [i32; 4]) {
-        let Some(insets) = crate::window_insets::physical_insets(self.scale.get(), safe, ime) else {
+        let Some(insets) = crate::window_insets::physical_insets(self.scale.get(), safe, ime)
+        else {
             return;
         };
         self.authoritative_insets.set(Some((safe, ime)));
@@ -420,6 +428,7 @@ impl AndroidWindow {
             native: RefCell::new(Some(native)),
             callbacks: RefCell::default(),
             handler: RefCell::default(),
+            keyboard_configuration: Default::default(),
             size: Cell::default(),
             scale: Cell::new(1.),
             visible: Cell::new(true),
@@ -491,9 +500,15 @@ impl PlatformWindow for AndroidWindow {
     }
     fn set_input_handler(&mut self, handler: PlatformInputHandler) {
         *self.state.handler.borrow_mut() = Some(handler);
+        self.state.apply_keyboard_configuration();
     }
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.state.handler.borrow_mut().take()
+    }
+    fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
+        let configuration = crate::AndroidTextInputConfiguration::from(&configuration);
+        self.state.keyboard_configuration.request(configuration);
+        self.state.apply_keyboard_configuration();
     }
     fn insets(&self) -> WindowInsets {
         self.state.insets.borrow().clone()
@@ -502,6 +517,7 @@ impl PlatformWindow for AndroidWindow {
         self.state.callbacks.borrow_mut().insets = Some(callback);
     }
     fn show_soft_keyboard(&self) {
+        self.state.apply_keyboard_configuration();
         if !crate::services::services().is_some_and(|s| s.set_keyboard_visible(true)) {
             self.state.app.show_soft_input(true);
         }
