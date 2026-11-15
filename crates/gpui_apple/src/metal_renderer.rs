@@ -1,12 +1,11 @@
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block::ConcreteBlock;
-use metal::NSUInteger;
-use objc::runtime::{NO, YES};
-
-/// `CAAutoresizingMask` (macOS only): kCALayerWidthSizable | kCALayerHeightSizable.
-#[cfg(target_os = "macos")]
-const LAYER_WIDTH_HEIGHT_SIZABLE: u32 = (1 << 1) | (1 << 4);
+use cocoa::{
+    base::{NO, YES},
+    foundation::{NSSize, NSUInteger},
+    quartzcore::AutoresizingMask,
+};
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
@@ -31,9 +30,9 @@ use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
 
-#[cfg(not(gpui_apple_runtime_shaders))]
+#[cfg(not(feature = "runtime_shaders"))]
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
-#[cfg(gpui_apple_runtime_shaders)]
+#[cfg(feature = "runtime_shaders")]
 const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitched_shaders.metal"));
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
@@ -167,8 +166,11 @@ impl MetalRenderer {
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
-            #[cfg(target_os = "macos")]
-            let _: () = msg_send![&*layer, setAutoresizingMask: LAYER_WIDTH_HEIGHT_SIZABLE];
+            let _: () = msg_send![
+                &*layer,
+                setAutoresizingMask: AutoresizingMask::WIDTH_SIZABLE
+                    | AutoresizingMask::HEIGHT_SIZABLE
+            ];
         }
 
         Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
@@ -185,12 +187,6 @@ impl MetalRenderer {
     }
 
     fn create_device() -> metal::Device {
-        // iOS has exactly one GPU, and `isRemovable`/`isLowPower` are
-        // macOS-only selectors (unrecognized-selector abort on iPhone).
-        #[cfg(target_os = "ios")]
-        if let Some(d) = metal::Device::system_default() {
-            return d;
-        }
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
@@ -218,11 +214,11 @@ impl MetalRenderer {
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     ) -> Self {
-        #[cfg(gpui_apple_runtime_shaders)]
+        #[cfg(feature = "runtime_shaders")]
         let library = device
             .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
             .expect("error building metal library");
-        #[cfg(not(gpui_apple_runtime_shaders))]
+        #[cfg(not(feature = "runtime_shaders"))]
         let library = device
             .new_library_with_data(SHADERS_METALLIB)
             .expect("error building metal library");
@@ -236,9 +232,7 @@ impl MetalRenderer {
 
         // Shared memory can be used only if CPU and GPU share the same memory space.
         // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
-        // iOS has no Managed storage mode; the Simulator's Metal device reports
-        // non-unified memory and aborts on StorageModeManaged buffers.
-        let is_unified_memory = cfg!(target_os = "ios") || device.has_unified_memory();
+        let is_unified_memory = device.has_unified_memory();
         // Apple GPU families support memoryless textures, which can significantly reduce
         // memory usage by keeping render targets in on-chip tile memory instead of
         // allocating backing store in system memory.
@@ -387,10 +381,16 @@ impl MetalRenderer {
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
-            layer.set_drawable_size(core_graphics::geometry::CGSize::new(
-                size.width.0 as f64,
-                size.height.0 as f64,
-            ));
+            let ns_size = NSSize {
+                width: size.width.0 as f64,
+                height: size.height.0 as f64,
+            };
+            unsafe {
+                let _: () = msg_send![
+                    layer.as_ref(),
+                    setDrawableSize: ns_size
+                ];
+            }
         }
         self.update_path_intermediate_textures(size);
     }
@@ -1133,11 +1133,6 @@ impl MetalRenderer {
         if surfaces.is_empty() {
             return;
         }
-        // `PaintSurface` only carries a CVPixelBuffer on macOS.
-        #[cfg(not(target_os = "macos"))]
-        let _ = (first_surface, instance_bindings, viewport_size, command_encoder);
-        #[cfg(target_os = "macos")]
-        {
 
         command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
@@ -1212,7 +1207,6 @@ impl MetalRenderer {
                 1,
                 (first_surface + index) as u64,
             );
-        }
         }
     }
 }

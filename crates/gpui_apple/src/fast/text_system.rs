@@ -48,13 +48,16 @@ use pathfinder_geometry::{
 use smallvec::SmallVec;
 use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
 
-use crate::open_type::apply_features_and_fallbacks;
+use crate::fast::open_type::apply_features_and_fallbacks;
 
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
 
 /// Apple (macOS/iOS) text system using CoreText for font shaping.
 pub struct MacTextSystem(RwLock<MacTextSystemState>);
+
+/// Alias used by non-macOS Apple backends.
+pub type AppleTextSystem = MacTextSystem;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct FontKey {
@@ -71,7 +74,7 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    sized_fonts: crate::sized_fonts::SizedFonts,
+    sized_fonts: crate::fast::sized_fonts::SizedFonts,
 }
 
 impl MacTextSystem {
@@ -769,7 +772,7 @@ mod lenient_font_attributes {
 
 #[cfg(test)]
 mod tests {
-    use crate::text_system::MacTextSystem;
+    use crate::fast::text_system::MacTextSystem;
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
 
     #[test]
