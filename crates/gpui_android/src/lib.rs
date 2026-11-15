@@ -2,6 +2,8 @@
 #[cfg(any(target_os = "android", test))]
 mod accessibility;
 #[cfg(any(target_os = "android", test))]
+mod fast;
+#[cfg(any(target_os = "android", test))]
 mod keyboard_configuration;
 #[cfg(target_os = "android")]
 pub use keyboard_configuration::AndroidTextInputConfiguration;

@@ -43,6 +43,12 @@ struct Callbacks {
     visibility: Option<Box<dyn FnMut(WindowVisibility)>>,
     insets: Option<Box<dyn FnMut(WindowInsets)>>,
 }
+enum DeferredInput {
+    Text(crate::AndroidTextInput),
+    NativeText(android_activity::input::TextInputState),
+    Key(PlatformInput),
+}
+
 pub(crate) struct WindowState {
     app: AndroidApp,
     renderer: RefCell<WgpuRenderer>,
@@ -50,6 +56,7 @@ pub(crate) struct WindowState {
     native: RefCell<Option<ndk::native_window::NativeWindow>>,
     callbacks: RefCell<Callbacks>,
     handler: RefCell<Option<PlatformInputHandler>>,
+    input_readiness: RefCell<crate::fast::input_readiness::InputReadiness<DeferredInput>>,
     keyboard_configuration: crate::keyboard_configuration::ConfigurationDelivery,
     size: Cell<Size<Pixels>>,
     scale: Cell<f32>,
@@ -83,9 +90,13 @@ impl WindowState {
     }
     pub fn set_active(&self, active: bool) {
         self.active.set(active);
+        if !active {
+            self.input_readiness.borrow_mut().cancel();
+        }
         self.callback(|c| &mut c.active, |cb| cb(active));
     }
     pub fn suspend(&self) {
+        self.input_readiness.borrow_mut().cancel();
         self.visible.set(false);
         self.renderer.borrow_mut().unconfigure_surface();
         self.renderer.borrow_mut().destroy();
@@ -171,6 +182,7 @@ impl WindowState {
                 },
             );
         }
+        self.finish_input_frame();
     }
     pub fn frame(&self) {
         self.a11y.process_events();
@@ -186,6 +198,37 @@ impl WindowState {
                 },
             );
         }
+        self.finish_input_frame();
+    }
+    fn finish_input_frame(&self) {
+        let ready = self.visible.get() && self.active.get() && self.handler.borrow().is_some();
+        let events = self.input_readiness.borrow_mut().finish_frame(ready);
+        let Some(events) = events else { return };
+        // This runs after the frame callback, never while GPUI is painting or
+        // holding its App borrow. The new field's input handler now exists.
+        self.apply_keyboard_configuration();
+        let generation = self.input_readiness.borrow().generation();
+        for event in events {
+            if self.input_readiness.borrow().generation() != generation {
+                break;
+            }
+            match event {
+                DeferredInput::Text(edit) => self.text_input(edit),
+                DeferredInput::NativeText(edit) => self.native_text_input(edit),
+                DeferredInput::Key(key) => {
+                    self.key_input(key);
+                }
+            }
+        }
+        if !self.input_readiness.borrow().keyboard_requested()
+            || self.input_readiness.borrow().pending_frame()
+        {
+            return;
+        }
+        log::info!("Android native text handler ready after frame");
+        if !crate::services::services().is_some_and(|s| s.set_keyboard_visible(true)) {
+            self.app.show_soft_input(true);
+        }
     }
     fn dispatch(&self, input: PlatformInput) -> bool {
         self.callback(|c| &mut c.input, |cb| !cb(input).propagate)
@@ -200,6 +243,21 @@ impl WindowState {
     }
     pub fn text_input(&self, input: crate::AndroidTextInput) {
         use crate::AndroidTextInput;
+        if !self.active.get() || !self.visible.get() {
+            return;
+        }
+        let event = self
+            .input_readiness
+            .borrow_mut()
+            .route(DeferredInput::Text(input));
+        let input = match event {
+            crate::fast::input_readiness::Route::Now(DeferredInput::Text(input)) => input,
+            crate::fast::input_readiness::Route::Overflow => {
+                log::warn!("Android focus transition input limit exceeded; canceled pending input");
+                return;
+            }
+            _ => return,
+        };
         match input {
             AndroidTextInput::Commit(text) => self.edit(|handler| {
                 let marked = handler.marked_text_range();
@@ -231,6 +289,66 @@ impl WindowState {
                     prefer_character_input: false,
                 }));
             }
+        }
+    }
+    fn native_text_input(&self, state: android_activity::input::TextInputState) {
+        if !self.active.get() || !self.visible.get() {
+            return;
+        }
+        let event = self
+            .input_readiness
+            .borrow_mut()
+            .route(DeferredInput::NativeText(state));
+        match event {
+            crate::fast::input_readiness::Route::Now(DeferredInput::NativeText(state)) => self
+                .edit(|handler| {
+                    if let Some(compose) = state.compose_region {
+                        handler.replace_and_mark_text_in_range(
+                            None,
+                            &state.text,
+                            Some(compose.start..compose.end),
+                        );
+                    } else {
+                        handler.replace_text_in_range(None, &state.text);
+                    }
+                }),
+            crate::fast::input_readiness::Route::Overflow => {
+                log::warn!("Android focus transition input limit exceeded; canceled pending input");
+            }
+            _ => {}
+        }
+    }
+    fn key_input(&self, input: PlatformInput) -> InputStatus {
+        if !self.active.get() || !self.visible.get() {
+            return InputStatus::Unhandled;
+        }
+        let event = self
+            .input_readiness
+            .borrow_mut()
+            .route(DeferredInput::Key(input));
+        let input = match event {
+            crate::fast::input_readiness::Route::Now(DeferredInput::Key(input)) => input,
+            crate::fast::input_readiness::Route::Overflow => {
+                log::warn!("Android focus transition input limit exceeded; canceled pending input");
+                return InputStatus::Unhandled;
+            }
+            _ => return InputStatus::Handled,
+        };
+        let character = match &input {
+            PlatformInput::KeyDown(event)
+                if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform =>
+            {
+                event.keystroke.key_char.clone()
+            }
+            _ => None,
+        };
+        if self.dispatch(input) {
+            InputStatus::Handled
+        } else if let Some(character) = character {
+            self.edit(|handler| handler.replace_text_in_range(None, &character));
+            InputStatus::Handled
+        } else {
+            InputStatus::Unhandled
         }
     }
     pub fn input(&self) {
@@ -348,33 +466,10 @@ impl WindowState {
                     KeyAction::Up => PlatformInput::KeyUp(KeyUpEvent { keystroke }),
                     _ => return InputStatus::Unhandled,
                 };
-                if self.dispatch(input) {
-                    InputStatus::Handled
-                } else if event.action() == KeyAction::Down
-                    && key_char.is_some()
-                    && !modifiers.control
-                    && !modifiers.platform
-                {
-                    self.edit(|handler| {
-                        handler.replace_text_in_range(None, key_char.as_deref().unwrap_or_default())
-                    });
-                    InputStatus::Handled
-                } else {
-                    InputStatus::Unhandled
-                }
+                self.key_input(input)
             }
             InputEvent::TextEvent(state) => {
-                self.edit(|handler| {
-                    if let Some(compose) = state.compose_region {
-                        handler.replace_and_mark_text_in_range(
-                            None,
-                            &state.text,
-                            Some(compose.start..compose.end),
-                        );
-                    } else {
-                        handler.replace_text_in_range(None, &state.text);
-                    }
-                });
+                self.native_text_input(state.clone());
                 InputStatus::Handled
             }
             _ => InputStatus::Unhandled,
@@ -428,6 +523,7 @@ impl AndroidWindow {
             native: RefCell::new(Some(native)),
             callbacks: RefCell::default(),
             handler: RefCell::default(),
+            input_readiness: RefCell::default(),
             keyboard_configuration: Default::default(),
             size: Cell::default(),
             scale: Cell::new(1.),
@@ -517,19 +613,21 @@ impl PlatformWindow for AndroidWindow {
         self.state.callbacks.borrow_mut().insets = Some(callback);
     }
     fn show_soft_keyboard(&self) {
-        self.state.apply_keyboard_configuration();
-        if !crate::services::services().is_some_and(|s| s.set_keyboard_visible(true)) {
-            self.state.app.show_soft_input(true);
-        }
+        // A gesture can focus a field before the next paint installs its input
+        // handler. Showing Android's keyboard here makes early edits disappear.
+        self.state.input_readiness.borrow_mut().request_keyboard();
     }
     fn hide_soft_keyboard(&self) {
+        self.state.input_readiness.borrow_mut().cancel();
         if !crate::services::services().is_some_and(|s| s.set_keyboard_visible(false)) {
             self.state.app.hide_soft_input(false);
         }
     }
     fn text_input_state_changed(&self, change: TextInputStateChange) {
         match change {
-            TextInputStateChange::FocusGained => self.show_soft_keyboard(),
+            TextInputStateChange::FocusGained => {
+                self.state.input_readiness.borrow_mut().focus_gained()
+            }
             TextInputStateChange::FocusLost => self.hide_soft_keyboard(),
             _ => {}
         }
