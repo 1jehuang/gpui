@@ -545,7 +545,7 @@ impl WgpuContext {
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
-        self.dual_source_blending
+        crate::fast::gles_downlevel::supports_dual_source_blending(self.dual_source_blending, self.uses_webgl_instance_data())
     }
 
     pub fn color_texture_format(&self) -> wgpu::TextureFormat {

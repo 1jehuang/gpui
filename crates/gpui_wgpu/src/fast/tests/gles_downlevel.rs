@@ -1,4 +1,4 @@
-use super::{base_limits, lacks_vertex_storage};
+use super::{base_limits, lacks_vertex_storage, supports_dual_source_blending};
 use wgpu::{DownlevelFlags, Limits};
 
 #[test]
@@ -20,6 +20,23 @@ fn gles3_without_vertex_storage_uses_texture_transport_and_webgl2_limits() {
     assert_eq!(limits, Limits::downlevel_webgl2_defaults());
     assert_eq!(limits.max_storage_buffers_per_shader_stage, 0);
     assert_eq!(limits.max_compute_workgroups_per_dimension, 0);
+}
+
+#[test]
+fn texture_transport_never_advertises_subpixel_blending() {
+    let flags = DownlevelFlags::all() - DownlevelFlags::VERTEX_STORAGE;
+    assert!(!supports_dual_source_blending(
+        true,
+        lacks_vertex_storage(flags)
+    ));
+    assert!(!supports_dual_source_blending(false, true));
+}
+
+#[test]
+fn storage_transport_preserves_device_subpixel_capability() {
+    let uses_texture = lacks_vertex_storage(DownlevelFlags::all());
+    assert!(supports_dual_source_blending(true, uses_texture));
+    assert!(!supports_dual_source_blending(false, uses_texture));
 }
 
 #[test]

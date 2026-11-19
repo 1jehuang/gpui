@@ -19,6 +19,15 @@ pub(crate) fn required_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
         .using_alignment(adapter.limits())
 }
 
+/// The texture transport has no subpixel pipeline. Report the same capability
+/// to window glyph rasterization so it requests grayscale rather than LCD masks.
+pub(crate) fn supports_dual_source_blending(
+    device_supports_dual_source: bool,
+    uses_texture_instance_data: bool,
+) -> bool {
+    device_supports_dual_source && !uses_texture_instance_data
+}
+
 fn lacks_vertex_storage(flags: wgpu::DownlevelFlags) -> bool {
     !flags.contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
 }
