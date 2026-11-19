@@ -262,9 +262,7 @@ impl WgpuContext {
                 .using_alignment(adapter.limits())
         };
         #[cfg(not(target_family = "wasm"))]
-        let required_limits = wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits())
-            .using_alignment(adapter.limits());
+        let required_limits = crate::fast::gles_downlevel::required_limits(adapter);
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -543,10 +541,11 @@ impl WgpuContext {
 
     pub fn uses_webgl_instance_data(&self) -> bool {
         matches!(self.backend, WgpuBackend::Gl) && cfg!(target_family = "wasm")
+            || crate::fast::gles_downlevel::needs_texture_instance_data(&self.adapter)
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
-        self.dual_source_blending
+        crate::fast::gles_downlevel::supports_dual_source_blending(self.dual_source_blending, self.uses_webgl_instance_data())
     }
 
     pub fn color_texture_format(&self) -> wgpu::TextureFormat {
