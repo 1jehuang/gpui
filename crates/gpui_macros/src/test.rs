@@ -5,7 +5,6 @@ use std::mem;
 use syn::{
     self, Expr, ExprLit, FnArg, ItemFn, Lit, Meta, MetaList, PathSegment, Token, Type,
     parse::{Parse, ParseStream},
-    parse_quote,
     punctuated::Punctuated,
     spanned::Spanned,
 };
@@ -129,7 +128,7 @@ fn generate_test_function(
     let on_failure_fn_name = &args.on_failure_fn_name;
     let seeds = quote!( #(#seeds),* );
 
-    let mut outer_fn: ItemFn = if inner_fn.sig.asyncness.is_some() {
+    let body = if inner_fn.sig.asyncness.is_some() {
         // Pass to the test function the number of app contexts that it needs,
         // based on its parameter list.
         let mut cx_vars = proc_macro2::TokenStream::new();
@@ -182,9 +181,7 @@ fn generate_test_function(
             return Err(error_with_message("invalid function signature", arg));
         }
 
-        parse_quote! {
-            #[test]
-            fn #outer_fn_name() {
+        quote! {
                 #inner_fn
 
                 gpui::run_test(
@@ -206,7 +203,6 @@ fn generate_test_function(
                     },
                     #on_failure_fn_name
                 );
-            }
         }
     } else {
         // Pass to the test function the number of app contexts that it needs,
@@ -275,9 +271,7 @@ fn generate_test_function(
             return Err(error_with_message("invalid function signature", arg));
         }
 
-        parse_quote! {
-            #[test]
-            fn #outer_fn_name() {
+        quote! {
                 #inner_fn
 
                 gpui::run_test(
@@ -297,12 +291,9 @@ fn generate_test_function(
                     },
                     #on_failure_fn_name,
                 );
-            }
         }
     };
-    outer_fn.attrs.extend(inner_fn_attributes);
-
-    Ok(TokenStream::from(quote!(#outer_fn)))
+    Ok(crate::fast::test_wrapper::emit(outer_fn_name, inner_fn_attributes, body).into())
 }
 
 fn parse_usize_from_expr(expr: &Expr) -> Result<usize, syn::Error> {
